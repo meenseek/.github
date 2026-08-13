@@ -13,12 +13,13 @@
 
 ## 현재 구조
 
-2026년 8월 12일 기준입니다.
+2026년 8월 13일 기준입니다.
 
 ```text
 github.com/meenseek/
 ├─ .github                         공개 프로필과 저장소 운영 모델
 ├─ measure-twice-design-system     React 디자인 시스템
+├─ yokgarim                        독립 제품
 ├─ tarot-spark                     독립 제품
 └─ grid-cell                       독립 실험
 ```
@@ -27,6 +28,7 @@ github.com/meenseek/
 | --- | --- | --- | --- |
 | `.github` | 현재 | 읽기 | 공개 프로필과 Organization 공통 기준 |
 | `measure-twice-design-system` | 현재 | 패키지 설치 | React UI 계약과 패키지 릴리스 |
+| `yokgarim` | 현재 | 독립 실행·배포 | 한국어 로컬 음성 검토·삐처리, macOS 앱과 제품 릴리스 |
 | `tarot-spark` | 현재 | 독립 실행·배포 | 타로 도메인, 제품 코드, 환경과 제품 릴리스 |
 | `grid-cell` | 현재 | 독립 실행·배포 | 실험 코드, 환경과 배포 |
 
@@ -45,6 +47,7 @@ github.com/meenseek/
 ├─ next-product-starter/                 반복되는 프로젝트 생성이 확인되면 생성
 ├─ automation/                           반복되는 workflow가 확인되면 생성
 │  └─ .github/workflows/
+├─ yokgarim/
 ├─ tarot-spark/
 ├─ grid-cell/
 └─ <actual-product-name>/                실제 제품명으로 생성

@@ -16,6 +16,13 @@ React 디자인 시스템입니다.
 - npm: [`@measure-twice/react`][measure-twice-npm]
 - [Storybook][measure-twice-storybook]
 
+### 욕가림
+
+짧은 영상의 한국어 욕설 후보를 Mac 안에서 찾아 확인하고 삐음이나 무음으로 바꾸는
+로컬 우선 데스크톱 제품입니다.
+
+[Repository](https://github.com/meenseek/yokgarim)
+
 ### Tarot Spark
 
 카드를 뽑고 읽기 방식을 선택해 AI 해석용 프롬프트를 만드는 독립 타로 제품입니다.
