@@ -3,6 +3,12 @@
 Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대상 저장소의
 더 구체적인 로컬 규칙이 있으면 그 규칙이 우선합니다.
 
+## Internal versioning
+
+- 현재 구현과 함께 원자적으로 교체할 수 없는 실제 소비자나 보존 데이터가 없으면
+  내부 버전 번호와 호환 분기를 만들지 않습니다. 있으면 원문을 불변 보존하고
+  소비자, 소유자와 종료 조건을 문서화한 경우에만 추가합니다.
+
 ## Database migrations
 
 - 새 migration version은 구현 단계의 기록이 아니라, 보존해야 하는 기존 database
