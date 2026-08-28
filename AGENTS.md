@@ -5,22 +5,25 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 ## Internal versioning
 
-- 현재 구현과 함께 원자적으로 교체할 수 없는 실제 소비자나 보존 데이터가 없으면
-  내부 버전 번호와 호환 분기를 만들지 않습니다. 있으면 원문을 불변 보존하고
-  소비자, 소유자와 종료 조건을 문서화한 경우에만 추가합니다.
+- 릴리즈 버전은 이 gate의 대상이 아닙니다. 릴리즈 외 내부 버전 번호와 호환 분기는
+  만들지 않고 Git history만 사용합니다.
+- Migration version은 아래 `Database migrations` 기준의 독립 리뷰가 필수라고 판정하고
+  대상 상태, 소유자와 부채 해소·종료 조건을 기록한 경우에만 추가하거나 유지합니다.
 
 ## Database migrations
 
-- 새 migration version은 구현 단계의 기록이 아니라, 보존해야 하는 기존 database
-  상태나 이미 적용·배포된 migration history를 다음 상태로 옮길 때만 추가합니다.
+- 새 migration version은 독립 리뷰가 보존해야 하는 기존 database 상태나 이미 적용·배포된
+  migration history를 다음 상태로 옮기는 데 필수라고 판정한 경우에만 추가합니다. 대상
+  환경·상태, 소유자와 부채 해소·종료 조건을 같은 변경에 기록합니다.
 - 비폐기 database에 적용된 적이 없고 보존할 data나 공유된 migration contract가
   없는 초기 초안은 현재 목표 schema의 단일 baseline으로 정리합니다. 존재하지 않는
   upgrade 또는 backfill 경로와 그 호환성 test는 만들지 않습니다.
 - 비폐기 database에 적용됐거나 migration history가 배포·공유된 뒤에는 기존
   migration을 수정·삭제·재정렬·squash하지 않고 새 migration을 append-only로
   추가합니다.
-- 적용·공유 여부 또는 data 보존 필요를 확인할 수 없으면 baseline을 다시 쓰지 않고
-  확인되지 않은 상태를 보고합니다.
+- 적용·공유 여부 또는 data 보존 필요를 확인할 수 없으면 baseline을 다시 쓰지 않습니다.
+  이 보존은 영구 근거가 아니라 확인 부채이므로 필요한 접근, 소유자와 해소 조건을
+  보고합니다.
 
 ## Branch
 
