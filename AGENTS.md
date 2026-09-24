@@ -7,6 +7,8 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 - 릴리즈 버전은 이 gate의 대상이 아닙니다. 릴리즈 외 내부 버전 번호와 호환 분기는
   만들지 않고 Git history만 사용합니다.
+- 호스팅 서비스가 자동 부여한 배포 순번은 제품·내부 버전으로 부르지 않습니다.
+  필요한 경우에만 배포 진단 정보로 표시합니다.
 - Migration version은 아래 `Database migrations` 기준의 독립 리뷰가 필수라고 판정하고
   대상 상태, 소유자와 부채 해소·종료 조건을 기록한 경우에만 추가하거나 유지합니다.
 
