@@ -2,8 +2,8 @@
 
 ## 목적과 상태
 
-이 문서는 `meenseek` Organization에서 저장소의 이름, 소유권과 소비 방식을 판단하는 공개
-기준입니다. 미래 구조의 생성 계획이나 일정이 아닙니다.
+이 문서는 `meenseek` GitHub 조직의 저장소 이름, 소유권과 소비 방식을 정하는 공개
+기준입니다. 새 저장소를 만들겠다는 계획이나 일정은 아닙니다.
 
 - 현재 사실은 GitHub의 실제 저장소와 각 저장소의 계약을 확인합니다.
 - 후보는 아래 조건을 충족했을 때만 생성합니다.
@@ -20,45 +20,17 @@
 
 ## 현재 구조
 
-2026년 9월 27일 기준입니다.
-
-이 공개 목록은 공개 저장소만 열거합니다. 비공개 저장소와 그 이름은 별도 공개
-승인이 없으면 의도적으로 생략하며, 목록에서 생략됐다고 해서 부재를 뜻하지는
-않습니다. 비공개 저장소도 내부적으로 이 문서의 소유권과 생성 조건을 따릅니다.
-
-```text
-github.com/meenseek/
-├─ .github                         공개 프로필과 저장소 운영 모델
-├─ tarot-spark                     독립 제품
-└─ ontology                        개인 지식 온톨로지와 native context runtime
-```
-
-| 저장소 | 상태 | 소비 방식 | 핵심 소유권 |
-| --- | --- | --- | --- |
-| `.github` | 현재 | 읽기 | 공개 프로필과 Organization 공통 기준 |
-| `tarot-spark` | 현재 | 독립 실행·배포 | 타로 도메인, 제품 코드, 환경과 제품 릴리스 |
-| `ontology` | 현재 | 소스 열람·로컬 실행 | 개인 지식 온톨로지와 native context runtime, 운영 데이터는 로컬 |
+현재 공개 저장소는 [GitHub 목록](https://github.com/orgs/meenseek/repositories?type=public)에서
+확인합니다. 이 문서는 목록을 복제하지 않고 저장소의 소유권과 생성 조건을 정합니다.
+비공개 저장소에도 같은 기준을 적용합니다.
 
 ## 조건부 확장 구조
 
-다음 이름은 조건을 충족했을 때 사용할 수 있는 경계입니다. 현재 존재한다고
-간주하지 않습니다.
+`product-foundation`, `next-product-starter`, `automation`은 아래 조건을 충족할 때만
+만드는 후보입니다. 후보를 현재 존재하는 저장소나 확정된 생성 계획으로 간주하지
+않습니다.
 
-```text
-github.com/meenseek/
-├─ .github/
-├─ product-foundation/                  조건 충족 시 생성
-│  ├─ packages/<promoted-capability>/
-│  └─ fixtures/<consumer>/               실제 소비 계약이 필요할 때만 추가
-├─ next-product-starter/                 반복되는 프로젝트 생성이 확인되면 생성
-├─ automation/                           반복되는 workflow가 확인되면 생성
-│  └─ .github/workflows/
-├─ tarot-spark/
-├─ ontology/
-└─ <actual-product-name>/                실제 제품명으로 생성
-```
-
-`http`, `ai`, `observability`, `testing`, `next`는 검토할 수 있는 capability 예시일
+`http`, `ai`, `observability`, `testing`, `next`는 검토할 수 있는 기능 범주일
 뿐, 미리 만들 패키지 목록이 아닙니다. 실제 책임은 `http-client`, `next-config`처럼
 제공하는 계약이 드러나도록 좁혀야 합니다.
 
@@ -170,10 +142,9 @@ automation implementation ─X_hardcoded─> specific product path / config
 
 ## 문서 갱신 규칙
 
-- 공개 목록은 공개 저장소를 생성·archive하거나 역할과 소비 방식이 바뀔 때
-  갱신합니다.
-- 비공개 저장소의 변경은 별도 공개 승인 없이는 공개 목록이나 기준일 갱신을
-  유발하지 않습니다.
+- 저장소 목록과 공개 상태는 GitHub에서 확인하고 이 문서에 복제하지 않습니다.
+- 소유권, 생성·승격 조건이나 소비 계약이 바뀌면 이 문서를 갱신합니다.
+- 비공개 저장소 이름은 별도 공개 승인 없이 적지 않습니다.
 - 현재 상태와 조건부 후보를 한 상태처럼 섞지 않습니다.
 - 후보 이름을 실제 존재 증거로 사용하지 않습니다.
 - 링크, 공개 패키지와 지원 범위는 실제 GitHub와 registry 상태를 확인한 뒤
