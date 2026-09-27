@@ -32,7 +32,8 @@ github.com/meenseek/
 ├─ measure-twice-design-system     React 디자인 시스템
 ├─ yokgarim                        독립 제품
 ├─ tarot-spark                     독립 제품
-└─ grid-cell                       독립 실험
+├─ grid-cell                       독립 실험
+└─ ontology                        개인 지식 온톨로지와 native context runtime
 ```
 
 | 저장소 | 상태 | 소비 방식 | 핵심 소유권 |
@@ -42,6 +43,7 @@ github.com/meenseek/
 | `yokgarim` | 현재 | 독립 실행·배포 | 한국어 로컬 음성 검토·삐처리, macOS 앱과 제품 릴리스 |
 | `tarot-spark` | 현재 | 독립 실행·배포 | 타로 도메인, 제품 코드, 환경과 제품 릴리스 |
 | `grid-cell` | 현재 | 독립 실행·배포 | 실험 코드, 환경과 배포 |
+| `ontology` | 현재 | 소스 열람·로컬 실행 | 개인 지식 온톨로지와 native context runtime, 운영 데이터는 로컬 |
 
 ## 조건부 확장 구조
 
@@ -61,6 +63,7 @@ github.com/meenseek/
 ├─ yokgarim/
 ├─ tarot-spark/
 ├─ grid-cell/
+├─ ontology/
 └─ <actual-product-name>/                실제 제품명으로 생성
 ```
 
