@@ -20,7 +20,7 @@
 
 ## 현재 구조
 
-2026년 8월 13일 기준입니다.
+2026년 9월 27일 기준입니다.
 
 이 공개 목록은 공개 저장소만 열거합니다. 비공개 저장소와 그 이름은 별도 공개
 승인이 없으면 의도적으로 생략하며, 목록에서 생략됐다고 해서 부재를 뜻하지는
@@ -32,7 +32,8 @@ github.com/meenseek/
 ├─ measure-twice-design-system     React 디자인 시스템
 ├─ yokgarim                        독립 제품
 ├─ tarot-spark                     독립 제품
-└─ grid-cell                       독립 실험
+├─ grid-cell                       독립 실험
+└─ ontology-public                 온톨로지 공개 소스 스냅샷
 ```
 
 | 저장소 | 상태 | 소비 방식 | 핵심 소유권 |
@@ -42,6 +43,7 @@ github.com/meenseek/
 | `yokgarim` | 현재 | 독립 실행·배포 | 한국어 로컬 음성 검토·삐처리, macOS 앱과 제품 릴리스 |
 | `tarot-spark` | 현재 | 독립 실행·배포 | 타로 도메인, 제품 코드, 환경과 제품 릴리스 |
 | `grid-cell` | 현재 | 독립 실행·배포 | 실험 코드, 환경과 배포 |
+| `ontology-public` | 보관(공개) | 읽기 | 2026-09-27 온톨로지 소스 스냅샷, 운영 데이터와 비공개 이력 제외 |
 
 ## 조건부 확장 구조
 
@@ -61,6 +63,7 @@ github.com/meenseek/
 ├─ yokgarim/
 ├─ tarot-spark/
 ├─ grid-cell/
+├─ ontology-public/
 └─ <actual-product-name>/                실제 제품명으로 생성
 ```
 
