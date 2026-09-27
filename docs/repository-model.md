@@ -29,15 +29,13 @@
 ```text
 github.com/meenseek/
 ├─ .github                         공개 프로필과 저장소 운영 모델
-├─ tarot-spark                     독립 제품
-└─ ontology-public                 온톨로지 공개 소스 스냅샷
+└─ tarot-spark                     독립 제품
 ```
 
 | 저장소 | 상태 | 소비 방식 | 핵심 소유권 |
 | --- | --- | --- | --- |
 | `.github` | 현재 | 읽기 | 공개 프로필과 Organization 공통 기준 |
 | `tarot-spark` | 현재 | 독립 실행·배포 | 타로 도메인, 제품 코드, 환경과 제품 릴리스 |
-| `ontology-public` | 보관(공개) | 읽기 | 2026-09-27 온톨로지 소스 스냅샷, 운영 데이터와 비공개 이력 제외 |
 
 ## 조건부 확장 구조
 
@@ -54,7 +52,6 @@ github.com/meenseek/
 ├─ automation/                           반복되는 workflow가 확인되면 생성
 │  └─ .github/workflows/
 ├─ tarot-spark/
-├─ ontology-public/
 └─ <actual-product-name>/                실제 제품명으로 생성
 ```
 
