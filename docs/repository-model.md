@@ -15,8 +15,6 @@
 
 - 저장소명은 제품명 또는 현재 책임을 기준으로 짧게 정하며, 조직명은 기본적으로
   생략합니다. 제품의 독립 구성요소는 `<제품명>-<역할>`로 구분합니다.
-- LLM 작업 자동화의 이름에는 대상과 행동을 표시합니다. 저장소별 GitHub Actions는
-  대상이 이미 드러나면 `CI`, `Release`처럼 역할만 표시합니다.
 
 ## 현재 저장소 확인
 
@@ -26,9 +24,9 @@
 
 ## 조건부 후보
 
-공통 기반 패키지 저장소 `product-foundation`, 제품 시작 템플릿 `next-product-starter`,
-공통 GitHub Actions workflow 저장소 `automation`은 아래 조건을 충족할 때만 만드는
-후보입니다. 후보를 현재 존재하는 저장소나 확정된 생성 계획으로 간주하지 않습니다.
+공통 기반 패키지 저장소 `product-foundation`과 제품 시작 템플릿
+`next-product-starter`는 아래 조건을 충족할 때만 만드는 후보입니다. 후보를 현재
+존재하는 저장소나 확정된 생성 계획으로 간주하지 않습니다.
 
 패키지 이름은 `http-client`, `next-config`처럼 제공하는 기능을 구체적으로 드러냅니다.
 
@@ -55,19 +53,10 @@
 - 시작 템플릿의 변경은 기존 제품에 자동 전파되지 않습니다.
 - 계속 동기화해야 하는 동작은 시작 템플릿에 두지 않습니다.
 
-### 공통 GitHub Actions
-
-- 제품 저장소가 검증된 commit SHA의 reusable workflow를 호출합니다.
-- 공통 lint, test, build처럼 입력과 결과가 안정된 작업만 소유합니다.
-- 호출 저장소가 trigger, 최소 권한, environment, secret과 제품별 배포를
-  소유합니다.
-- 공통 workflow를 호출할 때 이동 가능한 기본 브랜치를 참조하지 않습니다.
-
 ### 독립 제품·실험
 
 - 코드, 도메인, 데이터, 환경, 배포와 제품 릴리스를 직접 소유합니다.
-- 공통 패키지나 workflow를 사용할 수 있지만 공통 기반 패키지가 제품을 역으로 참조하지
-  않습니다.
+- 공통 패키지를 사용할 수 있지만 공통 기반 패키지가 제품을 역으로 참조하지 않습니다.
 - 다른 제품의 요구를 대신 수용하는 공통 코드 저장소가 되지 않습니다.
 
 ## 의존성 방향
@@ -76,14 +65,12 @@
 product ─────────> design-system package
 product ─────────> product-foundation packages
 starter ─────────> 배포된 패키지
-starter ─────────> 검증된 reusable workflow (automation이 존재할 때)
 consumer fixture ─> 검증 대상 foundation package
 
 금지:
 foundation production package ─X_runtime─> product / starter / fixture
 design system ─X_runtime─> product foundation / product
 production package ─X_runtime─> testing package
-automation implementation ─X_hardcoded─> specific product path / config
 ```
 
 패키지 간 참조는 대상 패키지의 공개 export만 사용합니다. deep import나 순환 의존성을
@@ -119,29 +106,17 @@ automation implementation ─X_hardcoded─> specific product path / config
 3. 포함된 앱을 독립적으로 install, lint, test, build할 수 있습니다.
 4. 장기 동기화가 필요한 런타임 로직을 포함하지 않습니다.
 
-### 공통 GitHub Actions 생성
-
-다음을 모두 충족할 때 로컬 workflow에서 추출합니다.
-
-1. 두 저장소 이상에서 같은 안정된 job graph를 사용합니다.
-2. 같은 유지보수 변경을 여러 저장소에 실제로 적용한 기록이 있습니다.
-3. 중앙 수정의 이익이 공통 장애 전파와 권한 관리 비용보다 큽니다.
-4. 최소 소비 fixture와 불변 버전 또는 commit SHA 갱신 절차가 있습니다.
-
 ## 환원과 폐기 조건
 
 - 공통 패키지에 운영 중인 제품·서비스의 사용처가 없다고 확인되면 사용 중단을 알린 뒤
   제거합니다.
-- 공통 workflow를 실제 개발·배포 작업에서 호출하는 저장소가 없다고 확인되면 사용 중단을
-  알린 뒤 제거합니다.
 - 검증 fixture는 사용처로 세지 않습니다. 유지할 항목이 없으면 저장소를 archive합니다.
 - 공통 패키지를 사용하는 제품이 하나뿐이고 API가 그 제품 요구에 따라 계속 변하면 제품 내부로
   환원합니다.
 - 예외 설정과 escape hatch가 정상 사용보다 많아지면 추상화를 폐기하거나 책임을
   다시 나눕니다.
 - 시작 템플릿에 기존 제품과 계속 동기화할 코드가 생기면 템플릿에서 제거합니다. 공통
-  패키지나 workflow로 옮길 때는 위 생성·승격 조건을 적용합니다.
-- 제품별 배포 정책이 공통 workflow에 쌓이면 각 제품 workflow로 돌려보냅니다.
+  패키지로 옮길 때는 위 승격 조건을 적용합니다.
 
 ## 문서 갱신 규칙
 
