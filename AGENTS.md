@@ -30,7 +30,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
   시간·호출·산출물의 낭비 여부, 더 단순한 방법, 코드·글의 간결성·가독성,
   근거를 넘는 결론과 남은 위험을 짧게 복기합니다. 재발 방지에 필요한 변경이
   확인되면 기존 소유 문서·절차에 최소한으로 반영하고 재발 확인 방법을 정합니다.
-- LLM 작업을 할 때는 [LLM 작업](#llm-작업) 규칙도 읽고 적용합니다.
+- LLM 작업을 할 때는 [LLM 작업 규칙](#llm-tasks)도 읽고 적용합니다.
 
 ## Internal versioning
 
@@ -41,7 +41,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 - Migration version은 아래 `Database migrations` 기준의 독립 리뷰가 필수라고 판정하고
   대상 상태, 소유자와 부채 해소·종료 조건을 기록한 경우에만 추가하거나 유지합니다.
 
-## LLM 작업
+## LLM tasks
 
 - LLM 작업의 입력·산출물·검증·완료 기준은 특정 LLM 제품·모델·실행기에 묶지 않습니다.
   필수 절차에 전용 기능이 필요하면 대체 수행 방법을 작업 소유 위치에 둡니다.
