@@ -13,7 +13,7 @@
 - [Tarot Spark](https://github.com/meenseek/tarot-spark) — 카드를 뽑고 읽기 방식을
   선택해 AI 해석용 프롬프트를 만드는 타로 제품입니다.
 
-저장소를 나누는 기준은 [저장소 운영 모델][repository-model]을 따릅니다.
+저장소를 나눌 때는 [저장소 운영 규칙][repository-model]을 따릅니다.
 
 [measure-twice-npm]: https://www.npmjs.com/package/@measure-twice/react
 [measure-twice-storybook]: https://measure-twice-design-system.meenseek5929.workers.dev/
