@@ -46,6 +46,8 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 - 작업 흐름은 달성할 결과를 기준으로 설계·구현·검증·문서화·배포 중 필요한 단계를
   잇습니다.
+- GitHub Actions의 `workflow`는 자동화 실행 단위입니다. 이름이 같다는 이유만으로
+  작업 흐름의 범위나 공통 자동화 저장소의 필요성을 결정하지 않습니다.
 
 ## LLM tasks
 
