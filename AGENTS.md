@@ -3,6 +3,9 @@
 Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대상 저장소의
 더 구체적인 로컬 규칙이 있으면 그 규칙이 우선합니다.
 
+조직 저장소 생성·소유권·연결 점검에서는 [저장소 운영 규칙](docs/repository-rules.md)의
+생성 완료와 재점검 절차를 먼저 읽습니다. 검사기와 문서 검증은 README를 따릅니다.
+
 ## Measurement and improvement
 
 - 작업과 리뷰에서 판단에 필요한 관측을 먼저 확인합니다. 기존 지표·로그·검증을 재사용하고,
