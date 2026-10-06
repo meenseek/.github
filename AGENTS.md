@@ -195,6 +195,7 @@ Python 3.11+와 의도한 계정으로 로그인한 `gh`가 필요합니다. 저
 ```sh
 python3 scripts/check_repositories.py --org meenseek --format json
 python3 scripts/check_repositories.py --org meenseek --repo .github --format markdown
+python3 scripts/check_repositories.py --org meenseek --local-root /absolute/checkouts --format json
 python3 -m unittest discover -s tests -v
 ```
 
@@ -215,6 +216,10 @@ JSON에는 확인 시각, 적용한 기준의 SHA-256, 저장소 ID·이름·상
 미확인만으로 준비 실패를 선언하거나 모든 저장소의 README를 일괄 변경하지 않습니다.
 
 종료 코드 0은 구조 검사 범위만 확인됨, 1은 선언된 참조의 실패, 2는 미확인입니다.
+선택적 `--local-root`는 확인된 조직 이름과 일치하는 `origin`을 가진 직접 하위 checkout의
+Git commit·branch·변경 여부와 README/AGENTS 파일의 SHA·크기만 추가합니다. 다른 저장소,
+미설치·큰 파일·심볼릭 링크·확인 중 바뀐 원문은 확인된 자료로 내보내지 않습니다.
+문서의 명령이나 도메인 검증을 실행하지 않으며 로컬 결과는 배포·서비스·사업 성과를 뜻하지 않습니다.
 어떤 종료 코드도 서비스 준비나 native 정책 적용의 완료를 뜻하지 않습니다.
 권한·네트워크 실패 뒤에는 반환된 범위를 보존하고 다음 승인된 점검에서 재대조합니다.
 누적 결과는 기존 작업·일일 점검 기록에 두며 새 목록 DB나 준비 상태 원장을 만들지 않습니다.

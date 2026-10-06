@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +42,42 @@ class MemoryGitHub:
 
 
 class RepositoryChecks(unittest.TestCase):
+    def test_local_export_verifies_owner_and_does_not_run_document_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "product"
+            checkout.mkdir()
+            for args in (["init", "-q"], ["remote", "add", "origin", "https://github.com/meenseek/product.git"],
+                         ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                          "commit", "-q", "--allow-empty", "-m", "fixture"]):
+                subprocess.run(["git", "-C", str(checkout), *args], check=True, capture_output=True)
+            marker = root / "must-not-exist"
+            (checkout / "README.md").write_text(f"# Owner\n`touch {marker}`\n")
+            result = module.check("meenseek", MemoryGitHub([repository()]), local_root=root)
+            local = result["repositories"][0]["local"]
+            self.assertEqual(local["status"], "confirmed")
+            self.assertTrue(local["dirty"])
+            self.assertEqual(local["entrypoints"]["README.md"]["bytes"], (checkout / "README.md").stat().st_size)
+            self.assertFalse(marker.exists())
+            self.assertEqual(result["repositories"][0]["connections"]["status"], "unknown")
+            subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "origin",
+                            "https://github.com/other/product.git"], check=True)
+            wrong = module.local_source(result["repositories"][0], root)
+            self.assertEqual(wrong["status"], "unknown")
+            self.assertEqual(wrong["entrypoints"], {})
+
+    def test_local_absence_and_symlink_never_become_runtime_failure_or_source_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = {"name": "meenseek/product"}
+            self.assertEqual(module.local_source(row, root)["status"], "unknown")
+            outside = root / "outside"
+            outside.mkdir()
+            (root / "product").symlink_to(outside, target_is_directory=True)
+            result = module.local_source(row, root)
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["entrypoints"], {})
+
     def test_structure_is_not_runtime_readiness_and_no_commands_execute(self):
         repo = repository()
         key = ("product", "a" * 40, "README.md")

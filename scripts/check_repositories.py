@@ -243,7 +243,55 @@ def reference(target, repo, source, inventory, org):
     return (owner["name"], branch["target"]["oid"], path)
 
 
-def check(org, github, selected=None):
+def local_source(repo, root):
+    """Export common source identity only; never execute a repository's commands."""
+    row = {"status": "unknown", "checked_at": datetime.now(timezone.utc).isoformat(),
+           "reason": "local checkout is not available", "entrypoints": {}}
+    path = Path(root).resolve() / repo["name"].split("/", 1)[1]
+    try:
+        if path.is_symlink() or not path.is_dir() or path.resolve().parent != Path(root).resolve():
+            return row
+        def git(*args):
+            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            if result.returncode:
+                raise ReadError("local Git identity could not be verified")
+            return result.stdout.strip()
+        if Path(git("rev-parse", "--show-toplevel")).resolve() != path.resolve():
+            raise ReadError("directory is not the root of this checkout")
+        remote = git("remote", "get-url", "origin")
+        expected = re.escape(repo["name"])
+        if not re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                            + expected + r"(?:\.git)?/?", remote, re.I):
+            raise ReadError("origin does not match the discovered repository")
+        row.update(status="confirmed", path=str(path.resolve()),
+                   commit=git("rev-parse", "HEAD"), branch=git("branch", "--show-current"),
+                   dirty=bool(git("status", "--porcelain")),
+                   reason="local Git and entrypoint bytes only; not runtime or business verification")
+        for name in ("README.md", "AGENTS.md"):
+            source = path / name
+            if not source.exists():
+                row["entrypoints"][name] = {"status": "absent"}
+                continue
+            if source.is_symlink() or not source.is_file() or source.stat().st_size > 1024 * 1024:
+                row["entrypoints"][name] = {"status": "unknown", "reason": "not a bounded regular source"}
+                continue
+            before = source.stat()
+            data = source.read_bytes()
+            after = source.stat()
+            identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                      value.st_mtime_ns, value.st_ctime_ns)
+            if source.is_symlink() or identity(before) != identity(after) or len(data) != after.st_size:
+                row["entrypoints"][name] = {"status": "unknown", "reason": "source changed while reading"}
+                continue
+            row["entrypoints"][name] = {"status": "confirmed", "path": str(source),
+                                        "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    except (OSError, subprocess.TimeoutExpired, ReadError) as exc:
+        row.update(status="unknown", reason=str(exc) if isinstance(exc, ReadError) else type(exc).__name__)
+    return row
+
+
+def check(org, github, selected=None, local_root=None):
     report = {"org": org, "checked_at": datetime.now(timezone.utc).isoformat(),
               "environment": "GitHub committed sources; local runtime checks are separate",
               "policy": {"path": str(POLICY), "sha256": hashlib.sha256(POLICY.read_bytes()).hexdigest()},
@@ -277,6 +325,8 @@ def check(org, github, selected=None):
                "structure": {"status": "unknown", "reason": "connection contract needs owner assessment"},
                "connections": {"status": "unknown", "reason": "owner contract meaning and target environment verification required"}}
         report["repositories"].append(row)
+        if local_root is not None:
+            row["local"] = local_source(row, local_root)
         if not branch:
             row["structure"]["reason"] = "no committed source; assess repository purpose before excluding"
             continue
@@ -369,12 +419,14 @@ def main():
     parser.add_argument("--org", default="meenseek")
     parser.add_argument("--repo", help="one repository name; inventory still spans the organization")
     parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    parser.add_argument("--local-root", type=Path,
+                        help="Optionally export verified local Git/entrypoint identity; no runtime checks")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
         parser.error("invalid organization")
     if args.repo and not re.fullmatch(r"[A-Za-z0-9_.-]+", args.repo):
         parser.error("--repo takes a repository name, without an owner")
-    report = check(args.org, GitHub(), args.repo)
+    report = check(args.org, GitHub(), args.repo, args.local_root)
     print(json.dumps(report, ensure_ascii=False, indent=2) if args.format == "json" else markdown(report), end="\n")
     # Exit success concerns structural checks only; connections are deliberately unassessed.
     statuses = {r["structure"]["status"] for r in report["repositories"]}
