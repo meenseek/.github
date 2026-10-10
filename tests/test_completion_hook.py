@@ -1,4 +1,6 @@
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -30,14 +32,70 @@ class HookTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0 if ok else 2, done.stdout)
         return json.loads(done.stdout)
 
-    def arm_bind(self):
+    def arm_bind(self, finalize=True):
         self.call("arm", "--task-id", self.f.seed["task_id"])
         self.f.seed["state_path"] = str(self.state)
         self.f.freeze()  # reviewed synthetic scope/result stored outside pointer directory
         self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
                   "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"])
-        self.call("finalize", "--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
-                  "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"])
+        if finalize:
+            self.call("finalize", "--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
+                      "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"])
+
+    def completion_args(self):
+        return ["--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
+                "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"]]
+
+    def test_complete_actual_cli_finalizes_inspects_and_releases_once(self):
+        self.arm_bind(finalize=False)
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"]); self.assertTrue(answer["binding_released"])
+        self.assertFalse(self.state.exists())
+        self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
+        self.assertEqual(answer["final_review"], self.f.ref(self.f.final_review_path))
+
+    def test_complete_failure_preserves_reviewed_inputs_for_recovery_and_retry(self):
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "unresolved", *self.basis())
+        answer = self.call("complete", *self.completion_args(), ok=False)
+        self.assertFalse(answer["binding_released"])
+        state = json.loads(self.state.read_bytes())
+        self.assertEqual(state["result_path"], str(self.f.result_path))
+        self.assertEqual(state["final_review"], self.f.ref(self.f.final_review_path))
+        resource = self.f.root / "resource.json"
+        resource.write_text(json.dumps({"kind":"absent", "target":{"path":str(self.f.root / "never-created")}}))
+        self.call("attach", "--id", "unresolved", "--resource", str(resource), *self.basis())
+        self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
+
+    def test_complete_refuses_changed_review_and_stale_pointer(self):
+        self.arm_bind(finalize=False)
+        argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
+                "--expected-sha256", "1"*64, *self.completion_args()]
+        before = self.state.read_bytes()
+        with redirect_stdout(io.StringIO()): self.assertEqual(h.main(argv), 2)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.f.final_review_path.write_text("{}")
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.state.exists())
+
+    def test_complete_reuses_one_inspection_and_retains_mid_inspection_mutation(self):
+        self.arm_bind(finalize=False)
+        argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
+                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.completion_args()]
+        original = h.c.observe
+        def drift(check, expected):
+            answer = original(check, expected)
+            if check["id"] == "installed":
+                state = json.loads(self.state.read_bytes())
+                state["resources"].append({"id":"late", "kind":"reserved", "target":{}, "basis":self.f.ref(self.f.owner)})
+                self.state.write_bytes(h.c.canonical(state) + b"\n")
+            return answer
+        with mock.patch.object(h.c, "check_scope", wraps=h.c.check_scope) as inspect:
+            with mock.patch.object(h.c, "observe", side_effect=drift), redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(argv), 2)
+            self.assertEqual(inspect.call_count, 1)
+        self.assertTrue(self.state.exists())
+        self.assertEqual(json.loads(self.state.read_bytes())["resources"][0]["id"], "late")
 
     def basis(self):
         return ["--basis", str(self.f.owner), "--basis-sha256", self.f.ref(self.f.owner)["sha256"]]

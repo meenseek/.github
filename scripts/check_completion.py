@@ -420,6 +420,70 @@ class NoRedirect(HTTPRedirectHandler):
         raise CompletionError("HTTP redirects are not a current owner observation")
 
 
+def http_expectation(expected):
+    fields(expected, ("revision", "health"))
+    text(expected["revision"])
+    if expected["health"] is not True and (not isinstance(expected["health"], str) or not expected["health"].strip()):
+        raise CompletionError("healthy expectation must be present and affirmative")
+    return expected
+
+
+def draft_result(scope_ref, expectations=None):
+    """Collect a candidate, never acceptance or an independently reviewed result.
+
+    HTTP expectations must come from the owner, not the running endpoint. Source
+    file digests come from committed main, so dirty working bytes cannot silently
+    become the intended source. Exceptions remain empty for explicit review.
+    """
+    scope = read_reference(scope_ref)
+    checks = validate_scope(scope)
+    expectations = {} if expectations is None else decode(canonical(expectations))
+    required = {key for key, check in checks.items() if check["kind"] == "http_json"}
+    fields(expectations, required)
+    for expected in expectations.values():
+        http_expectation(expected)
+
+    def collect(item):
+        key, check = item
+        kind, target = check["kind"], check["target"]
+        if kind == "http_json":
+            return key, expectations[key]
+        if kind in CLEANUP_KINDS:
+            return key, {}  # Absence is still checked after independent review.
+        if kind in {"file", "evidence", "installed_file"}:
+            fields(target, ("path",), ("source",))
+            return key, {"sha256": sha(raw_file(target["path"], links=kind == "installed_file"))}
+        if kind == "git_source":
+            fields(target, ("repository", "remote", "main", "files", "remote_binding"))
+            repo = target["repository"]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", text(target["main"])) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text(target["remote"])):
+                raise CompletionError("invalid named Git main or remote")
+            local = git(repo, "rev-parse", "refs/heads/" + text(target["main"])).decode().strip()
+            remote = remote_ref(repo, target["remote"], "refs/heads/" + target["main"], target["remote_binding"])
+            if remote is None:
+                raise CompletionError("remote main could not be observed")
+            files = {}
+            for filename in target["files"]:
+                relative = Path(text(filename))
+                if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
+                    raise CompletionError("invalid repository-relative source path")
+                files[filename] = sha(git(repo, "show", "--no-ext-diff", "--no-textconv", local + ":" + filename))
+            return key, {"local_revision": local, "remote_revision": remote, "files": files}
+        raise CompletionError("unsupported candidate observation")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        values = dict(pool.map(collect, checks.items()))
+    updates = {ref["path"]: sha(raw_file(ref["path"])) for ref in scope["owners"] if "original" in ref}
+    updates = {name: value for name, value in updates.items()
+               if value != next(ref["sha256"] for ref in scope["owners"] if ref["path"] == name)}
+    reference(scope_ref); reference(scope["request"])
+    current_owners(scope["owners"], updates)
+    result = {"scope_sha256": scope_ref["sha256"], "checks": values, "exceptions": {}}
+    if updates:
+        result["owner_updates"] = updates
+    return result
+
+
 def observe(check, expected):
     kind, target = check["kind"], check["target"]
     if kind in ("file", "evidence", "installed_file"):
@@ -472,10 +536,7 @@ def observe(check, expected):
         return {"absent": True, "pid_reused": actual is not None}
     if kind == "http_json":
         fields(target, ("url", "revision_field", "health_field"))
-        fields(expected, ("revision", "health"))
-        text(expected["revision"])
-        if expected["health"] is not True and (not isinstance(expected["health"], str) or not expected["health"].strip()):
-            raise CompletionError("healthy expectation must be present and affirmative")
+        http_expectation(expected)
         url = urlsplit(text(target["url"]))
         if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.fragment:
             raise CompletionError("expected an owner-bound HTTP endpoint without credentials")
@@ -530,7 +591,7 @@ def observe(check, expected):
     raise CompletionError("unsupported observer")
 
 
-def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False):
+def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
     started = time.monotonic()
     scope = read_reference(scope_ref)
     checks = validate_scope(scope)
@@ -649,12 +710,17 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     if raw_file(result_path) != result_raw or raw_file(scope["state_path"]) != state_raw:
         raise CompletionError("completion input or accumulated resources changed during inspection")
     if stopped: reference(state["status_basis"])
-    return {"complete": not failures and not stopped, "stopped": stopped and not failures, "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
+    answer = {"complete": not failures and not stopped, "stopped": stopped and not failures, "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
             "checked_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
             "observed": observed, "failures": failures, "exceptions": exceptions,
             "resource_state": {"path": scope["state_path"], "sha256": sha(state_raw)},
             "owner_paths": [ref["path"] for ref in scope["owners"]],
             "assurance": "mechanical observations; scope, consent, quality and reviewer independence remain owner judgments"}
+    if report:
+        answer.update(categories=scope["categories"], expectations=result["checks"],
+                      result={"path": str(path(result_path)), "sha256": sha(result_raw)},
+                      scope_review=selected_review, final_review=selected_final)
+    return answer
 
 
 def write_new(filename, value):
@@ -670,6 +736,10 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     begin = sub.add_parser("prepare", help="capture beginning observations before implementation; independent review freezes the output")
     begin.add_argument("--seed", required=True); begin.add_argument("--output", required=True)
+    draft = sub.add_parser("draft", help="collect candidate expectations; independent final review is still required")
+    draft.add_argument("--scope", required=True); draft.add_argument("--sha256", required=True)
+    draft.add_argument("--output", required=True)
+    draft.add_argument("--expectations", help="JSON with exactly the owner-selected HTTP check IDs and revision/health expectations")
     check = sub.add_parser("check", help="observe exact fixed obligations without executing input commands")
     check.add_argument("--scope", required=True); check.add_argument("--sha256", required=True)
     check.add_argument("--result", required=True)
@@ -681,6 +751,10 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             answer = write_new(args.output, prepare(decode(raw_file(args.seed))))
+        elif args.command == "draft":
+            value = draft_result({"path": args.scope, "sha256": args.sha256},
+                                 decode(raw_file(args.expectations)) if args.expectations else None)
+            answer = {**write_new(args.output, value), "review_required": True}
         else:
             answer = check_scope({"path": args.scope, "sha256": args.sha256}, args.result,
                                  task_id=args.task_id, request_digest=args.request_digest, workspace=args.workspace, stopped=args.stopped,

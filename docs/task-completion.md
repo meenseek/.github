@@ -113,10 +113,40 @@ worktree 정리는 점유·보존 확인과 해당 앱의 archive 경계를 따�
 dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하지 않는다.
 
 최종 result는 고정 scope SHA, 모든 obligation ID의 실제 기대값, 정확한 예외만 담는다.
-독립 최종 리뷰는 scope SHA와 **result 파일 SHA**까지 묶어 기대값·예외 변경을 검토한다.
-통과 참조를 `finalize`에 전달한 뒤 `inspect`한다. 큐에서는 원래 request의 `completion`에
+소유 도구의 적용·정리 뒤 `draft`로 이 결과의 후보를 수집할 수 있다.
+아래 `complete`는 직접 채팅의 종료 명령이다. 큐에서는 `finish --status completed`가
+연결된 pointer를 검사하므로 그 전에는 해제하지 않는다.
+
+```sh
+python3 scripts/check_completion.py draft --scope /absolute/scope.json --sha256 SCOPE_SHA --output /absolute/result.json
+python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha256 POINTER_SHA --result /absolute/result.json --review /absolute/final-review.json --review-sha256 REVIEW_SHA
+```
+
+두 명령 사이에 독립 최종 리뷰를 수행한다. 후보는 파일 bytes와 현재 local/remote main을
+수집하며 source 파일 SHA는 local main의 committed bytes를 사용한다. HTTP 검사에는
+`--expectations`로 소유자가 선택한 정확한 check ID별 revision·health를 전달해야 한다.
+실행 중 endpoint에서 목표 revision이나 정상 상태를 자동 선택하지 않는다. 후보의 예외는
+비어 있고, 선언된 owner 변경의 현재 SHA만 `owner_updates`에 담는다. 범위·N/A·승인·리뷰
+통과를 만들거나 이미 있는 결과 파일을 덮어쓰지 않는다. 후보 생성은 완료 검사가 아니다.
+
+독립 최종 리뷰는 scope SHA와 **result 파일 SHA**까지 묶어 기대값·예외·owner 변경을
+검토한다. 수정 뒤에는 영향받은 부분과 연결 계약을 재검증·재리뷰하며, 정확한 최신 result
+SHA의 리뷰 참조를 전달한다. 그대로인 범위의 검증을 반복할 필요는 없다.
+`complete`는 잠금과 pointer CAS 아래 검토된 참조를 먼저 보존하고 기존 검사기를 한 번
+호출한다. 성공하면 pointer를 제거하고 `binding_released: true`와 현재 관측을 JSON으로
+보고한다. 실패·관측 중 변경·미해결 예약이면 pointer와 참조를 남기고 종료 코드 2를 반환한다.
+원인을 해소한 뒤 현재 pointer SHA로 재시도한다. 원래 scope·결과·리뷰는 소유 기록에
+보존하며 출력은 그 기록의 기존 검증 요약으로 연결한다. 별도 보고 파일을 강제하지 않는다.
+보고에는 여덟 범주의 고정 검사·N/A, 기대값, 관측·실패·예외와 정확한 result·리뷰 참조가
+함께 나온다. file hash와 N/A 사유의 의미는 계속 소유자와 독립 검토자가 판단한다.
+
+기존 `finalize`, `inspect`, `unbind`는 중간 확인·복구에 계속 사용할 수 있다.
+큐에서는 원래 request의 `completion`에
 scope·범위 리뷰·검사기 SHA를 고정해 제출하고, 실제 `finish`에 `--completion-result`를
-전달한다. result/validation/review 파일 세 개만으로 이 검사를 우회할 수 없다.
+전달한다. `finalize`로 최종 참조를 연결한 뒤 `finish`의 완료 전이가 성공하면 `complete`로
+현재 자원을 다시 확인하고 세션을 해제한다. result/validation/review 파일 세 개만으로 이
+검사를 우회할 수 없다. 큐와 Stop의 기존 검사 출력은 간결하게 유지하며 상세 보고는
+`complete`에서 생성한다.
 
 검사기는 네 개 이내 worker로 읽기 전용 관측을 수행하고 마지막에 입력·자원·source를
 재대조한다. Git은 사용자 환경의 설정 명령을 상속하지 않으며 네트워크 Git transport를

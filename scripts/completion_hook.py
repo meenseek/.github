@@ -123,7 +123,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "reserve", "attach", "finalize", "outcome", "inspect", "unbind", "release"):
+    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -134,7 +134,7 @@ def main(argv=None):
         if name in {"reserve", "attach"}:
             item.add_argument("--id", required=True); item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
         if name == "attach": item.add_argument("--resource", required=True, help="JSON with fixed kind,target; actual tool handle and owner record")
-        if name == "finalize":
+        if name in {"finalize", "complete"}:
             item.add_argument("--result", required=True); item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "outcome":
             item.add_argument("--status", required=True, choices=("working", "waiting", "blocked", "cancelled"))
@@ -182,8 +182,20 @@ def main(argv=None):
                                 target = resource["target"]
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                             found[0].update(resource, basis=basis)
-                    elif args.command == "finalize":
+                    elif args.command in {"finalize", "complete"}:
                         state.update(result_path=str(c.path(args.result)), final_review=c.reference({"path": args.review, "sha256": args.review_sha256}))
+                        if args.command == "complete":
+                            # Preserve reviewed inputs for recovery before observing. A failed
+                            # inspection leaves this CAS-updated pointer bound for retry.
+                            before = replace(filename, state, before)["sha256"]
+                            scope = c.read_reference(state["scope"])
+                            answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
+                                                   workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
+                            if answer["complete"]:
+                                if c.sha(c.raw_file(str(filename))) != before: raise c.CompletionError("pointer changed")
+                                filename.unlink()
+                            answer["binding_released"] = answer["complete"]
+                            print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
                     elif args.command == "outcome":
                         state.update(outcome=args.status, status_basis=c.reference({"path": args.basis, "sha256": args.basis_sha256}))
                     else:

@@ -110,6 +110,62 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
         self.assertIn("owner judgments", answer["assurance"])
 
+    def test_draft_actual_cli_collects_candidate_without_claiming_completion(self):
+        output = self.root / "candidate.json"
+        before = self.state_path.read_bytes()
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), "draft", "--scope", str(self.scope_path),
+                               "--sha256", self.scope_ref["sha256"], "--output", str(output)], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertTrue(json.loads(done.stdout)["review_required"])
+        self.assertEqual(json.loads(output.read_bytes()), self.result)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertNotIn("complete", json.loads(done.stdout))
+        again = subprocess.run([sys.executable, "-I", str(SCRIPT), "draft", "--scope", str(self.scope_path),
+                                "--sha256", self.scope_ref["sha256"], "--output", str(output)], capture_output=True)
+        self.assertEqual(again.returncode, 2)
+
+    def test_draft_keeps_committed_source_and_cannot_accept_dirty_or_new_resources(self):
+        committed = self.result["checks"]["source"]["files"]["tool.py"]
+        (self.repo / "tool.py").write_text("uncommitted local bytes")
+        (self.artifacts / "temporary.txt").write_text("unclassified")
+        self.result = c.draft_result(self.scope_ref)
+        self.assertEqual(self.result["checks"]["source"]["files"]["tool.py"], committed)
+        self.assertEqual(self.result["exceptions"], {})
+        self.write(self.result_path, self.result); self.final_review()
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertTrue(any(f["id"].startswith("path:") for f in answer["failures"]))
+
+    def test_draft_http_expectations_are_explicit_and_never_observed_from_endpoint(self):
+        self.seed["checks"].append({"id":"live", "category":"deployment", "kind":"http_json",
+                                   "target":{"url":"http://127.0.0.1:1/live", "revision_field":"revision", "health_field":"healthy"}})
+        self.reset_categories()
+        self.write(self.scope_path, c.prepare(self.seed)); self.scope_ref = self.ref(self.scope_path)
+        for expected in (None, {"unknown":{}}, {"live":{"revision":"old", "health":False}}):
+            with self.assertRaises(c.CompletionError): c.draft_result(self.scope_ref, expected)
+        wanted = {"revision":"owner-selected-revision", "health":True}
+        with mock.patch.object(c, "build_opener", side_effect=AssertionError("draft must not choose running health")):
+            self.assertEqual(c.draft_result(self.scope_ref, {"live":wanted})["checks"]["live"], wanted)
+
+    def test_draft_owner_updates_still_require_exact_independent_review(self):
+        self.owner_edit_fixture(); self.update_owner_result()
+        self.result = c.draft_result(self.scope_ref)
+        self.assertEqual(self.result["owner_updates"], {str(self.owner):self.ref(self.owner)["sha256"]})
+        self.write(self.result_path, self.result)
+        self.final_review_path.write_text("{}")
+        self.state["final_review"] = self.ref(self.final_review_path); self.write(self.state_path, self.state)
+        with self.assertRaises(c.CompletionError): self.inspect()
+        self.final_review()
+        self.assertTrue(self.inspect()["complete"])
+
+    def test_report_binds_all_categories_expectations_and_reviewed_result(self):
+        answer = c.check_scope(self.scope_ref, str(self.result_path), report=True)
+        self.assertEqual(answer["categories"], json.loads(self.scope_path.read_bytes())["categories"])
+        self.assertEqual(answer["expectations"], self.result["checks"])
+        self.assertEqual(answer["result"], self.ref(self.result_path))
+        self.assertEqual(answer["final_review"], self.ref(self.final_review_path))
+        self.assertNotIn("expectations", self.inspect())  # Existing queue/host output stays compact.
+
     def test_new_branch_and_dirty_file_and_stash_prevent_completion(self):
         self.git("branch", "feature-unclassified")
         (self.repo / "temporary.txt").write_text("still here")
