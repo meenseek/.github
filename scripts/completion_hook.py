@@ -62,7 +62,7 @@ def replace(filename, value, expected):
 def load_state(filename):
     raw = c.raw_file(str(filename))
     value = c.decode(raw)
-    c.fields(value, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis",))
+    c.fields(value, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery"))
     if value["intent"] != "closure": raise c.CompletionError("invalid closure intent")
     return value, c.sha(raw)
 
@@ -123,7 +123,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release"):
+    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -136,6 +136,9 @@ def main(argv=None):
         if name == "attach": item.add_argument("--resource", required=True, help="JSON with fixed kind,target; actual tool handle and owner record")
         if name in {"finalize", "complete"}:
             item.add_argument("--result", required=True); item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
+        if name == "recover-owner":
+            item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
+            item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "outcome":
             item.add_argument("--status", required=True, choices=("working", "waiting", "blocked", "cancelled"))
             item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
@@ -182,6 +185,18 @@ def main(argv=None):
                                 target = resource["target"]
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                             found[0].update(resource, basis=basis)
+                    elif args.command == "recover-owner":
+                        if state["outcome"] != "waiting" or state["scope"] is None or "owner_recovery" in state:
+                            raise c.CompletionError("owner recovery requires the existing waiting binding and cannot replace a recovery")
+                        c.reference(state.get("status_basis"))
+                        binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                   "review": {"path": args.review, "sha256": args.review_sha256}}
+                        scope = c.read_reference(state["scope"])
+                        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
+                            raise c.CompletionError("scope task/session/resource pointer differs")
+                        recovery = c.owner_recovery(state["scope"], scope, binding)
+                        c.validate_scope(scope, recovery)
+                        state["owner_recovery"] = binding
                     elif args.command in {"finalize", "complete"}:
                         state.update(result_path=str(c.path(args.result)), final_review=c.reference({"path": args.review, "sha256": args.review_sha256}))
                         if args.command == "complete":

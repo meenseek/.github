@@ -163,6 +163,29 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
         self.call("arm", "--task-id", "new-synthetic-task")
 
+    def test_exact_owner_recovery_actual_cli_preserves_binding_and_unbinds(self):
+        self.f.seed["state_path"] = str(self.state)
+        frozen = self.f.recovery_fixture()
+        self.root.mkdir(mode=0o700)
+        waiting = dict(self.f.state); waiting.pop("owner_recovery")
+        waiting.update(outcome="waiting", status_basis=self.f.ref(self.f.request))
+        self.f.write(self.state, waiting)
+        args = ["--evidence", str(self.f.recovery_path), "--evidence-sha256", self.f.ref(self.f.recovery_path)["sha256"],
+                "--review", str(self.f.recovery_review_path), "--review-sha256", self.f.ref(self.f.recovery_review_path)["sha256"]]
+        before = self.state.read_bytes()
+        bad = subprocess.run([sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root), "recover-owner",
+                              "--session", self.f.seed["session_id"], "--expected-sha256", "0" * 64, *args], capture_output=True)
+        self.assertEqual(bad.returncode, 2); self.assertEqual(self.state.read_bytes(), before)
+        self.call("recover-owner", *args)
+        recovered = json.loads(self.state.read_bytes())
+        self.assertEqual(recovered["outcome"], "waiting"); self.assertEqual(recovered["scope"], waiting["scope"])
+        self.assertEqual(recovered["resources"], waiting["resources"]); self.assertEqual(recovered["status_basis"], waiting["status_basis"])
+        self.call("recover-owner", *args, ok=False)
+        self.call("outcome", "--status", "working", "--basis", str(self.f.request), "--basis-sha256", self.f.ref(self.f.request)["sha256"])
+        self.assertTrue(self.call("inspect")["complete"])
+        self.assertTrue(self.call("unbind")["complete"]); self.assertFalse(self.state.exists())
+        self.assertEqual(self.f.scope_path.read_bytes(), frozen)
+
     def test_configuration_preserves_all_handlers_and_is_idempotent(self):
         original = {"description":"Existing owner", "hooks":{"Stop":[{"hooks":[{"type":"command", "command":"owner-command", "timeout":5}]}],
                                                         "Interrupt":[{"hooks":[{"type":"command", "command":"interrupt-owner"}]}]}}

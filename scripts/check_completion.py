@@ -267,14 +267,15 @@ def tree(root):
     return dict(sorted(files.items()))
 
 
-def owner_refs(values):
+def owner_refs(values, recovery=None):
     """Read unchanged live contracts or the committed original of a planned edit."""
     if not isinstance(values, list) or not 1 <= len(values) <= 32:
         raise CompletionError("expected 1..32 owner references")
     for ref in values:
         fields(ref, ("path", "sha256"), ("original",))
         if "original" not in ref:
-            reference(ref)
+            reference({"path": ref["path"], "sha256": recovery["current"]["sha256"]}
+                      if recovery and ref["path"] == recovery["owner_path"] else ref)
             continue
         original = ref["original"]
         fields(original, ("repository", "revision", "file", "identity"))
@@ -293,23 +294,62 @@ def owner_refs(values):
     return values
 
 
-def current_owners(owners, updates):
+def current_owners(owners, updates, recovery=None):
     if not isinstance(updates, dict):
         raise CompletionError("owner updates must be exact path/digest expectations")
     editable = {ref["path"] for ref in owners if "original" in ref}
     if updates.keys() - editable:
         raise CompletionError("owner update was not declared in the frozen source obligations")
-    owner_refs(owners)
+    owner_refs(owners, recovery)
     for ref in owners:
-        reference({"path": ref["path"], "sha256": updates.get(ref["path"], ref["sha256"])})
+        default = recovery["current"]["sha256"] if recovery and ref["path"] == recovery["owner_path"] else ref["sha256"]
+        reference({"path": ref["path"], "sha256": updates.get(ref["path"], default)})
 
 
-def validate_scope(scope):
+def owner_recovery(scope_ref, scope, binding):
+    """Reconcile one reviewed owner drift without replacing the frozen scope."""
+    fields(binding, ("evidence", "review"))
+    evidence = read_reference(binding["evidence"])
+    fields(evidence, ("scope_sha256", "task_id", "session_id", "owner_path", "repository", "identity",
+                      "original", "current", "authorization", "source"))
+    if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
+        raise CompletionError("owner recovery belongs to another frozen task")
+    selected = [ref for ref in scope["owners"] if ref["path"] == evidence["owner_path"]]
+    if len(selected) != 1 or "original" in selected[0]:
+        raise CompletionError("recovery requires one unchanged frozen owner; planned edits use owner_updates")
+    if repo_identity(evidence["repository"]) != evidence["identity"]:
+        raise CompletionError("recovery owner repository identity changed")
+    for key in ("original", "current"):
+        value = evidence[key]
+        fields(value, ("revision", "file", "sha256"))
+        owner_refs([{"path": evidence["owner_path"], "sha256": value["sha256"], "original": {
+            "repository": evidence["repository"], "revision": value["revision"], "file": value["file"], "identity": evidence["identity"]}}])
+    if evidence["original"]["sha256"] != selected[0]["sha256"] or evidence["original"]["file"] != evidence["current"]["file"]:
+        raise CompletionError("recovery changed the original owner contract identity")
+    reference(evidence["authorization"])
+    reviewed = read_reference(binding["review"])
+    if reviewed != {"scope_sha256": scope_ref["sha256"], "recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
+        raise CompletionError("independent recovery review does not cover these exact bytes")
+    source = evidence["source"]
+    fields(source, ("definition", "expected"))
+    fields(source["definition"], ("id", "category", "kind", "target"))
+    target = source["definition"]["target"]
+    if (source["definition"]["kind"] != "git_source" or source["definition"]["category"] != "source"
+            or target.get("repository") != evidence["repository"] or evidence["current"]["file"] not in target.get("files", [])):
+        raise CompletionError("recovery requires the reviewed current owner in canonical source")
+    if source["expected"].get("files", {}).get(evidence["current"]["file"]) != evidence["current"]["sha256"]:
+        raise CompletionError("recovery source bytes differ from the reviewed owner")
+    observe(source["definition"], source["expected"])
+    reference({"path": evidence["owner_path"], "sha256": evidence["current"]["sha256"]})
+    return evidence
+
+
+def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"))
     text(scope["task_id"]); text(scope["session_id"])
     reference(scope["request"]); digest(scope["request_digest"])
-    owners = owner_refs(scope["owners"])
+    owners = owner_refs(scope["owners"], recovery)
     fields(scope["categories"], CATEGORIES)
     if not isinstance(scope["checks"], list) or len(scope["checks"]) > 128:
         raise CompletionError("expected at most 128 checks")
@@ -436,7 +476,14 @@ def draft_result(scope_ref, expectations=None):
     become the intended source. Exceptions remain empty for explicit review.
     """
     scope = read_reference(scope_ref)
-    checks = validate_scope(scope)
+    recovery = None
+    state_raw = raw_file(scope["state_path"]) if path(scope["state_path"]).is_file() else None
+    state = decode(state_raw) if state_raw is not None else {}
+    if "owner_recovery" in state:
+        if (state.get("task_id"), state.get("session_id"), state.get("intent"), state.get("scope")) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
+            raise CompletionError("current resource pointer differs from frozen task")
+        recovery = owner_recovery(scope_ref, scope, state["owner_recovery"])
+    checks = validate_scope(scope, recovery)
     expectations = {} if expectations is None else decode(canonical(expectations))
     required = {key for key, check in checks.items() if check["kind"] == "http_json"}
     fields(expectations, required)
@@ -477,7 +524,11 @@ def draft_result(scope_ref, expectations=None):
     updates = {name: value for name, value in updates.items()
                if value != next(ref["sha256"] for ref in scope["owners"] if ref["path"] == name)}
     reference(scope_ref); reference(scope["request"])
-    current_owners(scope["owners"], updates)
+    if recovery:
+        owner_recovery(scope_ref, scope, state["owner_recovery"])
+        if raw_file(scope["state_path"]) != state_raw:
+            raise CompletionError("recovery binding changed during candidate collection")
+    current_owners(scope["owners"], updates, recovery)
     result = {"scope_sha256": scope_ref["sha256"], "checks": values, "exceptions": {}}
     if updates:
         result["owner_updates"] = updates
@@ -594,7 +645,13 @@ def observe(check, expected):
 def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
     started = time.monotonic()
     scope = read_reference(scope_ref)
-    checks = validate_scope(scope)
+    state_raw = raw_file(scope["state_path"])
+    state = decode(state_raw)
+    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery"))
+    if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
+        raise CompletionError("current resource pointer differs from frozen task")
+    recovery = owner_recovery(scope_ref, scope, state["owner_recovery"]) if "owner_recovery" in state else None
+    checks = validate_scope(scope, recovery)
     if workspace is not None and scope["environment"]["workspace"] != str(path(workspace)):
         raise CompletionError("observer workspace differs from host")
     if task_id is not None and scope["task_id"] != task_id:
@@ -606,12 +663,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates",))
     if not isinstance(result["checks"], dict) or result["scope_sha256"] != scope_ref["sha256"] or set(result["checks"]) != set(checks):
         raise CompletionError("final result changed or omitted fixed obligations")
-    current_owners(scope["owners"], result.get("owner_updates", {}))
-    state_raw = raw_file(scope["state_path"])
-    state = decode(state_raw)
-    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis",))
-    if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
-        raise CompletionError("current resource pointer differs from frozen task")
+    current_owners(scope["owners"], result.get("owner_updates", {}), recovery)
     if stopped:
         if state["outcome"] not in {"blocked", "cancelled"}:
             raise CompletionError("terminal release requires blocked/cancelled, not waiting/completed")
@@ -626,6 +678,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     selected_final = reference(final_review_ref if final_review_ref is not None else state["final_review"])
     reviewed_final = read_reference(selected_final)
     expected_review = {"scope_sha256": scope_ref["sha256"], "result_sha256": sha(result_raw), "status": "No Findings"}
+    if recovery: expected_review["owner_recovery_sha256"] = state["owner_recovery"]["evidence"]["sha256"]
     if stopped: expected_review["disposition"] = "stopped"
     if reviewed_final != expected_review:
         raise CompletionError("final review does not cover these exact expectations and exceptions")
@@ -703,7 +756,8 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
     # Recheck immutable inputs and accumulated handles after observations.
     reference(scope_ref); reference(scope["request"])
-    current_owners(scope["owners"], result.get("owner_updates", {})); reference(selected_review)
+    if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"])
+    current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
     reference(selected_final)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
         raise CompletionError("observer environment changed during inspection")
