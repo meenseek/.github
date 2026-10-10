@@ -1,0 +1,337 @@
+"""Actual isolated Git/files/process/HTTP observations, not production approval."""
+
+import copy
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts/check_completion.py"
+spec = importlib.util.spec_from_file_location("completion", SCRIPT)
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+
+
+class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.remote = self.root / "remote.git"
+        self.git("init", "-b", "main")
+        self.git("config", "user.name", "Synthetic completion test")
+        self.git("config", "user.email", "completion@example.invalid")
+        subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
+        (self.repo / "tool.py").write_text("print('reviewed tool')\n")
+        self.git("add", "tool.py"); self.git("commit", "-m", "test: establish source")
+        self.git("remote", "add", "origin", str(self.remote)); self.git("push", "origin", "main")
+        self.owner = self.root / "owner.md"
+        self.owner.write_text("Synthetic owner: local Python tool, no service deployment.\n")
+        self.request = self.root / "request.txt"
+        self.request.write_text("Synthetic instruction: finish the reviewed local tool.\n")
+        self.installed = self.root / "installed.py"
+        self.installed.symlink_to(self.repo / "tool.py")
+        self.artifacts = self.root / "artifacts"
+        self.artifacts.mkdir()
+        self.scope_path = self.root / "scope.json"
+        self.state_path = self.root / "state.json"
+        self.review_path = self.root / "scope-review.json"
+        self.final_review_path = self.root / "final-review.json"
+        self.result_path = self.root / "result.json"
+        self.seed = {"task_id": "synthetic-task", "session_id": "synthetic-session",
+                     "request": self.ref(self.request), "request_digest": "0" * 64,
+                     "owners": [self.ref(self.owner)],
+                     "checks": [
+                         {"id": "source", "category": "source", "kind": "git_source",
+                          "target": {"repository": str(self.repo), "remote": "origin", "main": "main", "files": ["tool.py"]}},
+                         {"id": "installed", "category": "usage", "kind": "installed_file",
+                          "target": {"path": str(self.installed), "source": str(self.repo / "tool.py")}}],
+                     "categories": {}, "repositories": [str(self.repo)],
+                     "workspace": str(Path.cwd()),
+                     "artifact_roots": [str(self.artifacts)], "state_path": str(self.state_path)}
+        self.reset_categories()
+        self.freeze()
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True).stdout.decode().strip()
+
+    def ref(self, filename):
+        return {"path": str(filename), "sha256": hashlib.sha256(filename.read_bytes()).hexdigest()}
+
+    def write(self, filename, value):
+        filename.write_bytes(c.canonical(value) + b"\n")
+
+    def reset_categories(self):
+        for name in c.CATEGORIES:
+            ids = [x["id"] for x in self.seed["checks"] if x["category"] == name]
+            self.seed["categories"][name] = {"checks": ids, "not_applicable": None if ids else
+                                           {"reason": "Excluded by the synthetic owner contract", "basis": [self.ref(self.owner)]}}
+
+    def freeze(self):
+        self.write(self.scope_path, c.prepare(self.seed))
+        self.scope_ref = self.ref(self.scope_path)
+        self.write(self.review_path, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings"})
+        self.state = {"task_id": self.seed["task_id"], "session_id": self.seed["session_id"], "intent": "closure",
+                      "scope": self.scope_ref, "review": self.ref(self.review_path), "result_path": str(self.result_path),
+                      "final_review": None,
+                      "resources": [], "outcome": "working"}
+        self.write(self.state_path, self.state)
+        revision = self.git("rev-parse", "main")
+        self.result = {"scope_sha256": self.scope_ref["sha256"], "exceptions": {}, "checks": {
+            "source": {"local_revision": revision, "remote_revision": revision,
+                       "files": {"tool.py": self.ref(self.repo / "tool.py")["sha256"]}},
+            "installed": {"sha256": self.ref(self.repo / "tool.py")["sha256"]}}}
+        self.write(self.result_path, self.result)
+        self.final_review()
+
+    def final_review(self):
+        self.write(self.final_review_path, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings",
+                                           "result_sha256": self.ref(self.result_path)["sha256"]})
+        self.state["final_review"] = self.ref(self.final_review_path)
+        self.write(self.state_path, self.state)
+
+    def inspect(self):
+        return c.check_scope(self.scope_ref, str(self.result_path), task_id=self.seed["task_id"], request_digest="0" * 64)
+
+    def test_real_observations_are_read_only_and_complete(self):
+        before = {p: p.read_bytes() for p in (self.scope_path, self.state_path, self.result_path, self.repo / ".git/index")}
+        answer = self.inspect()
+        self.assertTrue(answer["complete"], answer)
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        self.assertIn("owner judgments", answer["assurance"])
+
+    def test_new_branch_and_dirty_file_and_stash_prevent_completion(self):
+        self.git("branch", "feature-unclassified")
+        (self.repo / "temporary.txt").write_text("still here")
+        (self.repo / "tool.py").write_text("local change")
+        self.git("stash", "push", "-m", "unique task state")
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        ids = [f["id"] for f in answer["failures"]]
+        for kind in (":ref:", ":dirty:", ":stash:"):
+            self.assertTrue(any(kind in key for key in ids), ids)
+        self.assertTrue((self.repo / "temporary.txt").exists())
+        self.assertTrue(self.git("stash", "list"))
+
+    def test_preexisting_other_resources_remain_without_being_deleted(self):
+        self.git("branch", "feature-other-owner")
+        (self.repo / "other.txt").write_text("preexisting")
+        self.freeze()
+        self.assertTrue(self.inspect()["complete"])
+        self.assertTrue((self.repo / "other.txt").exists())
+        self.assertIn("feature-other-owner", self.git("branch", "--list"))
+
+    def test_squash_uses_content_not_feature_ancestry(self):
+        self.git("switch", "-c", "feature-task")
+        (self.repo / "tool.py").write_text("print('new reviewed tool')\n")
+        self.git("commit", "-am", "test: update task")
+        feature = self.git("rev-parse", "HEAD")
+        self.git("switch", "main"); self.git("merge", "--squash", "feature-task")
+        self.git("commit", "-m", "test: integrate reviewed bytes")
+        self.git("branch", "-D", "feature-task"); self.git("push", "origin", "main")
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), feature)
+        revision = self.git("rev-parse", "main")
+        wanted = self.ref(self.repo / "tool.py")["sha256"]
+        self.result["checks"]["source"] = {"local_revision": revision, "remote_revision": revision, "files": {"tool.py": wanted}}
+        self.result["checks"]["installed"] = {"sha256": wanted}
+        self.write(self.result_path, self.result)
+        self.final_review()
+        self.assertTrue(self.inspect()["complete"])
+
+    def test_stale_installed_copy_and_remote_main_drift_fail(self):
+        self.installed.unlink(); self.installed.write_text("old installed tool")
+        (self.repo / "tool.py").write_text("new reviewed tool")
+        self.git("commit", "-am", "test: new revision"); self.git("push", "origin", "main")
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertEqual({x["id"] for x in answer["failures"]}, {"source", "installed"})
+
+    def test_all_categories_and_bound_na_basis_are_required(self):
+        seed = copy.deepcopy(self.seed)
+        del seed["categories"]["deployment"]
+        with self.assertRaises(c.CompletionError): c.prepare(seed)
+        seed = copy.deepcopy(self.seed)
+        seed["categories"]["deployment"]["not_applicable"]["basis"] = [self.ref(self.request)]
+        with self.assertRaisesRegex(c.CompletionError, "owner contract"): c.prepare(seed)
+
+    def test_omitted_obligation_and_self_declared_success_are_rejected(self):
+        self.result["checks"].pop("installed"); self.write(self.result_path, self.result)
+        with self.assertRaises(c.CompletionError): self.inspect()
+        self.write(self.result_path, {"complete": True})
+        result = subprocess.run([sys.executable, str(SCRIPT), "check", "--scope", str(self.scope_path),
+                                 "--sha256", self.scope_ref["sha256"], "--result", str(self.result_path)], capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(json.loads(result.stdout)["complete"])
+
+    def test_wrong_task_request_scope_and_review_bytes_fail(self):
+        for args in ({"task_id": "another-task"}, {"request_digest": "1" * 64}):
+            with self.assertRaises(c.CompletionError): c.check_scope(self.scope_ref, str(self.result_path), **args)
+        with self.assertRaises(c.CompletionError): c.check_scope({**self.scope_ref, "sha256": "1" * 64}, str(self.result_path))
+        self.write(self.review_path, {"scope_sha256": "1" * 64, "status": "No Findings"})
+        self.state["review"] = self.ref(self.review_path); self.write(self.state_path, self.state)
+        with self.assertRaises(c.CompletionError): self.inspect()
+
+    def test_scope_and_owner_drift_are_not_reused(self):
+        self.owner.write_text("changed owner policy")
+        with self.assertRaises(c.CompletionError): self.inspect()
+
+    def test_future_artifact_and_pending_resource_reservation_fail(self):
+        new = self.artifacts / "new.bin"; new.write_bytes(b"newly generated")
+        self.state["resources"].append({"id": "helper", "kind": "reserved", "target": {}, "basis": self.ref(self.owner)})
+        self.write(self.state_path, self.state)
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertEqual(len(answer["failures"]), 2)
+        self.assertTrue(new.exists())
+
+    def test_live_process_and_pid_reuse_are_observed_without_killing(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(30)"], stdout=subprocess.PIPE)
+        def close_child():
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=3)
+            child.stdout.close()
+        self.addCleanup(close_child)
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        fake = self.root / "ps"; fake.write_text("#!/bin/sh\nexit 1\n"); fake.chmod(0o700)
+        with mock.patch.dict(c.os.environ, {"PATH": str(self.root)}):
+            identity = c.process_identity(child.pid)
+        self.assertIsNotNone(identity)
+        definition = {"kind": "process_absent", "target": {"pid": child.pid, "identity": identity}}
+        with self.assertRaises(c.CompletionError): c.observe(definition, {})
+        self.assertIsNone(child.poll())
+        child.terminate(); child.wait(timeout=3)
+        self.assertTrue(c.observe(definition, {})["absent"])
+        with mock.patch.object(c, "process_identity", return_value=identity[:20] + "1901" + identity[24:]):
+            self.assertTrue(c.observe(definition, {})["pid_reused"])
+        with mock.patch.object(c, "process_identity", return_value=identity[:24] + " another executable"):
+            with self.assertRaises(c.CompletionError): c.observe(definition, {})
+
+    def test_input_changes_during_observation_are_rejected(self):
+        original = c.observe
+        def drift(check, expected):
+            answer = original(check, expected)
+            if check["id"] == "installed":
+                self.state["resources"].append({"id": "late", "kind": "reserved", "target": {}, "basis": self.ref(self.owner)})
+                self.write(self.state_path, self.state)
+            return answer
+        with mock.patch.object(c, "observe", side_effect=drift):
+            with self.assertRaisesRegex(c.CompletionError, "changed during"): self.inspect()
+
+    def test_http_checks_actual_revision_health_and_refuses_redirect(self):
+        class Handler(BaseHTTPRequestHandler):
+            value = {"revision": "reviewed", "healthy": True}
+            def do_GET(self):
+                if self.path == "/redirect":
+                    self.send_response(302); self.send_header("Location", "/live"); self.end_headers(); return
+                self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(self.value).encode())
+            def log_message(self, *args): pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        target = {"url": f"http://127.0.0.1:{server.server_port}/live", "revision_field": "revision", "health_field": "healthy"}
+        definition = {"kind": "http_json", "target": target}
+        expected = {"revision": "reviewed", "health": True}
+        with mock.patch.dict(c.os.environ, {"HTTP_PROXY":"http://127.0.0.1:1", "NO_PROXY":""}):
+            self.assertEqual(c.observe(definition, expected), expected)
+        Handler.value = {}
+        with self.assertRaises(c.CompletionError): c.observe(definition, {"revision": None, "health": None})
+        with self.assertRaises(c.CompletionError): c.observe(definition, expected)
+        Handler.value = {"revision": "old", "healthy": True}
+        with self.assertRaises(c.CompletionError): c.observe(definition, expected)
+        target["url"] = target["url"].replace("/live", "/redirect")
+        with self.assertRaises(c.CompletionError): c.observe(definition, expected)
+
+    def test_remote_branch_absence_is_current_and_does_not_delete(self):
+        self.git("push", "origin", "main:refs/heads/feature-task")
+        definition = {"kind": "remote_ref_absent", "target": {"repository": str(self.repo), "remote": "origin", "ref": "refs/heads/feature-task", "remote_binding": c.remote_identity(str(self.repo), "origin")}}
+        with self.assertRaises(c.CompletionError): c.observe(definition, {})
+        self.assertIn("feature-task", self.git("ls-remote", "--heads", "origin"))
+        self.git("push", "origin", "--delete", "feature-task")
+        self.assertTrue(c.observe(definition, {})["absent"])
+
+    def test_unrelated_resource_removal_and_bytes_loss_are_detected(self):
+        self.git("branch", "other")
+        (self.repo / "other.txt").write_text("unique existing content")
+        (self.artifacts / "other.txt").write_text("unique artifact")
+        self.freeze()
+        self.git("branch", "-D", "other")
+        (self.repo / "other.txt").write_text("lost content")
+        (self.artifacts / "other.txt").unlink()
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        for part in (":ref:refs/heads/other", ":content:other.txt", "path:"):
+            self.assertTrue(any(part in failure["id"] for failure in answer["failures"]), answer)
+
+    def test_git_transport_cannot_execute_and_remote_identity_is_frozen(self):
+        marker = self.root / "executed"
+        self.git("config", "protocol.ext.allow", "always")
+        self.git("remote", "set-url", "origin", "ext::touch " + str(marker))
+        self.assertFalse(self.inspect()["complete"])
+        self.assertFalse(marker.exists())
+        self.git("remote", "set-url", "origin", str(self.remote))
+        clone = self.root / "clone.git"
+        subprocess.run(["git", "clone", "--bare", str(self.remote), str(clone)], check=True, capture_output=True)
+        self.git("remote", "set-url", "origin", str(clone))
+        self.assertFalse(self.inspect()["complete"])
+        with mock.patch.dict(c.os.environ, {"GIT_CONFIG_COUNT":"1", "GIT_CONFIG_KEY_0":"core.fsmonitor", "GIT_CONFIG_VALUE_0":"touch " + str(marker)}):
+            c.inventory(str(self.repo))
+        self.assertFalse(marker.exists())
+
+    def test_final_source_observation_rejects_drift(self):
+        original = c.observe
+        changed = False
+        def drift(check, expected):
+            nonlocal changed
+            answer = original(check, expected)
+            if check.get("id") == "source" and not changed:
+                changed = True
+                (self.repo / "tool.py").write_text("new source during inspection")
+                self.git("commit", "-am", "test: concurrent change")
+                self.git("push", "origin", "main")
+            return answer
+        with mock.patch.object(c, "observe", side_effect=drift):
+            answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertTrue(any("final source" in f["reason"] for f in answer["failures"]), answer)
+
+    def test_fifo_input_refused_without_waiting(self):
+        fifo = self.root / "fifo"
+        c.os.mkfifo(fifo)
+        with self.assertRaises(c.CompletionError): c.raw_file(str(fifo))
+        artifact_fifo = self.artifacts / "fifo"; c.os.mkfifo(artifact_fifo)
+        with self.assertRaisesRegex(c.CompletionError, "unsupported filesystem"): c.tree(str(self.artifacts))
+
+    def test_empty_directory_and_single_buffer_reference_are_checked(self):
+        empty = self.artifacts / "empty"; empty.mkdir()
+        self.assertFalse(self.inspect()["complete"])
+        self.freeze(); empty.rmdir()
+        self.assertFalse(self.inspect()["complete"])
+        original = c.raw_file
+        calls = []
+        def read(value, *args, **kwargs):
+            calls.append(value); return original(value, *args, **kwargs)
+        with mock.patch.object(c, "raw_file", side_effect=read):
+            c.read_reference(self.scope_ref)
+        self.assertEqual(calls, [str(self.scope_path)])
+
+    def test_duplicate_keys_and_unrecognized_observer_never_execute_input(self):
+        with self.assertRaises(c.CompletionError): c.decode(b'{"scope":1,"scope":2}')
+        seed = copy.deepcopy(self.seed)
+        seed["checks"][0]["kind"] = "shell"
+        seed["checks"][0]["target"] = {"command": "touch arbitrary-file"}
+        with self.assertRaises(c.CompletionError): c.prepare(seed)
+
+
+if __name__ == "__main__":
+    unittest.main()

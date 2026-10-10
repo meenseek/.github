@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Private per-session completion pointers (no task content in Git).
+.completion/
+__pycache__/
+*.pyc
