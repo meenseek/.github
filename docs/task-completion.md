@@ -48,6 +48,17 @@ python3 scripts/check_completion.py prepare --seed /absolute/seed.json --output 
 `prepare`는 시작 Git ref·worktree·dirty bytes·stash와 산출물 bytes, 저장소 common-dir
 identity, 허용된 원격 identity, 실제 검사 바이너리·환경을 고정한다. 불필요한 전체 Desktop
 스캔 대신 작업 소유 위치만 지정한다. baseline 이전 자원은 자동으로 이번 작업 소유가 되지 않는다.
+dirty bytes에는 stage된 파일의 index mode·blob·stage와 작업 파일 bytes를 각각 포함한다.
+같은 상태 문자열로 다시 stage해도 기존 변경의 손실을 구분한다.
+
+수정할 소유 문서는 처음부터 `git_source`의 파일 목록에 선언한다. `prepare`는 현재 owner
+bytes가 HEAD에 보존된 경우 원래 계약의 repository identity·revision·파일·SHA를
+`owners[].original`에 고정한다. 최종 result의 `owner_updates`는 그 정확한 owner 경로와
+검토된 최종 SHA만 담고, 최종 독립 리뷰가 result와 함께 검토한다. 원래 계약·요청·의무를
+바꾸지 않으며 선언하지 않은 owner 변경과 예상하지 않은 현재 bytes는 거부한다.
+N/A 근거는 고정한 원래 owner를 가리키고, 변경 뒤 타당성도 최종 리뷰에서 확인한다.
+Git에 원래 bytes가 없는 계약은 수정 대상으로 묶을 수 없으며, 미변경 계약은 현재 SHA를
+계속 대조한다. 이미 고정된 scope에 이 근거를 소급 추가하지 않는다.
 
 독립 검토자가 실제 요청·승인·소유 계약과 이 정확한 범위 파일을 확인한다. 통과 후
 `scope_sha256`와 `status: No Findings`를 담은 검토 참조를 `bind`에 전달한다. 이 참조의

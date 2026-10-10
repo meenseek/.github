@@ -215,12 +215,21 @@ def environment(workspace):
 
 
 def inventory(repo):
-    dirty_files = git(repo, "ls-files", "-z", "--modified", "--others", "--exclude-standard").decode().split("\0")
+    dirty_files = set(git(repo, "ls-files", "-z", "--modified", "--others", "--exclude-standard").decode().split("\0"))
+    dirty_files.update(git(repo, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv").decode().split("\0"))
+    dirty_files = sorted(dirty_files - {""})
+    index = {}
+    for start in range(0, len(dirty_files), 32):
+        records = git(repo, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", *dirty_files[start:start + 32])
+        for record in records.decode().split("\0"):
+            if record:
+                metadata, filename = record.split("\t", 1)
+                index.setdefault(filename, []).append(metadata)
     dirty_bytes = {}
     for filename in dirty_files:
-        if filename:
-            entry = path(repo) / filename
-            dirty_bytes[filename] = file_identity(entry) if os.path.lexists(entry) else None
+        entry = path(repo) / filename
+        dirty_bytes[filename] = {"worktree": file_identity(entry) if os.path.lexists(entry) else None,
+                                 "index": index.get(filename, [])}
     return {
         "identity": repo_identity(repo),
         "refs": dict(line.split(" ", 1) for line in git(repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes").decode().splitlines()),
@@ -258,12 +267,49 @@ def tree(root):
     return dict(sorted(files.items()))
 
 
+def owner_refs(values):
+    """Read unchanged live contracts or the committed original of a planned edit."""
+    if not isinstance(values, list) or not 1 <= len(values) <= 32:
+        raise CompletionError("expected 1..32 owner references")
+    for ref in values:
+        fields(ref, ("path", "sha256"), ("original",))
+        if "original" not in ref:
+            reference(ref)
+            continue
+        original = ref["original"]
+        fields(original, ("repository", "revision", "file", "identity"))
+        relative = Path(text(original["file"]))
+        if relative.is_absolute() or ".." in relative.parts or str(relative).startswith(":"):
+            raise CompletionError("invalid owner source path")
+        if path(ref["path"]) != path(original["repository"]) / relative:
+            raise CompletionError("owner source identity differs")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", text(original["revision"])):
+            raise CompletionError("owner original requires a full Git revision")
+        if repo_identity(original["repository"]) != original["identity"]:
+            raise CompletionError("owner repository identity changed")
+        raw = git(original["repository"], "show", "--no-ext-diff", "--no-textconv", original["revision"] + ":" + original["file"])
+        if sha(raw) != digest(ref["sha256"]):
+            raise CompletionError("owner original bytes changed")
+    return values
+
+
+def current_owners(owners, updates):
+    if not isinstance(updates, dict):
+        raise CompletionError("owner updates must be exact path/digest expectations")
+    editable = {ref["path"] for ref in owners if "original" in ref}
+    if updates.keys() - editable:
+        raise CompletionError("owner update was not declared in the frozen source obligations")
+    owner_refs(owners)
+    for ref in owners:
+        reference({"path": ref["path"], "sha256": updates.get(ref["path"], ref["sha256"])})
+
+
 def validate_scope(scope):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"))
     text(scope["task_id"]); text(scope["session_id"])
     reference(scope["request"]); digest(scope["request_digest"])
-    owners = refs(scope["owners"])
+    owners = owner_refs(scope["owners"])
     fields(scope["categories"], CATEGORIES)
     if not isinstance(scope["checks"], list) or len(scope["checks"]) > 128:
         raise CompletionError("expected at most 128 checks")
@@ -276,6 +322,12 @@ def validate_scope(scope):
         if not isinstance(check["target"], dict):
             raise CompletionError("check target must be an object")
         checks[key] = check
+    for owner in owners:
+        if "original" in owner and not any(
+            check["kind"] == "git_source" and check["target"].get("repository") == owner["original"]["repository"]
+            and owner["original"]["file"] in check["target"].get("files", []) for check in checks.values()
+        ):
+            raise CompletionError("owner edit is outside the frozen source obligations")
     for name, category in scope["categories"].items():
         fields(category, ("checks", "not_applicable"))
         expected = [key for key, check in checks.items() if check["category"] == name]
@@ -287,8 +339,12 @@ def validate_scope(scope):
         else:
             fields(category["not_applicable"], ("reason", "basis"))
             text(category["not_applicable"]["reason"])
-            for ref in refs(category["not_applicable"]["basis"]):
-                if ref not in owners:
+            basis = category["not_applicable"]["basis"]
+            if not isinstance(basis, list) or not 1 <= len(basis) <= 32:
+                raise CompletionError("expected 1..32 N/A owner references")
+            for ref in basis:
+                fields(ref, ("path", "sha256"))
+                if not any(ref == {"path": owner["path"], "sha256": owner["sha256"]} for owner in owners):
                     raise CompletionError("N/A requires a bound owner contract")
     for key in ("repositories", "artifact_roots"):
         if not isinstance(scope[key], list) or len(scope[key]) > 16 or len(scope[key]) != len(set(scope[key])):
@@ -319,6 +375,22 @@ def prepare(seed):
     fields(seed, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                   "repositories", "artifact_roots", "state_path", "workspace"))
     seed = decode(canonical(seed))
+    refs(seed["owners"])
+    for owner in seed["owners"]:
+        for check in seed["checks"]:
+            if check["kind"] != "git_source":
+                continue
+            target = check["target"]
+            repo = target["repository"]
+            for filename in target["files"]:
+                if path(owner["path"]) != path(repo) / filename:
+                    continue
+                revision = git(repo, "rev-parse", "HEAD").decode().strip()
+                original = git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)
+                if sha(original) != owner["sha256"]:
+                    raise CompletionError("planned owner edit requires committed original bytes")
+                owner["original"] = {"repository": repo, "revision": revision, "file": filename,
+                                     "identity": repo_identity(repo)}
     for check in seed["checks"]:
         if check["kind"] in {"git_source", "remote_ref_absent"}:
             target = check["target"]
@@ -470,9 +542,10 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         raise CompletionError("original request differs from host")
     result_raw = raw_file(result_path)
     result = decode(result_raw)
-    fields(result, ("scope_sha256", "checks", "exceptions"))
+    fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates",))
     if not isinstance(result["checks"], dict) or result["scope_sha256"] != scope_ref["sha256"] or set(result["checks"]) != set(checks):
         raise CompletionError("final result changed or omitted fixed obligations")
+    current_owners(scope["owners"], result.get("owner_updates", {}))
     state_raw = raw_file(scope["state_path"])
     state = decode(state_raw)
     fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis",))
@@ -568,7 +641,8 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
     # Recheck immutable inputs and accumulated handles after observations.
-    reference(scope_ref); reference(scope["request"]); refs(scope["owners"]); reference(selected_review)
+    reference(scope_ref); reference(scope["request"])
+    current_owners(scope["owners"], result.get("owner_updates", {})); reference(selected_review)
     reference(selected_final)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
         raise CompletionError("observer environment changed during inspection")

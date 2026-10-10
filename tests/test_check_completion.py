@@ -89,7 +89,7 @@ class CompletionTests(unittest.TestCase):
         revision = self.git("rev-parse", "main")
         self.result = {"scope_sha256": self.scope_ref["sha256"], "exceptions": {}, "checks": {
             "source": {"local_revision": revision, "remote_revision": revision,
-                       "files": {"tool.py": self.ref(self.repo / "tool.py")["sha256"]}},
+                       "files": {name: self.ref(self.repo / name)["sha256"] for name in self.seed["checks"][0]["target"]["files"]}},
             "installed": {"sha256": self.ref(self.repo / "tool.py")["sha256"]}}}
         self.write(self.result_path, self.result)
         self.final_review()
@@ -272,6 +272,111 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(answer["complete"])
         for part in (":ref:refs/heads/other", ":content:other.txt", "path:"):
             self.assertTrue(any(part in failure["id"] for failure in answer["failures"]), answer)
+
+    def test_staged_only_and_mixed_worktree_index_loss_are_detected(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                other = self.repo / "other.txt"
+                other.write_text(f"committed original {mixed}")
+                self.git("add", "other.txt"); self.git("commit", "-m", "test: other owner's source")
+                self.git("push", "origin", "main")
+                other.write_text("unique staged change"); self.git("add", "other.txt")
+                if mixed: other.write_text("unique unstaged change")
+                self.freeze()
+                self.assertTrue(self.inspect()["complete"])
+                status = self.git("status", "--porcelain")
+                working = other.read_bytes()
+                other.write_text("lost staged content"); self.git("add", "other.txt")
+                if mixed: other.write_bytes(working)
+                self.assertEqual(self.git("status", "--porcelain"), status)
+                answer = self.inspect()
+                self.assertFalse(answer["complete"])
+                self.assertTrue(any(f["id"].endswith(":content:other.txt") for f in answer["failures"]), answer)
+                self.git("reset", "--hard", "HEAD")  # Isolated synthetic repository only.
+
+    def owner_edit_fixture(self):
+        self.owner = self.repo / "README.md"
+        self.owner.write_text("Synthetic original local tool contract.\n")
+        self.git("add", "README.md"); self.git("commit", "-m", "test: establish owner contract")
+        self.git("push", "origin", "main")
+        self.seed["owners"] = [self.ref(self.owner)]
+        self.seed["checks"][0]["target"]["files"].append("README.md")
+        self.reset_categories(); self.freeze()
+
+    def update_owner_result(self):
+        self.owner.write_text("Synthetic reviewed updated local tool contract.\n")
+        self.git("add", "README.md"); self.git("commit", "-m", "test: update owner contract")
+        self.git("push", "origin", "main")
+        revision = self.git("rev-parse", "HEAD")
+        wanted = self.ref(self.owner)["sha256"]
+        self.result["checks"]["source"].update(local_revision=revision, remote_revision=revision)
+        self.result["checks"]["source"]["files"]["README.md"] = wanted
+        self.result["owner_updates"] = {str(self.owner): wanted}
+        self.write(self.result_path, self.result); self.final_review()
+
+    def test_reviewed_planned_owner_edit_preserves_original_and_completes(self):
+        self.owner_edit_fixture()
+        original_scope = self.scope_path.read_bytes()
+        self.update_owner_result()
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(self.scope_path.read_bytes(), original_scope)
+        del self.result["owner_updates"]
+        self.write(self.result_path, self.result); self.final_review()
+        with self.assertRaisesRegex(c.CompletionError, "source bytes changed"):
+            self.inspect()
+
+    def test_unplanned_owner_update_and_unreviewed_expected_bytes_refuse(self):
+        self.owner_edit_fixture(); self.update_owner_result()
+        self.result["owner_updates"][str(self.request)] = self.ref(self.request)["sha256"]
+        self.write(self.result_path, self.result); self.final_review()
+        with self.assertRaisesRegex(c.CompletionError, "not declared"):
+            self.inspect()
+        del self.result["owner_updates"][str(self.request)]
+        self.write(self.result_path, self.result)  # Deliberately omit a review for these result bytes.
+        with self.assertRaisesRegex(c.CompletionError, "final review"):
+            self.inspect()
+
+    def test_owner_update_drift_during_inspection_is_rejected(self):
+        self.owner_edit_fixture(); self.update_owner_result()
+        original = c.observe
+        def drift(check, expected):
+            answer = original(check, expected)
+            if check["id"] == "installed": self.owner.write_text("unreviewed concurrent policy")
+            return answer
+        with mock.patch.object(c, "observe", side_effect=drift):
+            with self.assertRaisesRegex(c.CompletionError, "source bytes changed"):
+                self.inspect()
+
+    def test_planned_owner_edit_actual_cli_unbind_and_stopped_release(self):
+        for command in ("unbind", "release"):
+            with self.subTest(command=command):
+                f = CompletionTests(); f.setUp(); self.addCleanup(f.doCleanups)
+                f.state_path = f.root / (f.seed["session_id"] + ".json")
+                f.seed["state_path"] = str(f.state_path)
+                f.owner_edit_fixture(); f.update_owner_result()
+                if command == "release":
+                    f.state.update(outcome="blocked", status_basis=f.ref(f.owner))
+                    before = json.loads(f.scope_path.read_bytes())["baseline"]["repositories"][str(f.repo)]["refs"]
+                    after = c.inventory(str(f.repo))["refs"]
+                    for ref in before.keys() | after.keys():
+                        if before.get(ref) != after.get(ref):
+                            key = "git:" + str(f.repo) + ":ref:" + ref
+                            f.result["exceptions"][key] = {"owner":"synthetic owner", "reason":"Reviewed stopped-state owner edit", "scope":key,
+                                                           "removal_condition":"Next authorized work", "basis":[f.ref(f.owner)]}
+                    f.write(f.result_path, f.result)
+                    reviewed = {"scope_sha256": f.scope_ref["sha256"], "result_sha256": f.ref(f.result_path)["sha256"],
+                                "status":"No Findings", "disposition":"stopped"}
+                    f.write(f.final_review_path, reviewed)
+                    f.state["final_review"] = f.ref(f.final_review_path)
+                    f.write(f.state_path, f.state)
+                done = subprocess.run([sys.executable, "-I", str(SCRIPT.with_name("completion_hook.py")), "--bindings", str(f.root), command,
+                                       "--session", f.seed["session_id"], "--expected-sha256", f.ref(f.state_path)["sha256"]],
+                                      capture_output=True, timeout=35)
+                self.assertEqual(done.returncode, 0, done.stdout)
+                answer = json.loads(done.stdout)
+                self.assertEqual(answer["complete"], command == "unbind")
+                self.assertEqual(answer["stopped"], command == "release")
+                self.assertFalse(f.state_path.exists())
 
     def test_git_transport_cannot_execute_and_remote_identity_is_frozen(self):
         marker = self.root / "executed"
