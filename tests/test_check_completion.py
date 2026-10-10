@@ -370,15 +370,24 @@ class CompletionTests(unittest.TestCase):
         self.result["owner_updates"] = {str(self.owner): wanted}
         self.write(self.result_path, self.result); self.final_review()
 
-    def recovery_fixture(self):
+    def recovery_fixture(self, two_owners=False):
         self.owner = self.repo / "README.md"
         self.owner.write_text("Synthetic frozen owner before external drift.\n")
+        other = self.repo / "other-owner.md"
+        if two_owners:
+            other.write_text("Second frozen owner.\n")
+            self.git("add", "other-owner.md")
         self.git("add", "README.md"); self.git("commit", "-m", "test: frozen owner")
         self.git("push", "origin", "main")
         original = {"revision": self.git("rev-parse", "HEAD"), "file": "README.md", "sha256": self.ref(self.owner)["sha256"]}
-        self.seed["owners"] = [self.ref(self.owner)]; self.reset_categories(); self.freeze()
+        self.seed["owners"] = [self.ref(self.owner)] + ([self.ref(other)] if two_owners else [])
+        other_original = {"revision": original["revision"], "file": "other-owner.md", "sha256": self.ref(other)["sha256"]} if two_owners else None
+        self.reset_categories(); self.freeze()
         frozen_bytes = self.scope_path.read_bytes()
         self.owner.write_text("Synthetic externally changed and reviewed current owner.\n")
+        if two_owners:
+            other.write_text("Second externally changed and reviewed owner.\n")
+            self.git("add", "other-owner.md")
         self.git("add", "README.md"); self.git("commit", "-m", "test: external owner drift")
         self.git("push", "origin", "main")
         revision = self.git("rev-parse", "HEAD")
@@ -388,9 +397,15 @@ class CompletionTests(unittest.TestCase):
         wanted = copy.deepcopy(self.result["checks"]["source"]); wanted["files"]["README.md"] = self.ref(self.owner)["sha256"]
         self.recovery_path = self.root / "recovery.json"; self.recovery_review_path = self.root / "recovery-review.json"
         self.recovery = {"scope_sha256": self.scope_ref["sha256"], "task_id": self.seed["task_id"], "session_id": self.seed["session_id"],
-                         "owner_path": str(self.owner), "repository": str(self.repo), "identity": c.repo_identity(str(self.repo)),
+                         "authorization": self.ref(self.request), "owners": [{"owner_path": str(self.owner), "repository": str(self.repo), "identity": c.repo_identity(str(self.repo)),
                          "original": original, "current": {"revision": revision, "file": "README.md", "sha256": self.ref(self.owner)["sha256"]},
-                         "authorization": self.ref(self.request), "source": {"definition": source, "expected": wanted}}
+                         "source": {"definition": source, "expected": wanted}}]}
+        if two_owners:
+            other_source = copy.deepcopy(source); other_source["target"]["files"].append("other-owner.md")
+            other_wanted = copy.deepcopy(wanted); other_wanted["files"]["other-owner.md"] = self.ref(other)["sha256"]
+            self.recovery["owners"].append({"owner_path": str(other), "repository": str(self.repo), "identity": c.repo_identity(str(self.repo)),
+                "original": other_original, "current": {"revision": revision, "file": "other-owner.md", "sha256": self.ref(other)["sha256"]},
+                "source": {"definition": other_source, "expected": other_wanted}})
         self.write(self.recovery_path, self.recovery)
         self.write(self.recovery_review_path, {"scope_sha256": self.scope_ref["sha256"], "recovery_sha256": self.ref(self.recovery_path)["sha256"], "status": "No Findings"})
         self.recovery_binding = {"evidence": self.ref(self.recovery_path), "review": self.ref(self.recovery_review_path)}
@@ -412,11 +427,32 @@ class CompletionTests(unittest.TestCase):
         self.write(self.state_path, self.state)
         self.assertIn("resource:pending", [f["id"] for f in self.inspect()["failures"]])
 
+    def test_recovery_covers_multiple_exact_owners_and_rejects_duplicate_or_omitted_drift(self):
+        frozen = self.recovery_fixture(two_owners=True)
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(c.draft_result(self.scope_ref), self.result)
+        self.assertEqual(self.scope_path.read_bytes(), frozen)
+        for owners in ([self.recovery["owners"][0]] * 2, self.recovery["owners"][:1],
+                       self.recovery["owners"] + [self.recovery["owners"][0]]):
+            value = {**self.recovery, "owners": owners}; self.write(self.recovery_path, value)
+            evidence_ref = self.ref(self.recovery_path)
+            self.write(self.recovery_review_path, {"scope_sha256": self.scope_ref["sha256"], "recovery_sha256": evidence_ref["sha256"], "status": "No Findings"})
+            binding = {"evidence": evidence_ref, "review": self.ref(self.recovery_review_path)}
+            with self.assertRaises(c.CompletionError):
+                recovery = c.owner_recovery(self.scope_ref, json.loads(frozen), binding)
+                c.validate_scope(json.loads(frozen), recovery)
+        self.write(self.recovery_path, self.recovery)
+        self.write(self.recovery_review_path, {"scope_sha256": self.scope_ref["sha256"], "recovery_sha256": self.ref(self.recovery_path)["sha256"], "status": "No Findings"})
+        (self.repo / "other-owner.md").write_text("new unreviewed drift")
+        with self.assertRaises(c.CompletionError): self.inspect()
+
     def test_recovery_requires_exact_task_owner_identity_and_independent_review(self):
         self.recovery_fixture()
         for key, bad in (("scope_sha256", "1" * 64), ("owner_path", str(self.request)), ("task_id", "another"), ("identity", {})):
             with self.subTest(key=key):
-                value = copy.deepcopy(self.recovery); value[key] = bad; self.write(self.recovery_path, value)
+                value = copy.deepcopy(self.recovery)
+                (value["owners"][0] if key in ("owner_path", "identity") else value)[key] = bad
+                self.write(self.recovery_path, value)
                 binding = {**self.recovery_binding, "evidence": self.ref(self.recovery_path)}
                 with self.assertRaises(c.CompletionError): c.owner_recovery(self.scope_ref, json.loads(self.scope_path.read_bytes()), binding)
         self.write(self.recovery_path, self.recovery)

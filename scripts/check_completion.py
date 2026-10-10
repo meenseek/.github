@@ -274,8 +274,8 @@ def owner_refs(values, recovery=None):
     for ref in values:
         fields(ref, ("path", "sha256"), ("original",))
         if "original" not in ref:
-            reference({"path": ref["path"], "sha256": recovery["current"]["sha256"]}
-                      if recovery and ref["path"] == recovery["owner_path"] else ref)
+            current = recovery.get(ref["path"]) if recovery else None
+            reference({"path": ref["path"], "sha256": current} if current else ref)
             continue
         original = ref["original"]
         fields(original, ("repository", "revision", "file", "identity"))
@@ -302,46 +302,51 @@ def current_owners(owners, updates, recovery=None):
         raise CompletionError("owner update was not declared in the frozen source obligations")
     owner_refs(owners, recovery)
     for ref in owners:
-        default = recovery["current"]["sha256"] if recovery and ref["path"] == recovery["owner_path"] else ref["sha256"]
+        default = recovery.get(ref["path"], ref["sha256"]) if recovery else ref["sha256"]
         reference({"path": ref["path"], "sha256": updates.get(ref["path"], default)})
 
 
 def owner_recovery(scope_ref, scope, binding):
-    """Reconcile one reviewed owner drift without replacing the frozen scope."""
+    """Reconcile exact reviewed owner drifts without replacing the frozen scope."""
     fields(binding, ("evidence", "review"))
     evidence = read_reference(binding["evidence"])
-    fields(evidence, ("scope_sha256", "task_id", "session_id", "owner_path", "repository", "identity",
-                      "original", "current", "authorization", "source"))
+    fields(evidence, ("scope_sha256", "task_id", "session_id", "authorization", "owners"))
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("owner recovery belongs to another frozen task")
-    selected = [ref for ref in scope["owners"] if ref["path"] == evidence["owner_path"]]
-    if len(selected) != 1 or "original" in selected[0]:
-        raise CompletionError("recovery requires one unchanged frozen owner; planned edits use owner_updates")
-    if repo_identity(evidence["repository"]) != evidence["identity"]:
-        raise CompletionError("recovery owner repository identity changed")
-    for key in ("original", "current"):
-        value = evidence[key]
-        fields(value, ("revision", "file", "sha256"))
-        owner_refs([{"path": evidence["owner_path"], "sha256": value["sha256"], "original": {
-            "repository": evidence["repository"], "revision": value["revision"], "file": value["file"], "identity": evidence["identity"]}}])
-    if evidence["original"]["sha256"] != selected[0]["sha256"] or evidence["original"]["file"] != evidence["current"]["file"]:
-        raise CompletionError("recovery changed the original owner contract identity")
     reference(evidence["authorization"])
     reviewed = read_reference(binding["review"])
     if reviewed != {"scope_sha256": scope_ref["sha256"], "recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("independent recovery review does not cover these exact bytes")
-    source = evidence["source"]
-    fields(source, ("definition", "expected"))
-    fields(source["definition"], ("id", "category", "kind", "target"))
-    target = source["definition"]["target"]
-    if (source["definition"]["kind"] != "git_source" or source["definition"]["category"] != "source"
-            or target.get("repository") != evidence["repository"] or evidence["current"]["file"] not in target.get("files", [])):
-        raise CompletionError("recovery requires the reviewed current owner in canonical source")
-    if source["expected"].get("files", {}).get(evidence["current"]["file"]) != evidence["current"]["sha256"]:
-        raise CompletionError("recovery source bytes differ from the reviewed owner")
-    observe(source["definition"], source["expected"])
-    reference({"path": evidence["owner_path"], "sha256": evidence["current"]["sha256"]})
-    return evidence
+    if not isinstance(evidence["owners"], list) or not 1 <= len(evidence["owners"]) <= len(scope["owners"]):
+        raise CompletionError("recovery requires a bounded list of frozen owners")
+    recovered = {}
+    for owner in evidence["owners"]:
+        fields(owner, ("owner_path", "repository", "identity", "original", "current", "source"))
+        selected = [ref for ref in scope["owners"] if ref["path"] == owner["owner_path"]]
+        if len(selected) != 1 or "original" in selected[0] or owner["owner_path"] in recovered:
+            raise CompletionError("recovery requires unique unchanged frozen owners; planned edits use owner_updates")
+        if repo_identity(owner["repository"]) != owner["identity"]:
+            raise CompletionError("recovery owner repository identity changed")
+        for key in ("original", "current"):
+            value = owner[key]
+            fields(value, ("revision", "file", "sha256"))
+            owner_refs([{"path": owner["owner_path"], "sha256": value["sha256"], "original": {
+                "repository": owner["repository"], "revision": value["revision"], "file": value["file"], "identity": owner["identity"]}}])
+        if owner["original"]["sha256"] != selected[0]["sha256"] or owner["original"]["file"] != owner["current"]["file"]:
+            raise CompletionError("recovery changed the original owner contract identity")
+        source = owner["source"]
+        fields(source, ("definition", "expected"))
+        fields(source["definition"], ("id", "category", "kind", "target"))
+        target = source["definition"]["target"]
+        if (source["definition"]["kind"] != "git_source" or source["definition"]["category"] != "source"
+                or target.get("repository") != owner["repository"] or owner["current"]["file"] not in target.get("files", [])):
+            raise CompletionError("recovery requires the reviewed current owner in canonical source")
+        if source["expected"].get("files", {}).get(owner["current"]["file"]) != owner["current"]["sha256"]:
+            raise CompletionError("recovery source bytes differ from the reviewed owner")
+        observe(source["definition"], source["expected"])
+        reference({"path": owner["owner_path"], "sha256": owner["current"]["sha256"]})
+        recovered[owner["owner_path"]] = owner["current"]["sha256"]
+    return recovered
 
 
 def validate_scope(scope, recovery=None):

@@ -70,7 +70,8 @@ Git에 원래 bytes가 없는 계약은 수정 대상으로 묶을 수 없으며
 
 다른 작업이 수정한 소유 계약 때문에 기존 waiting 세션의 현재 hash 검사가 막혔으면
 원래 scope·요청·baseline·의무·예약 자원을 유지한 채 `recover-owner`를 사용한다.
-변경 전 bytes와 독립 검토한 현재 bytes를 같은 Git repository identity·정확한 owner 파일의
+변경된 기존 owner의 정확한 목록을 한 evidence에 고정하고 중복·새 owner를 거부한다.
+각 변경 전 bytes와 독립 검토한 현재 bytes를 같은 Git repository identity·정확한 owner 파일의
 전체 revision·SHA에 묶는다. 근거는 scope SHA·task/session, 승인 참조, 현재 canonical
 main/remote의 `git_source` definition/expected를 포함하고 source 파일 목록에 owner를 넣는다.
 독립 리뷰는 scope SHA·recovery evidence SHA·`No Findings`를 정확히 묶는다.
@@ -79,8 +80,8 @@ main/remote의 `git_source` definition/expected를 포함하고 source 파일 �
 python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected-sha256 POINTER_SHA --evidence /absolute/recovery.json --evidence-sha256 RECOVERY_SHA --review /absolute/recovery-review.json --review-sha256 REVIEW_SHA
 ```
 
-이 명령은 기존 waiting pointer에 한 owner의 evidence/review 참조만 CAS로 추가한다.
-원래 planned-edit `original`이 없는 owner 하나에만 적용하며 scope를 재고정하거나
+이 명령은 기존 waiting pointer에 그 목록의 evidence/review 참조 한 쌍만 CAS로 추가한다.
+원래 scope에 있고 planned-edit `original`이 없는 owner에만 적용하며 scope를 재고정하거나
 `owner_updates` 허용 경로를 늘리지 않는다. 상태 근거와 이전 리뷰도 보존하고 재개는
 별도 `outcome working`으로 한다. 이미 연결한 recovery를 교체하지 않는다.
 최종 리뷰는 기존 scope/result SHA와 추가 `owner_recovery_sha256`를 묶는다.

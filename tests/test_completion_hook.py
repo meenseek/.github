@@ -165,7 +165,7 @@ class HookTests(unittest.TestCase):
 
     def test_exact_owner_recovery_actual_cli_preserves_binding_and_unbinds(self):
         self.f.seed["state_path"] = str(self.state)
-        frozen = self.f.recovery_fixture()
+        frozen = self.f.recovery_fixture(two_owners=True)
         self.root.mkdir(mode=0o700)
         waiting = dict(self.f.state); waiting.pop("owner_recovery")
         waiting.update(outcome="waiting", status_basis=self.f.ref(self.f.request))
