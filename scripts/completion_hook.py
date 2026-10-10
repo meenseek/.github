@@ -11,6 +11,8 @@ import shlex
 import sys
 import tempfile
 
+# Hook observations must not create repository bytecode artifacts.
+sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location("completion", Path(__file__).with_name("check_completion.py"))
 c = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(c)

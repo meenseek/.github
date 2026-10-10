@@ -42,6 +42,16 @@ class HookTests(unittest.TestCase):
     def basis(self):
         return ["--basis", str(self.f.owner), "--basis-sha256", self.f.ref(self.f.owner)["sha256"]]
 
+    def test_installed_cli_does_not_create_local_bytecode(self):
+        runtime = self.f.root / "runtime"; runtime.mkdir()
+        import shutil
+        for name in ("completion_hook.py", "check_completion.py"):
+            shutil.copyfile(SCRIPT.with_name(name), runtime / name)
+        done = subprocess.run([sys.executable, "-I", str(runtime / "completion_hook.py"), "--bindings", str(self.root), "hook"],
+                              input=json.dumps(self.payload).encode(), capture_output=True, timeout=10)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertFalse((runtime / "__pycache__").exists())
+
     def test_unbound_guidance_and_context_have_no_inspection(self):
         with mock.patch.object(h.c, "check_scope", side_effect=AssertionError("unbound must not inspect")):
             self.assertNotIn("decision", h.hook(self.payload, self.root))
