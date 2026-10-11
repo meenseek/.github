@@ -110,6 +110,56 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
         self.assertIn("owner judgments", answer["assurance"])
 
+    def test_large_binary_source_draft_and_check_preserve_exact_bytes(self):
+        png = self.repo / "large.png"
+        payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8193
+        png.write_bytes(payload)
+        self.git("add", "large.png"); self.git("commit", "-m", "test: add large binary source")
+        self.git("push", "origin", "main")
+        self.seed["checks"][0]["target"]["files"].append("large.png")
+        self.freeze()
+        candidate = c.draft_result(self.scope_ref)
+        self.assertEqual(candidate, self.result)
+        self.assertEqual(candidate["checks"]["source"]["files"]["large.png"],
+                         hashlib.sha256(payload).hexdigest())
+        self.assertTrue(self.inspect()["complete"])
+        with png.open("r+b") as stream:
+            stream.write(b"changed")
+        with self.assertRaisesRegex(c.CompletionError, "working source bytes differ"):
+            c.observe(json.loads(self.scope_path.read_bytes())["checks"][0],
+                      self.result["checks"]["source"])
+
+    def test_source_hash_has_no_replacement_size_cap(self):
+        source = self.root / "large-source.bin"
+        with source.open("wb") as stream:
+            stream.write(b"large source")
+            stream.truncate(129 * c.MAX_BYTES)
+        with source.open("rb") as stream:
+            expected = hashlib.file_digest(stream, "sha256").hexdigest()
+        self.assertEqual(c.working_source_sha(source), expected)
+        self.assertEqual(c.working_source_sha(self.installed), self.ref(self.repo / "tool.py")["sha256"])
+
+    def test_source_hash_rejects_missing_blob_nonregular_file_and_timeout(self):
+        revision = self.git("rev-parse", "main")
+        with self.assertRaisesRegex(c.CompletionError, "source observation failed"):
+            c.git_source_sha(str(self.repo), revision, "missing.png")
+        fifo = self.root / "source-fifo"
+        c.os.mkfifo(fifo)
+        with self.assertRaisesRegex(c.CompletionError, "regular file"):
+            c.working_source_sha(fifo)
+        with mock.patch.object(c.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", c.TIMEOUT)):
+            with self.assertRaisesRegex(c.CompletionError, "source observation unavailable or timed out"):
+                c.git_source_sha(str(self.repo), revision, "tool.py")
+
+    def test_metadata_and_policy_byte_limits_remain_enforced(self):
+        policy = self.root / "oversized.json"
+        policy.write_bytes(b" " * (c.MAX_BYTES + 1))
+        with self.assertRaises(c.CompletionError):
+            c.raw_file(str(policy))
+        with self.assertRaisesRegex(c.CompletionError, "exceeded output limit"):
+            c.run([sys.executable, "-I", "-c",
+                   "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024 + 1))"])
+
     def test_draft_actual_cli_collects_candidate_without_claiming_completion(self):
         output = self.root / "candidate.json"
         before = self.state_path.read_bytes()

@@ -161,6 +161,42 @@ def git(repo, *args):
                 "-C", str(path(repo)), *args])
 
 
+def source_stream_sha(stream):
+    """Hash source bytes in chunks; source files have no metadata size cap."""
+    hasher = hashlib.sha256()
+    while chunk := stream.read(64 * 1024):
+        hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def git_source_sha(repo, revision, filename):
+    import tempfile
+    argv = [shutil.which("git", path=observer_env()["PATH"]), "--no-pager",
+            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-C", str(path(repo)), "show", "--no-ext-diff", "--no-textconv",
+            revision + ":" + filename]
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+        try:
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                  stderr=error, timeout=TIMEOUT, env=observer_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CompletionError("source observation unavailable or timed out") from exc
+        if done.returncode:
+            raise CompletionError("source observation failed")
+        output.seek(0)
+        return source_stream_sha(output)
+
+
+def working_source_sha(value):
+    # Preserve git_source's existing links=True working-tree semantics.
+    fd = os.open(path(str(value)), os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise CompletionError("working source must be a regular file")
+        return source_stream_sha(stream)
+
+
 def repo_identity(repo):
     root = path(repo)
     if root.resolve() != root:
@@ -519,7 +555,7 @@ def draft_result(scope_ref, expectations=None):
                 relative = Path(text(filename))
                 if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
                     raise CompletionError("invalid repository-relative source path")
-                files[filename] = sha(git(repo, "show", "--no-ext-diff", "--no-textconv", local + ":" + filename))
+                files[filename] = git_source_sha(repo, local, filename)
             return key, {"local_revision": local, "remote_revision": remote, "files": files}
         raise CompletionError("unsupported candidate observation")
 
@@ -639,9 +675,9 @@ def observe(check, expected):
                 raise CompletionError("invalid repository-relative source path")
             wanted = digest(wanted)
             for revision in (local, remote_oid):
-                if sha(git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)) != wanted:
+                if git_source_sha(repo, revision, filename) != wanted:
                     raise CompletionError("reviewed source bytes are not preserved in both main revisions")
-            if sha(raw_file(str(path(repo) / filename), links=True)) != wanted:
+            if working_source_sha(path(repo) / filename) != wanted:
                 raise CompletionError("working source bytes differ from integrated source")
         return {"local_revision": local, "remote_revision": remote_oid}
     raise CompletionError("unsupported observer")
