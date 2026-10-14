@@ -1,4 +1,6 @@
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -39,6 +41,12 @@ class MemoryGitHub:
     def objects(self, org, requests):
         self.requests.extend(requests)
         return {request: self.files.get(request, (None, None)) for request in requests}
+
+    def actions_budget(self, org):
+        return {"status": "confirmed", "amount": 0, "stop_usage": True, "reason": "synthetic budget"}
+
+    def runs(self, org, repo, commit):
+        return []
 
 
 class RepositoryChecks(unittest.TestCase):
@@ -145,7 +153,7 @@ class RepositoryChecks(unittest.TestCase):
         github = MemoryGitHub([repository()], {key: (blob("## 연결과 검증\n" + body), None)})
         row = module.check("meenseek", github)["repositories"][0]
         self.assertEqual(row["structure"]["status"], "confirmed")
-        self.assertEqual(len(github.requests), 2)  # Root entrypoints only; examples never read.
+        self.assertEqual(len(github.requests), 3)  # Entry points + workflow tree; examples never read.
 
     def test_ambiguous_indented_list_content_is_unknown_instead_of_an_example_failure(self):
         key = ("product", "a" * 40, "README.md")
@@ -227,6 +235,131 @@ class RepositoryChecks(unittest.TestCase):
 
 
 class GitHubBoundaryTests(unittest.TestCase):
+    def test_budget_requires_global_zero_stop_and_complete_access(self):
+        github = module.GitHub()
+        budget = {"budget_type": "ProductPricing", "budget_product_sku": "actions", "budget_scope": "organization",
+                  "budget_entity_name": "meenseek", "budget_amount": 0, "prevent_further_usage": True}
+        response = {"budgets": [budget], "has_next_page": False, "total_count": 1}
+        with patch.object(github, "api", return_value=response):
+            self.assertEqual(github.actions_budget("meenseek")["status"], "confirmed")
+            budget["prevent_further_usage"] = False
+            self.assertEqual(github.actions_budget("meenseek")["status"], "failed")
+            budget["prevent_further_usage"] = True
+            budget["budget_scope"] = "repository"
+            self.assertEqual(github.actions_budget("meenseek")["status"], "failed")
+            response["has_next_page"] = True
+            self.assertEqual(github.actions_budget("meenseek")["status"], "unknown")
+        with patch.object(github, "api", side_effect=module.ReadError("access denied")):
+            self.assertEqual(github.actions_budget("meenseek")["status"], "unknown")
+
+    def test_ci_requires_declared_workflow_and_latest_exact_main_push(self):
+        github = MemoryGitHub([repository()])
+        listing = ({"__typename": "Tree", "entries": [{"type": "blob", "name": "test.yml"}]}, None)
+        declared = [{"source": {"repository": "product", "path": ".github/workflows/test.yml"}, "status": "confirmed"}]
+        observe = lambda refs=declared: module.ci_observation(repository(), listing, refs, github, "meenseek")
+        self.assertEqual(observe()["status"], "unknown")
+        self.assertEqual(observe([])["workflow_files"], [".github/workflows/test.yml"])
+        run = {"id": 1, "run_attempt": 1, "path": ".github/workflows/test.yml", "event": "push",
+               "head_branch": "main", "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
+        with patch.object(github, "runs", return_value=[run]):
+            self.assertEqual(observe()["status"], "confirmed")
+            for key, wrong in [("head_sha", "c" * 40), ("head_branch", "feature"), ("event", "pull_request"),
+                               ("path", ".github/workflows/release.yml")]:
+                with patch.dict(run, {key: wrong}):
+                    self.assertEqual(observe()["status"], "unknown")
+        with patch.object(github, "runs", return_value=[run, {**run, "id": 2, "conclusion": "failure"}]):
+            self.assertEqual(observe()["status"], "failed")
+        with patch.object(github, "runs", return_value=[run, {**run, "id": 2, "status": "in_progress", "conclusion": None}]):
+            self.assertEqual(observe()["status"], "unknown")
+        with patch.object(github, "runs", side_effect=module.ReadError("denied")):
+            self.assertEqual(observe()["status"], "unknown")
+
+    def test_ci_discovery_survives_missing_contract_and_selected_check_uses_one_run_read(self):
+        repo = repository()
+        ci_path = ".github/workflows/test.yml"
+        tree = {"__typename": "Tree", "entries": [{"type": "blob", "name": "test.yml"}]}
+        files = {("product", "a" * 40, ".github/workflows"): (tree, None),
+                 ("product", "a" * 40, "README.md"): (blob("## 연결과 검증\nCI: [CI](" + ci_path + ")"), None),
+                 ("product", "a" * 40, ci_path): (blob("name: CI"), None)}
+        github = MemoryGitHub([repo, repository("unselected", 2)], files)
+        with patch.object(github, "runs", return_value=[]) as call:
+            report = module.check("meenseek", github, "product")
+            self.assertEqual(call.call_count, 1)
+        self.assertEqual(report["inventory"]["visible_count"], 2)
+        self.assertEqual(report["repositories"][0]["ci"]["workflow_files"], [ci_path])
+        self.assertEqual(len(github.requests), 4)
+        del files[("product", "a" * 40, "README.md")]
+        with patch.object(github, "runs", side_effect=AssertionError("unselected workflows never queried")):
+            row = module.check("meenseek", github)["repositories"][0]
+        self.assertEqual(row["ci"]["workflow_files"], [ci_path])
+        self.assertEqual(row["ci"]["status"], "unknown")
+
+    def test_ci_absence_and_access_failure_are_distinct_and_no_archive_auto_exemption(self):
+        github = MemoryGitHub([repository()])
+        for repo in (repository(), repository(archived=True)):
+            self.assertEqual(module.ci_observation(repo, (None, None), [], github, "meenseek")["status"], "absent")
+            self.assertEqual(module.ci_observation(repo, (None, "denied"), [], github, "meenseek")["status"], "unknown")
+
+    def test_creation_cli_requires_ci_and_budget_while_default_exit_remains_structural(self):
+        repo = repository()
+        ci = ".github/workflows/test.yml"
+        files = {("product", "a" * 40, "README.md"): (blob("## 연결과 검증\nCI: [CI](" + ci + ")"), None),
+                 ("product", "a" * 40, ci): (blob("name: CI"), None),
+                 ("product", "a" * 40, ".github/workflows"):
+                 ({"__typename": "Tree", "entries": [{"type": "blob", "name": "test.yml"}]}, None)}
+        github = MemoryGitHub([repo], files)
+        def cli(required):
+            with patch.object(module, "GitHub", return_value=github), \
+                 patch.object(module.sys, "argv", ["check", "--repo", "product"] + (["--require-ci"] if required else [])), \
+                 redirect_stdout(io.StringIO()):
+                return module.main()
+        self.assertEqual(cli(False), 0)
+        self.assertEqual(cli(True), 2)  # A present workflow without a run is not completion.
+        run = {"id": 1, "path": ci, "event": "push", "head_branch": "main", "head_sha": "a" * 40,
+               "status": "completed", "conclusion": "success", "run_attempt": 1}
+        with patch.object(github, "runs", return_value=[run]):
+            self.assertEqual(cli(True), 0)
+            with patch.object(github, "actions_budget", return_value={"status": "failed", "reason": "disabled"}):
+                self.assertEqual(cli(True), 1)
+                self.assertEqual(cli(False), 0)
+
+    def test_release_link_does_not_become_ci_or_block_successful_owner_verification(self):
+        ci, release = ".github/workflows/ci.yml", ".github/workflows/release.yml"
+        files = {("product", "a" * 40, "README.md"):
+                 (blob(f"## 연결과 검증\nCI: [Verify]({ci})\nRelease: [Publish]({release})"), None),
+                 ("product", "a" * 40, ci): (blob("name: CI"), None),
+                 ("product", "a" * 40, release): (blob("name: Release"), None),
+                 ("product", "a" * 40, ".github/workflows"):
+                 ({"__typename": "Tree", "entries": [{"type": "blob", "name": "ci.yml"},
+                                                     {"type": "blob", "name": "release.yml"}]}, None)}
+        github = MemoryGitHub([repository()], files)
+        run = {"id": 1, "path": ci, "event": "push", "head_branch": "main", "head_sha": "a" * 40,
+               "status": "completed", "conclusion": "success", "run_attempt": 1}
+        with patch.object(github, "runs", return_value=[run]) as call:
+            row = module.check("meenseek", github)["repositories"][0]
+        self.assertEqual(row["ci"]["status"], "confirmed")
+        self.assertEqual([w["path"] for w in row["ci"]["workflows"]], [ci])
+        self.assertEqual(row["ci"]["workflow_files"], [ci, release])
+        self.assertEqual(len(row["references"]), 2)
+        self.assertEqual(call.call_count, 1)
+
+    def test_run_reads_paginate_once_per_repo_and_reject_api_cap_or_partial_response(self):
+        github = module.GitHub()
+        runs = [{"id": n} for n in range(101)]
+        with patch.object(github, "api", side_effect=[{"total_count": 101, "workflow_runs": runs[:100]},
+                                                     {"total_count": 101, "workflow_runs": runs[100:]}]) as call:
+            self.assertEqual(len(github.runs("meenseek", "product", "a" * 40)), 101)
+            self.assertEqual(call.call_count, 2)
+            self.assertIn("head_sha=" + "a" * 40, call.call_args_list[0].args[0])
+        with patch.object(github, "api", return_value={"total_count": 100, "workflow_runs": runs[:100]}) as call:
+            self.assertEqual(len(github.runs("meenseek", "product", "a" * 40)), 100)
+            self.assertEqual(call.call_count, 1)
+        for response in ({"total_count": 1001, "workflow_runs": []},
+                         {"total_count": 1, "workflow_runs": []},
+                         {"total_count": 2, "workflow_runs": [{"id": 1}, {"id": 1}]}):
+            with patch.object(github, "api", return_value=response), self.assertRaises(module.ReadError):
+                github.runs("meenseek", "product", "a" * 40)
+
     def test_inventory_paginates_past_100_and_requires_final_cursor(self):
         pages = [dict(nodes=[repository(f"p{i}", i + 1) for i in range(100)],
                       pageInfo={"hasNextPage": True, "endCursor": "next"}),

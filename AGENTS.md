@@ -5,6 +5,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 조직 저장소 생성·소유권·연결 점검에서는 [저장소 운영 규칙](docs/repository-rules.md)의
 생성 완료와 재점검 절차를 먼저 읽습니다. 검사 명령과 결과 해석은 이 문서의 [연결과 검증](#연결과-검증)을 따릅니다.
+새 저장소의 검증 자동화 설치·비용 통제·첫 성공 확인은 같은 문서의 [경량 CI](docs/repository-rules.md#경량-ci)를 따릅니다.
 
 새 저장소 생성이나 이름 변경에서는 [명명](docs/repository-rules.md#명명)을 먼저 읽습니다.
 제품이 소유한 이름의 판단 근거와 원문 연결을 확인하고, 가칭을 확정된 제품명으로
@@ -193,6 +194,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 조직 기준은 [저장소 운영 규칙](docs/repository-rules.md)이 소유합니다.
 [검사기](scripts/check_repositories.py)는 GitHub 실제 목록과 선언된 참조의 접근을 확인하고,
 각 저장소의 실제 연결은 그 소유 계약과 현재 실행 환경에서 별도로 검증합니다.
+CI: [이 저장소의 검증 workflow](.github/workflows/ci.yml)
 operations 등록이나 개인 ontology 사용은 모든 저장소의 필수 조건이 아닙니다.
 
 Python 3.11+와 의도한 계정으로 로그인한 `gh`가 필요합니다. 저장소 루트에서 실행합니다.
@@ -200,6 +202,7 @@ Python 3.11+와 의도한 계정으로 로그인한 `gh`가 필요합니다. 저
 ```sh
 python3 scripts/check_repositories.py --org meenseek --format json
 python3 scripts/check_repositories.py --org meenseek --repo .github --format markdown
+python3 scripts/check_repositories.py --org meenseek --repo .github --require-ci --format markdown
 python3 scripts/check_repositories.py --org meenseek --local-root /absolute/checkouts --format json
 python3 -m unittest discover -s tests -v
 ```
@@ -210,7 +213,8 @@ python3 -m unittest discover -s tests -v
 별개로 전체 범위를 미확인으로 둡니다. 새 자격증명이나 권한 변경을 자동으로 시도하지 않습니다.
 
 JSON에는 확인 시각, 적용한 기준의 SHA-256, 저장소 ID·이름·상태·commit, 진입점과
-참조의 확인 결과가 있습니다. 원문 본문은 출력하지 않습니다. 상대 파일과 같은 조직의
+참조, CI 파일 발견·선언한 workflow의 현재 commit 실행 결과, 조직 Actions 과금 차단의
+확인 결과가 있습니다. 원문 본문은 출력하지 않습니다. 상대 파일과 같은 조직의
 현재 기본 브랜치/commit을 가리키는 GitHub 파일 링크는 고정 commit에서 확인합니다.
 원문 접근과 내용 판단, anchor, native·외부·과거 commit·호스트 경로는 실행자가 확인합니다.
 지원하는 연결 선언은 README 또는 AGENTS 한 곳의 `## 연결과 검증`
@@ -220,7 +224,9 @@ JSON에는 확인 시각, 적용한 기준의 SHA-256, 저장소 ID·이름·상
 기존 저장소의 동등한 계약은 실행자가 원래 소유 문서로 판정합니다. 지원하는 절이 없다는
 미확인만으로 준비 실패를 선언하거나 모든 저장소의 README를 일괄 변경하지 않습니다.
 
-종료 코드 0은 구조 검사 범위만 확인됨, 1은 선언된 참조의 실패, 2는 미확인입니다.
+기본 종료 코드 0은 구조 검사 범위만 확인됨, 1은 선언된 참조의 실패, 2는 미확인입니다.
+`--require-ci`는 `--repo`가 필요한 생성 게이트이며 CI와 과금 차단도 종료 판정에 포함합니다.
+CI 적용 여부와 제외 판단은 [생성 기준](docs/repository-rules.md#경량-ci)을 따릅니다.
 선택적 `--local-root`는 확인된 조직 이름과 일치하는 `origin`을 가진 직접 하위 checkout의
 Git commit·branch·변경 여부와 README/AGENTS 파일의 SHA·크기만 추가합니다. 다른 저장소,
 미설치·큰 파일·심볼릭 링크·확인 중 바뀐 원문은 확인된 자료로 내보내지 않습니다.

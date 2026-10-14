@@ -10,7 +10,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 
 POLICY = Path(__file__).resolve().parents[1] / "docs/repository-rules.md"
@@ -99,6 +99,52 @@ class GitHub:
                 raise ReadError("inventory pagination is incomplete", repositories)
             seen.add(cursor)
 
+    def actions_budget(self, org):
+        """Read the organization-wide Actions hard stop; never change billing."""
+        try:
+            data = self.api(f"orgs/{org}/settings/billing/budgets")
+            if not isinstance(data, dict) or data.get("has_next_page") is not False:
+                raise ReadError("Actions budget coverage is incomplete")
+            budgets = data.get("budgets")
+            if not isinstance(budgets, list) or data.get("total_count") != len(budgets):
+                raise ReadError("Actions budget coverage is incomplete")
+            matches = [b for b in budgets if isinstance(b, dict)
+                       and b.get("budget_type") == "ProductPricing"
+                       and b.get("budget_product_sku") == "actions"
+                       and b.get("budget_scope") == "organization"
+                       and isinstance(b.get("budget_entity_name"), str)
+                       and b["budget_entity_name"].lower() == org.lower()]
+            if any(b.get("budget_amount") == 0 and b.get("prevent_further_usage") is True
+                   for b in matches):
+                return {"status": "confirmed", "amount": 0, "stop_usage": True,
+                        "reason": "organization-wide Actions zero-dollar stop is enabled"}
+            return {"status": "failed", "reason": "organization-wide Actions zero-dollar stop not established"}
+        except ReadError as exc:
+            return {"status": "unknown", "reason": str(exc)}
+
+    def runs(self, org, repo, commit):
+        """One bounded, paginated read per declared repository, shared by its workflows."""
+        runs, seen = [], set()
+        for page in range(1, 11):
+            query = urlencode({"head_sha": commit, "event": "push", "per_page": 100, "page": page})
+            data = self.api(f"repos/{org}/{repo}/actions/runs?{query}")
+            if not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list):
+                raise ReadError("invalid Actions runs response")
+            batch = data["workflow_runs"]
+            total = data.get("total_count")
+            if not isinstance(total, int) or not 0 <= total <= 1000:
+                raise ReadError("Actions runs exceed the bounded API search coverage")
+            for run in batch:
+                if not isinstance(run, dict) or not isinstance(run.get("id"), int) or run["id"] in seen:
+                    raise ReadError("Actions runs changed during pagination")
+                seen.add(run["id"])
+            runs.extend(batch)
+            if len(runs) == total:
+                return runs
+            if len(batch) < 100:
+                raise ReadError("Actions runs pagination is incomplete")
+        raise ReadError("Actions runs pagination is incomplete")
+
     def objects(self, org, requests):
         """Fetch exact commit/path pairs in batches, including explicit nulls for absence."""
         results = {}
@@ -108,7 +154,8 @@ class GitHub:
             for i, (repo, commit, path) in enumerate(batch):
                 fields.append(f"r{i}:repository(owner:{json.dumps(org)},name:{json.dumps(repo)})"
                               " { object(expression:" + json.dumps(commit + ":" + path)
-                              + ") { __typename ... on Blob { oid byteSize isBinary text } } }")
+                              + ") { __typename ... on Blob { oid byteSize isBinary text } "
+                              "... on Tree { entries { name type } } } }")
             try:
                 data = self.graphql("query { " + " ".join(fields) + " }")
                 for i, request in enumerate(batch):
@@ -196,6 +243,10 @@ def declared_links(body):
         if target not in targets:
             targets.append(target)
     return targets
+
+
+def declared_ci_links(body):
+    return declared_links("\n".join(line for line in body.splitlines() if line.startswith("CI:")))
 
 
 def display_target(target):
@@ -291,6 +342,56 @@ def local_source(repo, root):
     return row
 
 
+def ci_observation(repo, listing, references, github, org):
+    """Keep discovery, owner selection and exact-commit hosted success distinct."""
+    result = {"status": "unknown", "workflow_files": [], "workflows": [],
+              "reason": "CI applicability and workflow selection need the owner contract"}
+    obj, error = listing
+    if error:
+        result["reason"] = error
+        return result
+    if obj is not None and (obj.get("__typename") != "Tree" or not isinstance(obj.get("entries"), list)):
+        result["reason"] = "workflow directory could not be assessed"
+        return result
+    result["workflow_files"] = sorted(".github/workflows/" + e["name"]
+        for e in (obj or {}).get("entries", [])
+        if e.get("type") == "blob" and re.fullmatch(r"[^/]+\.ya?ml", e.get("name", "")))
+    declared = {r["source"]["path"]: r for r in references if r.get("source", {}).get("repository") == repo["name"]
+                and re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", r["source"]["path"])}
+    if not declared:
+        if not result["workflow_files"]:
+            result.update(status="absent", reason="no GitHub workflow at observed commit; owner must assess applicability")
+        return result
+    if any(p not in result["workflow_files"] or r["status"] != "confirmed" for p, r in declared.items()):
+        result.update(status="failed", reason="declared CI workflow is absent or inaccessible at observed commit")
+        if any(r["status"] == "unknown" for r in declared.values()):
+            result.update(status="unknown", reason="declared CI workflow access is unverified")
+        return result
+    branch = repo["defaultBranchRef"]
+    try:
+        runs = github.runs(org, repo["name"], branch["target"]["oid"])
+    except ReadError as exc:
+        result["reason"] = str(exc)
+        return result
+    for filename in sorted(declared):
+        candidates = [r for r in runs if r.get("path") == filename and r.get("event") == "push"
+                      and r.get("head_sha") == branch["target"]["oid"] and r.get("head_branch") == branch["name"]]
+        item = {"path": filename, "status": "unknown", "reason": "no main push run for the observed commit"}
+        if candidates:
+            run = max(candidates, key=lambda r: (r["id"], r.get("run_attempt", 1)))
+            success = run.get("status") == "completed" and run.get("conclusion") == "success"
+            failure = run.get("status") == "completed" and run.get("conclusion") in {"failure", "timed_out", "action_required", "startup_failure"}
+            item.update(status="confirmed" if success else "failed" if failure else "unknown",
+                        reason="latest exact-commit main push workflow result",
+                        run={k: run.get(k) for k in ("id", "run_attempt", "head_sha", "status", "conclusion")},
+                        url=f"https://github.com/{org}/{repo['name']}/actions/runs/{run['id']}")
+        result["workflows"].append(item)
+    statuses = {w["status"] for w in result["workflows"]}
+    result.update(status="failed" if "failed" in statuses else "unknown" if "unknown" in statuses else "confirmed",
+                  reason="declared workflow results only; command meaning and runtime readiness need owner review")
+    return result
+
+
 def check(org, github, selected=None, local_root=None):
     report = {"org": org, "checked_at": datetime.now(timezone.utc).isoformat(),
               "environment": "GitHub committed sources; local runtime checks are separate",
@@ -308,14 +409,16 @@ def check(org, github, selected=None, local_root=None):
         coverage = {"status": "unknown", "reason": str(exc)}
         pagination_complete = False
     report["inventory"] = {**coverage, "visible_count": len(repositories), "pagination_complete": pagination_complete}
+    report["actions_budget"] = github.actions_budget(org)
     inventory = {r["name"]: r for r in repositories}
     if selected and selected not in inventory:
         report["selection_error"] = "requested repository is not visible"
     targets = [r for r in repositories if not selected or r["name"] == selected]
     requests = [(r["name"], r["defaultBranchRef"]["target"]["oid"], path)
-                for r in targets if r.get("defaultBranchRef") for path in ["README.md", "AGENTS.md"]]
+                for r in targets if r.get("defaultBranchRef") for path in ["README.md", "AGENTS.md", ".github/workflows"]]
     documents = github.objects(org, requests)
     references = {}
+    ci_references = {}
     for repo in targets:
         branch = repo.get("defaultBranchRef")
         row = {"id": repo["databaseId"], "name": repo["nameWithOwner"],
@@ -324,6 +427,8 @@ def check(org, github, selected=None, local_root=None):
                "entrypoints": {}, "contract": None, "references": [],
                "structure": {"status": "unknown", "reason": "connection contract needs owner assessment"},
                "connections": {"status": "unknown", "reason": "owner contract meaning and target environment verification required"}}
+        row["ci"] = {"status": "unknown", "workflow_files": [], "workflows": [],
+                     "reason": "no committed source; owner must assess applicability"}
         report["repositories"].append(row)
         if local_root is not None:
             row["local"] = local_source(row, local_root)
@@ -361,6 +466,7 @@ def check(org, github, selected=None, local_root=None):
         # Fenced examples are not declarations of actual dependencies.
         try:
             links = declared_links(body)
+            ci_links = declared_ci_links(body)
         except ReadError as exc:
             row["structure"]["reason"] = str(exc)
             continue
@@ -376,6 +482,8 @@ def check(org, github, selected=None, local_root=None):
             else:
                 item["reason"] = "native, external, historical or host-specific reference; verify in its own environment"
             row["references"].append(item)
+            if link in ci_links:
+                ci_references.setdefault(row["id"], []).append(item)
     resolved = dict(documents)
     resolved.update(github.objects(org, [r for r in references if r not in resolved]))
     for request, items in references.items():
@@ -385,6 +493,10 @@ def check(org, github, selected=None, local_root=None):
             item["reason"] = error or ("source exists at pinned commit; anchors and meaning need native review" if obj
                                       else "declared source absent at pinned commit")
     for row in report["repositories"]:
+        if row["commit"]:
+            repo = inventory[row["name"].split("/", 1)[1]]
+            row["ci"] = ci_observation(repo, documents[(repo["name"], row["commit"], ".github/workflows")],
+                                       ci_references.get(row["id"], []), github, org)
         if not row["references"]:
             continue
         statuses = {i["status"] for i in row["references"]}
@@ -399,11 +511,15 @@ def markdown(report):
              f"Checked: {report['checked_at']}",
              f"Inventory: {report['inventory']['status']} (full visibility and pagination assessed separately)",
              "", "Structure checks do not prove runtime readiness.", "",
-             "| Repository | Structure | Connections |", "|---|---|---|"]
+             f"Actions budget: {report['actions_budget']['status']} — {report['actions_budget']['reason']}", "",
+             "| Repository | Structure | CI | Connections |", "|---|---|---|---|"]
     for row in report["repositories"]:
-        lines.append(f"| {row['name']} | {row['structure']['status']} | {row['connections']['status']} |")
+        lines.append(f"| {row['name']} | {row['structure']['status']} | {row['ci']['status']} | {row['connections']['status']} |")
     for row in report["repositories"]:
         lines.extend(["", f"## {row['name']}", row["structure"]["reason"]])
+        lines.extend(["CI: " + row["ci"]["reason"], "Workflow files: " + (", ".join(row["ci"]["workflow_files"]) or "none")])
+        for workflow in row["ci"]["workflows"]:
+            lines.append(f"- CI {workflow['path']}: {workflow['status']} — {workflow['reason']}")
         for ref in row["references"]:
             if ref["status"] != "confirmed":
                 lines.append(f"- {ref['status']}: `{ref['target']}` — {ref['reason']}")
@@ -418,6 +534,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="meenseek")
     parser.add_argument("--repo", help="one repository name; inventory still spans the organization")
+    parser.add_argument("--require-ci", action="store_true",
+                        help="Creation gate: require one selected repo's declared exact-commit CI and zero-dollar Actions stop")
     parser.add_argument("--format", choices=["json", "markdown"], default="json")
     parser.add_argument("--local-root", type=Path,
                         help="Optionally export verified local Git/entrypoint identity; no runtime checks")
@@ -426,10 +544,15 @@ def main():
         parser.error("invalid organization")
     if args.repo and not re.fullmatch(r"[A-Za-z0-9_.-]+", args.repo):
         parser.error("--repo takes a repository name, without an owner")
+    if args.require_ci and not args.repo:
+        parser.error("--require-ci needs --repo; applicability exclusions require owner assessment")
     report = check(args.org, GitHub(), args.repo, args.local_root)
     print(json.dumps(report, ensure_ascii=False, indent=2) if args.format == "json" else markdown(report), end="\n")
     # Exit success concerns structural checks only; connections are deliberately unassessed.
     statuses = {r["structure"]["status"] for r in report["repositories"]}
+    if args.require_ci:
+        statuses.update("unknown" if r["ci"]["status"] == "absent" else r["ci"]["status"] for r in report["repositories"])
+        statuses.add(report["actions_budget"]["status"])
     if report["inventory"]["status"] != "confirmed" or report.get("selection_error") or "unknown" in statuses:
         return 2
     return 1 if "failed" in statuses else 0

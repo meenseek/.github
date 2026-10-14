@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'docs/**'
       - 'AGENTS.md'
+      - 'README.md'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - 'tests/**'
       - 'docs/**'
       - 'AGENTS.md'
+      - 'README.md'
       - '.github/workflows/ci.yml'
 
 permissions:

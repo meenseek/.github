@@ -16,6 +16,10 @@
 소유자와 실행 환경에서 확인하며, 구조 확인을 운영 준비나 사업 성과로 해석하지 않습니다.
 operations 등록이나 개인 ontology 사용은 모든 저장소의 필수 조건이 아닙니다.
 
+새 저장소는 [생성 기준의 경량 CI](docs/repository-rules.md#경량-ci)를 함께 적용합니다.
+[설치 도구](scripts/install_ci.py)는 대상 workflow와 소유 진입점의 연결을 함께 만들고,
+검사기는 CI 파일 발견·선언한 workflow의 현재 commit 실행 결과·과금 차단을 별도로 보고합니다.
+
 검사 명령·입력·결과 해석은 [AGENTS.md의 연결과 검증](AGENTS.md#연결과-검증)을 따릅니다.
 
 ## 작업 완료 검사
