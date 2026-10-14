@@ -213,6 +213,22 @@ class RepositoryChecks(unittest.TestCase):
                          ['README.md'])
         self.assertIsNone(module.section('<!--\n## 연결과 검증\n[Fake](x.md)\n-->'))
 
+    def test_backtick_escapes_and_delimiters_preserve_actual_links_and_exclude_code(self):
+        cases = [
+            (r"\`[Required](missing.md)\`", ["missing.md"]),
+            (r"\\`[Example](missing.md)` [Actual](README.md)", ["README.md"]),
+            (r"`[Example](missing.md)\` [Actual](README.md)", ["README.md"]),
+            (r"\``[Example](missing.md)` [Actual](README.md)", ["README.md"]),
+            (r"``[Example](missing.md) `literal` `` [Actual](README.md)", ["README.md"]),
+            (r"``[Actual](README.md)`", ["README.md"]),
+            (r"`[Actual](README.md)", ["README.md"]),
+            ("`[Example]\n(missing.md)` [Actual](README.md)", ["README.md"]),
+            ("[Label]`code`(missing.md) [Actual](README.md)", ["README.md"]),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(module.declared_links(text), expected)
+
     def test_parenthesized_escaped_and_angle_targets_are_not_truncated(self):
         self.assertEqual(module.declared_links('[A](docs/a(b).md) [B](docs/a\\(b\\).md) [C](<docs/a(b).md> "title")'),
                          ['docs/a(b).md'])
@@ -342,6 +358,36 @@ class GitHubBoundaryTests(unittest.TestCase):
         self.assertEqual(row["ci"]["workflow_files"], [ci, release])
         self.assertEqual(len(row["references"]), 2)
         self.assertEqual(call.call_count, 1)
+
+    def test_escaped_backticks_cannot_hide_missing_owner_from_structural_or_creation_cli(self):
+        ci = ".github/workflows/ci.yml"
+        missing = ("product", "a" * 40, "missing.md")
+        run = {"id": 1, "path": ci, "event": "push", "head_branch": "main", "head_sha": "a" * 40,
+               "status": "completed", "conclusion": "success", "run_attempt": 1}
+        for ci_link in (f"CI: [Verify]({ci})", f"CI: \\` [Verify]({ci}) \\`"):
+            for exists in (False, True):
+                with self.subTest(ci_link=ci_link, owner_exists=exists):
+                    files = {("product", "a" * 40, "README.md"):
+                             (blob("## 연결과 검증\nLiteral \\` [Owner](missing.md) \\`\n" + ci_link), None),
+                             ("product", "a" * 40, ci): (blob("name: CI"), None),
+                             ("product", "a" * 40, ".github/workflows"):
+                             ({"__typename": "Tree", "entries": [{"type": "blob", "name": "ci.yml"}]}, None)}
+                    if exists:
+                        files[missing] = (blob("Required owner"), None)
+                    github = MemoryGitHub([repository()], files)
+                    for required in (False, True):
+                        output = io.StringIO()
+                        with patch.object(module, "GitHub", return_value=github), \
+                             patch.object(github, "runs", return_value=[run]), \
+                             patch.object(module.sys, "argv", ["check", "--repo", "product"] +
+                                          (["--require-ci"] if required else [])), redirect_stdout(output):
+                            code = module.main()
+                        row = json.loads(output.getvalue())["repositories"][0]
+                        self.assertEqual(code, 0 if exists else 1)
+                        self.assertEqual(row["structure"]["status"], "confirmed" if exists else "failed")
+                        self.assertEqual(row["ci"]["status"], "confirmed")
+                        self.assertEqual(len(row["references"]), 2)
+                    self.assertEqual(github.requests.count(missing), 2)
 
     def test_unsupported_ci_declaration_cannot_hide_behind_successful_local_ci(self):
         ci, shared = ".github/workflows/ci.yml", ".github/workflows/shared.yml"

@@ -209,7 +209,21 @@ def declared_links(body):
                 list_seen = True
         previous_blank = not line.strip()
     body = "".join(lines)
-    body = re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", body, flags=re.S)
+    # Escapes protect opening backticks; inside a code span backslashes are literal.
+    parts, start, position = [], 0, 0
+    tokens = re.compile(r"\\.|`+", re.S)
+    while token := tokens.search(body, position):
+        position = token.end()
+        if token[0].startswith("\\"):
+            continue
+        closing = re.search(r"(?<!`)" + token[0] + r"(?!`)", body[position:])
+        if closing:
+            # Keep separated Markdown fragments from becoming a new link.
+            parts.extend((body[start:token.start()], " "))
+            position += closing.end()
+            start = position
+    parts.append(body[start:])
+    body = "".join(parts)
     targets = []
     for match in LINK.finditer(body):
         prefix = body[:match.start()]
