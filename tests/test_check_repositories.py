@@ -343,6 +343,37 @@ class GitHubBoundaryTests(unittest.TestCase):
         self.assertEqual(len(row["references"]), 2)
         self.assertEqual(call.call_count, 1)
 
+    def test_unsupported_ci_declaration_cannot_hide_behind_successful_local_ci(self):
+        ci, shared = ".github/workflows/ci.yml", ".github/workflows/shared.yml"
+        run = {"id": 1, "path": ci, "event": "push", "head_branch": "main", "head_sha": "a" * 40,
+               "status": "completed", "conclusion": "success", "run_attempt": 1}
+        for target, normal_exit in [(f"https://github.com/meenseek/shared/blob/main/{shared}", 0),
+                                    ("README.md", 0), ("https://example.invalid/check.yml", 2)]:
+            with self.subTest(target=target):
+                files = {("product", "a" * 40, "README.md"):
+                         (blob(f"## 연결과 검증\nCI: [Local]({ci})\nCI: [Other]({target})"), None),
+                         ("product", "a" * 40, ci): (blob("name: CI"), None),
+                         ("shared", "a" * 40, shared): (blob("name: CI"), None),
+                         ("product", "a" * 40, ".github/workflows"):
+                         ({"__typename": "Tree", "entries": [{"type": "blob", "name": "ci.yml"}]}, None)}
+                github = MemoryGitHub([repository(), repository("shared", 2)], files)
+                def cli(required):
+                    output = io.StringIO()
+                    with patch.object(module, "GitHub", return_value=github), \
+                         patch.object(module.sys, "argv", ["check", "--repo", "product"] + (["--require-ci"] if required else [])), \
+                         redirect_stdout(output):
+                        code = module.main()
+                    return code, json.loads(output.getvalue())
+                with patch.object(github, "runs", return_value=[run]) as calls:
+                    self.assertEqual(cli(False)[0], normal_exit)
+                    code, report = cli(True)
+                self.assertEqual(code, 2)
+                row = report["repositories"][0]
+                self.assertEqual(row["ci"]["status"], "unknown")
+                self.assertEqual(row["ci"]["workflow_files"], [ci])
+                self.assertEqual(len(row["references"]), 2)
+                self.assertEqual(calls.call_count, 0)  # Unsupported declarations never fan out into other repo runs.
+
     def test_run_reads_paginate_once_per_repo_and_reject_api_cap_or_partial_response(self):
         github = module.GitHub()
         runs = [{"id": n} for n in range(101)]

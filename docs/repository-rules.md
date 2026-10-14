@@ -262,6 +262,8 @@ workflow와 진입점의 CI 링크를 함께 검토·commit하고, 기존 승인
 `python3 scripts/check_repositories.py --org meenseek --repo REPOSITORY --require-ci`로 확인합니다.
 이 생성 게이트는 선언한 모든 CI workflow의 현재 기본 브랜치 commit에 대한 최신 push
 실행 성공과 과금 차단을 요구합니다. CI가 없거나 실행 중·취소·조회 실패이면 미확인입니다.
+CI 실행 확인은 대상 저장소의 workflow만 지원합니다. 다른 저장소를 가리키거나 해석할 수
+없는 CI 선언은 미확인으로 남깁니다.
 검사기는 workflow 내용의 적절성·검증 품질·운영 준비를 대신 판단하지 않습니다.
 전체 조직 점검은 CI 파일 발견과 소유자가 선택한 CI의 실행 근거를 문서 구조와 구분해
 보고합니다. CI가 없는 사실만으로 보관·문서·Issue 전용 저장소의 결함을 자동 판정하지 않습니다.

@@ -356,8 +356,14 @@ def ci_observation(repo, listing, references, github, org):
     result["workflow_files"] = sorted(".github/workflows/" + e["name"]
         for e in (obj or {}).get("entries", [])
         if e.get("type") == "blob" and re.fullmatch(r"[^/]+\.ya?ml", e.get("name", "")))
-    declared = {r["source"]["path"]: r for r in references if r.get("source", {}).get("repository") == repo["name"]
-                and re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", r["source"]["path"])}
+    declared = {}
+    for item in references:
+        source = item.get("source", {})
+        if source.get("repository") != repo["name"] or not re.fullmatch(
+                r"\.github/workflows/[^/]+\.ya?ml", source.get("path", "")):
+            result["reason"] = "CI declaration does not identify a workflow in this repository; owner assessment required"
+            return result
+        declared[source["path"]] = item
     if not declared:
         if not result["workflow_files"]:
             result.update(status="absent", reason="no GitHub workflow at observed commit; owner must assess applicability")
