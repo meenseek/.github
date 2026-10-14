@@ -358,6 +358,41 @@ class CompletionTests(unittest.TestCase):
         target["url"] = target["url"].replace("/live", "/redirect")
         with self.assertRaises(c.CompletionError): c.observe(definition, expected)
 
+    def test_local_stash_absence_observes_live_and_packed_refs_read_only(self):
+        definition = {"kind": "ref_absent", "target": {"repository": str(self.repo), "ref": "refs/stash"}}
+        self.assertTrue(c.observe(definition, {})["absent"])
+        (self.repo / "scratch.txt").write_text("unique local work")
+        self.git("stash", "push", "-u", "-m", "synthetic local work")
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                if packed: self.git("pack-refs", "--all")
+                before = self.git("rev-parse", "refs/stash")
+                with self.assertRaisesRegex(c.CompletionError, "owned stash remains"):
+                    c.observe(definition, {})
+                self.assertEqual(self.git("rev-parse", "refs/stash"), before)
+        self.git("stash", "pop")
+        self.assertEqual((self.repo / "scratch.txt").read_text(), "unique local work")
+        self.assertTrue(c.observe(definition, {})["absent"])
+
+    def test_stash_ref_without_reflog_is_not_mistaken_for_absence(self):
+        definition = {"kind": "ref_absent", "target": {"repository": str(self.repo), "ref": "refs/stash"}}
+        self.git("update-ref", "refs/stash", self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.git("stash", "list"), "")
+        with self.assertRaisesRegex(c.CompletionError, "owned stash remains"):
+            c.observe(definition, {})
+
+    def test_unsupported_ref_observers_are_rejected_during_prepare(self):
+        for kind, ref in (("ref_absent", "refs/tags/example"),
+                          ("ref_absent", "refs/stash/example"),
+                          ("remote_ref_absent", "refs/stash")):
+            with self.subTest(kind=kind, ref=ref):
+                seed = copy.deepcopy(self.seed)
+                seed["checks"].append({"id": "unsupported", "category": "temporary_resources", "kind": kind,
+                                       "target": {"repository": str(self.repo), "remote": "origin", "ref": ref}})
+                seed["categories"]["temporary_resources"] = {"checks": ["unsupported"], "not_applicable": None}
+                with self.assertRaisesRegex(c.CompletionError, "only exact branch refs"):
+                    c.prepare(seed)
+
     def test_remote_branch_absence_is_current_and_does_not_delete(self):
         self.git("push", "origin", "main:refs/heads/feature-task")
         definition = {"kind": "remote_ref_absent", "target": {"repository": str(self.repo), "remote": "origin", "ref": "refs/heads/feature-task", "remote_binding": c.remote_identity(str(self.repo), "origin")}}

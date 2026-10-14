@@ -65,6 +65,13 @@ def digest(value):
     return value
 
 
+def validate_ref_observer(kind, value):
+    ref = text(value)
+    if ref.startswith("refs/heads/") or (kind == "ref_absent" and ref == "refs/stash"):
+        return ref
+    raise CompletionError("only exact branch refs and local refs/stash are supported")
+
+
 def path(value):
     value = Path(text(value))
     if not value.is_absolute() or ".." in value.parts or str(value).startswith("//"):
@@ -402,6 +409,8 @@ def validate_scope(scope, recovery=None):
             raise CompletionError("duplicate or unsupported check")
         if not isinstance(check["target"], dict):
             raise CompletionError("check target must be an object")
+        if check["kind"] in {"ref_absent", "remote_ref_absent"}:
+            validate_ref_observer(check["kind"], check["target"].get("ref"))
         checks[key] = check
     for owner in owners:
         if "original" in owner and not any(
@@ -597,15 +606,17 @@ def observe(check, expected):
         required = ("repository", "ref") if kind != "worktree_absent" else ("repository", "path")
         fields(target, required, ("remote", "remote_binding") if kind == "remote_ref_absent" else ()); fields(expected, ())
         if kind != "worktree_absent":
-            ref = text(target["ref"])
-            if not ref.startswith("refs/heads/"):
-                raise CompletionError("only exact local branch refs are supported")
+            ref = validate_ref_observer(kind, target["ref"])
             if kind == "remote_ref_absent":
                 remote = text(target.get("remote"))
                 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
                     raise CompletionError("invalid named remote")
                 if remote_ref(target["repository"], remote, ref, target.get("remote_binding")):
                     raise CompletionError("owned remote branch remains")
+            elif ref == "refs/stash":
+                current = git(target["repository"], "for-each-ref", "--format=%(refname)", ref).decode().splitlines()
+                if ref in current:
+                    raise CompletionError("owned stash remains")
             elif ref in inventory(target["repository"])["refs"]:
                 raise CompletionError("owned branch remains")
         else:

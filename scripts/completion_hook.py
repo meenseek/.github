@@ -181,6 +181,8 @@ def main(argv=None):
                             resource = c.decode(c.raw_file(args.resource)); c.fields(resource, ("kind", "target"))
                             if resource["kind"] not in {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"} or not isinstance(resource["target"], dict):
                                 raise c.CompletionError("pointer covers temporary resources only; retained outputs/runtime need fixed owner scope checks")
+                            if resource["kind"] in {"ref_absent", "remote_ref_absent"}:
+                                c.validate_ref_observer(resource["kind"], resource["target"].get("ref"))
                             if resource["kind"] == "remote_ref_absent":
                                 target = resource["target"]
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])

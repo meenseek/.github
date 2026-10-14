@@ -67,6 +67,38 @@ class HookTests(unittest.TestCase):
         self.call("attach", "--id", "unresolved", "--resource", str(resource), *self.basis())
         self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
 
+    def test_stash_resource_waiting_resume_and_complete_actual_cli(self):
+        self.f.seed["checks"].append({"id": "stash", "category": "temporary_resources", "kind": "ref_absent",
+                                      "target": {"repository": str(self.f.repo), "ref": "refs/stash"}})
+        self.f.reset_categories()
+        self.arm_bind(finalize=False)
+        self.f.result["checks"]["stash"] = {}
+        self.f.write(self.f.result_path, self.f.result)
+        self.f.final_review()
+        self.call("reserve", "--id", "stash", *self.basis())
+        scratch = self.f.repo / "scratch.txt"; scratch.write_text("preserved local work")
+        self.f.git("stash", "push", "-u", "-m", "synthetic temporary stash")
+        resource = self.f.root / "stash-resource.json"
+        resource.write_text(json.dumps({"kind": "ref_absent", "target": {"repository": str(self.f.repo), "ref": "refs/stash"}}))
+        self.call("attach", "--id", "stash", "--resource", str(resource), *self.basis())
+        answer = self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(any(failure["reason"] == "owned stash remains" for failure in answer["failures"]))
+        self.call("outcome", "--status", "waiting", *self.basis())
+        self.f.git("stash", "pop")
+        self.assertEqual(scratch.read_text(), "preserved local work"); scratch.unlink()
+        self.call("outcome", "--status", "working", *self.basis())
+        self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
+        self.assertFalse(self.state.exists())
+
+    def test_attach_rejects_unsupported_ref_before_pointer_mutation(self):
+        self.arm_bind()
+        self.call("reserve", "--id", "invalid", *self.basis())
+        before = self.state.read_bytes()
+        resource = self.f.root / "invalid-resource.json"
+        resource.write_text(json.dumps({"kind": "ref_absent", "target": {"repository": str(self.f.repo), "ref": "refs/tags/example"}}))
+        self.call("attach", "--id", "invalid", "--resource", str(resource), *self.basis(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_complete_refuses_changed_review_and_stale_pointer(self):
         self.arm_bind(finalize=False)
         argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],

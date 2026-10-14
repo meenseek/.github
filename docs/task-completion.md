@@ -119,7 +119,9 @@ argv가 바뀌어도 같은 시작 시각이면 살아 있는 프로세스로 �
 다른 프로세스를 종료하지 않는다. pointer는 기존 작업 기록에 대한 참조와 현재 handles만
 담고 원문·로그·자격증명을 복제하지 않는다. private `.completion/`은 Git에서 제외한다.
 
-pointer는 임시 파일, exact branch ref, worktree 경로, PID 시작 identity의 부재만 지원한다.
+pointer는 임시 파일, exact branch ref, 로컬 `refs/stash`, worktree 경로, PID 시작 identity의 부재만 지원한다.
+stash는 현재 Git ref를 확인하므로 packed ref와 reflog 없는 ref도 남아 있으면 거부한다.
+그 밖의 ref는 범위 준비와 자원 연결 단계에서 거부하며 원격 stash 검사는 지원하지 않는다.
 최종 산출물과 유지할 제품 runtime은 pointer에 예약하지 않고, 생성 전 고정 scope의 보존·
 설치·health 검사 및 제한된 artifact root로 연결한다. 소유권 이전으로 임시 자원을 유지하려면
 기존 예약을 지워 통과시키지 않고 중단 후 정확한 소유자·후속 범위의 재검토를 받는다.
