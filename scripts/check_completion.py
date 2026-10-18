@@ -204,6 +204,11 @@ def working_source_sha(value):
         return source_stream_sha(stream)
 
 
+def git_source_present(repo, revision, filename):
+    # A successful lookup in a valid revision distinguishes deletion from Git errors.
+    return bool(git(repo, "--literal-pathspecs", "ls-tree", "-z", revision, "--", filename))
+
+
 def repo_identity(repo):
     root = path(repo)
     if root.resolve() != root:
@@ -346,7 +351,12 @@ def current_owners(owners, updates, recovery=None):
     owner_refs(owners, recovery)
     for ref in owners:
         default = recovery.get(ref["path"], ref["sha256"]) if recovery else ref["sha256"]
-        reference({"path": ref["path"], "sha256": updates.get(ref["path"], default)})
+        wanted = updates.get(ref["path"], default)
+        if wanted is None:
+            if os.path.lexists(path(ref["path"])):
+                raise CompletionError("reviewed deleted owner reappeared")
+        else:
+            reference({"path": ref["path"], "sha256": wanted})
 
 
 def owner_recovery(scope_ref, scope, binding):
@@ -534,6 +544,8 @@ def draft_result(scope_ref, expectations=None):
             raise CompletionError("current resource pointer differs from frozen task")
         recovery = owner_recovery(scope_ref, scope, state["owner_recovery"])
     checks = validate_scope(scope, recovery)
+    planned = {(ref["original"]["repository"], ref["original"]["file"])
+               for ref in scope["owners"] if "original" in ref}
     expectations = {} if expectations is None else decode(canonical(expectations))
     required = {key for key, check in checks.items() if check["kind"] == "http_json"}
     fields(expectations, required)
@@ -564,13 +576,16 @@ def draft_result(scope_ref, expectations=None):
                 relative = Path(text(filename))
                 if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
                     raise CompletionError("invalid repository-relative source path")
-                files[filename] = git_source_sha(repo, local, filename)
+                files[filename] = (None if (repo, filename) in planned
+                                   and not git_source_present(repo, local, filename)
+                                   else git_source_sha(repo, local, filename))
             return key, {"local_revision": local, "remote_revision": remote, "files": files}
         raise CompletionError("unsupported candidate observation")
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         values = dict(pool.map(collect, checks.items()))
-    updates = {ref["path"]: sha(raw_file(ref["path"])) for ref in scope["owners"] if "original" in ref}
+    updates = {ref["path"]: (sha(raw_file(ref["path"])) if os.path.lexists(path(ref["path"])) else None)
+               for ref in scope["owners"] if "original" in ref}
     updates = {name: value for name, value in updates.items()
                if value != next(ref["sha256"] for ref in scope["owners"] if ref["path"] == name)}
     reference(scope_ref); reference(scope["request"])
@@ -684,6 +699,13 @@ def observe(check, expected):
             relative = Path(filename)
             if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
                 raise CompletionError("invalid repository-relative source path")
+            if wanted is None:
+                for revision in (local, remote_oid):
+                    if git_source_present(repo, revision, filename):
+                        raise CompletionError("reviewed source deletion is not preserved in both main revisions")
+                if os.path.lexists(path(repo) / filename):
+                    raise CompletionError("reviewed deleted source reappeared")
+                continue
             wanted = digest(wanted)
             for revision in (local, remote_oid):
                 if git_source_sha(repo, revision, filename) != wanted:
@@ -715,6 +737,17 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates",))
     if not isinstance(result["checks"], dict) or result["scope_sha256"] != scope_ref["sha256"] or set(result["checks"]) != set(checks):
         raise CompletionError("final result changed or omitted fixed obligations")
+    planned = {(ref["original"]["repository"], ref["original"]["file"])
+               for ref in scope["owners"] if "original" in ref}
+    for key, definition in checks.items():
+        if definition["kind"] == "git_source":
+            expected = result["checks"][key]
+            fields(expected, ("local_revision", "remote_revision", "files"))
+            if not isinstance(expected["files"], dict):
+                raise CompletionError("source files must be exact path expectations")
+            if any(wanted is None and (definition["target"]["repository"], filename) not in planned
+                   for filename, wanted in expected["files"].items()):
+                raise CompletionError("source deletion was not declared as a planned owner edit")
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery)
     if stopped:
         if state["outcome"] not in {"blocked", "cancelled"}:

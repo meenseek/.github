@@ -54,6 +54,18 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
         self.assertEqual(answer["final_review"], self.f.ref(self.f.final_review_path))
 
+    def test_complete_actual_cli_releases_reviewed_planned_owner_deletion(self):
+        self.f.owner_edit_fixture()
+        self.arm_bind(finalize=False)
+        original = self.f.scope_path.read_bytes()
+        self.f.delete_planned_owner()
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"])
+        self.assertTrue(answer["binding_released"])
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.f.scope_path.read_bytes(), original)
+        self.assertIsNone(self.f.result["owner_updates"][str(self.f.owner)])
+
     def test_complete_failure_preserves_reviewed_inputs_for_recovery_and_retry(self):
         self.arm_bind(finalize=False)
         self.call("reserve", "--id", "unresolved", *self.basis())

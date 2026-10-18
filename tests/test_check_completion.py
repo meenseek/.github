@@ -208,6 +208,73 @@ class CompletionTests(unittest.TestCase):
         self.final_review()
         self.assertTrue(self.inspect()["complete"])
 
+    def delete_planned_owner(self, push=True):
+        self.git("mv", "README.md", "guide.md")
+        self.git("commit", "-m", "test: move reviewed owner")
+        if push:
+            self.git("push", "origin", "main")
+        self.result = c.draft_result(self.scope_ref)
+        self.write(self.result_path, self.result)
+        self.final_review()
+
+    def test_reviewed_owner_rename_preserves_scope_and_checks_original_path_absence(self):
+        self.owner_edit_fixture()
+        original = self.scope_path.read_bytes()
+        self.delete_planned_owner()
+        self.assertIsNone(self.result["checks"]["source"]["files"]["README.md"])
+        self.assertEqual(self.result["owner_updates"], {str(self.owner): None})
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(self.scope_path.read_bytes(), original)
+        self.assertEqual((self.repo / "guide.md").read_text(), "Synthetic original local tool contract.\n")
+        self.final_review_path.write_text("{}")
+        self.state["final_review"] = self.ref(self.final_review_path)
+        self.write(self.state_path, self.state)
+        with self.assertRaisesRegex(c.CompletionError, "final review"):
+            self.inspect()
+
+    def test_deleted_owner_reappearance_as_file_directory_or_dangling_symlink_refuses(self):
+        self.owner_edit_fixture()
+        self.delete_planned_owner()
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "file": self.owner.write_text("unreviewed reappearance")
+                elif kind == "directory": self.owner.mkdir()
+                else: self.owner.symlink_to(self.root / "missing")
+                try:
+                    with self.assertRaisesRegex(c.CompletionError, "deleted owner reappeared"):
+                        self.inspect()
+                finally:
+                    if kind == "directory": self.owner.rmdir()
+                    else: self.owner.unlink()
+
+    def test_deleted_owner_still_present_in_remote_refuses(self):
+        self.owner_edit_fixture()
+        self.delete_planned_owner(push=False)
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertTrue(any("deletion is not preserved" in x["reason"] for x in answer["failures"]))
+
+    def test_unplanned_source_or_owner_deletion_is_not_an_absence_expectation(self):
+        self.result["checks"]["source"]["files"]["tool.py"] = None
+        self.write(self.result_path, self.result)
+        self.final_review()
+        with self.assertRaisesRegex(c.CompletionError, "not declared"):
+            self.inspect()
+        (self.repo / "tool.py").unlink()
+        self.git("add", "-u"); self.git("commit", "-m", "test: undeclared source deletion")
+        self.git("push", "origin", "main")
+        with self.assertRaises((c.CompletionError, FileNotFoundError)):
+            c.draft_result(self.scope_ref)
+        with self.assertRaisesRegex(c.CompletionError, "not declared"):
+            c.current_owners([self.ref(self.owner)], {str(self.owner): None})
+
+    def test_git_absence_lookup_errors_are_not_deletions(self):
+        with self.assertRaises(c.CompletionError):
+            c.git_source_present(str(self.repo), "f" * 40, "README.md")
+        with mock.patch.object(c.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", c.TIMEOUT)):
+            with self.assertRaises(c.CompletionError):
+                c.git_source_present(str(self.repo), self.result["checks"]["source"]["local_revision"], "README.md")
+
     def test_report_binds_all_categories_expectations_and_reviewed_result(self):
         answer = c.check_scope(self.scope_ref, str(self.result_path), report=True)
         self.assertEqual(answer["categories"], json.loads(self.scope_path.read_bytes())["categories"])

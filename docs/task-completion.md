@@ -54,7 +54,10 @@ dirty bytes에는 stage된 파일의 index mode·blob·stage와 작업 파일 by
 수정할 소유 문서는 처음부터 `git_source`의 파일 목록에 선언한다. `prepare`는 현재 owner
 bytes가 HEAD에 보존된 경우 원래 계약의 repository identity·revision·파일·SHA를
 `owners[].original`에 고정한다. 최종 result의 `owner_updates`는 그 정확한 owner 경로와
-검토된 최종 SHA만 담고, 최종 독립 리뷰가 result와 함께 검토한다. 원래 계약·요청·의무를
+검토된 최종 SHA를 담고, 승인된 삭제는 `null`로 명시한다. `git_source`의 같은 파일 기대값도
+`null`로 두며 로컬·원격 기준 커밋과 작업 경로 모두에서 부재를 확인한다. 삭제 표기는 처음부터
+수정 대상으로 선언된 owner에만 허용하고 일반 소스 누락·조회 오류는 실패한다.
+최종 독립 리뷰가 이 정확한 기대값을 result와 함께 검토한다. 원래 계약·요청·의무를
 바꾸지 않으며 선언하지 않은 owner 변경과 예상하지 않은 현재 bytes는 거부한다.
 N/A 근거는 고정한 원래 owner를 가리키고, 변경 뒤 타당성도 최종 리뷰에서 확인한다.
 Git에 원래 bytes가 없는 계약은 수정 대상으로 묶을 수 없으며, 미변경 계약은 현재 SHA를
