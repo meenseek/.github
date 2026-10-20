@@ -511,6 +511,119 @@ class CompletionTests(unittest.TestCase):
         self.seed["checks"][0]["target"]["files"].append("README.md")
         self.reset_categories(); self.freeze()
 
+    def dirty_owner_fixture(self, freeze=True):
+        self.owner_edit_fixture()
+        self.owner.write_text("Synthetic inherited staged contract.\n")
+        self.git("add", "README.md")
+        self.owner.write_text("Synthetic inherited working contract.\n")
+        self.snapshot = self.root / "preserved-owner-original.md"
+        self.snapshot.write_bytes(self.owner.read_bytes())
+        self.seed["owners"] = [self.ref(self.owner)]
+        self.seed["owner_snapshots"] = {str(self.owner): self.ref(self.snapshot)}
+        self.reset_categories()
+        if freeze: self.freeze()
+
+    def snapshot_result(self):
+        self.result = c.draft_result(self.scope_ref)
+        # Publication changes only the explicitly owned README's dirty entries.
+        before = json.loads(self.scope_path.read_bytes())["baseline"]["repositories"][str(self.repo)]
+        after = c.inventory(str(self.repo))
+        keys = ["git:" + str(self.repo) + ":dirty:" + item
+                for item in set(before["dirty"]) ^ set(after["dirty"]) if item.endswith(" README.md")]
+        keys.append("git:" + str(self.repo) + ":content:README.md")
+        self.result["exceptions"] = {key: {"owner": "synthetic task", "reason": "publish the reviewed owner edit",
+                                          "scope": "README.md only", "removal_condition": "publication observed",
+                                          "basis": [self.ref(self.request)]} for key in keys}
+        self.write(self.result_path, self.result)
+        self.final_review()
+
+    def test_dirty_owner_snapshot_actual_cli_prepares_binds_and_completes(self):
+        self.dirty_owner_fixture(freeze=False)
+        self.state_path = self.root / (self.seed["session_id"] + ".json")
+        self.seed["state_path"] = str(self.state_path)
+        self.scope_path = self.root / "dirty-scope.json"
+        seed_path = self.root / "dirty-seed.json"
+        self.write(seed_path, self.seed)
+        hook = [sys.executable, "-I", str(SCRIPT.with_name("completion_hook.py")), "--bindings", str(self.root)]
+
+        def cli(argv):
+            done = subprocess.run(argv, capture_output=True, timeout=35)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            return json.loads(done.stdout)
+
+        original = self.snapshot.read_bytes()
+        index = (self.repo / ".git/index").read_bytes()
+        cli([*hook, "arm", "--session", self.seed["session_id"], "--task-id", self.seed["task_id"]])
+        self.scope_ref = cli([sys.executable, "-I", str(SCRIPT), "prepare", "--seed", str(seed_path),
+                              "--output", str(self.scope_path)])
+        scope = json.loads(self.scope_path.read_bytes())
+        self.assertEqual(scope["owners"][0]["original"]["snapshot"], self.ref(self.snapshot))
+        self.assertNotIn("revision", scope["owners"][0]["original"])
+        self.assertNotIn("owner_snapshots", scope)
+        self.write(self.review_path, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings"})
+        cli([*hook, "bind", "--session", self.seed["session_id"], "--expected-sha256", self.ref(self.state_path)["sha256"],
+             "--scope", str(self.scope_path), "--scope-sha256", self.scope_ref["sha256"],
+             "--review", str(self.review_path), "--review-sha256", self.ref(self.review_path)["sha256"]])
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual(self.owner.read_bytes(), original)
+        self.state = json.loads(self.state_path.read_bytes())
+        self.update_owner_result(); self.snapshot_result()
+        answer = cli([*hook, "complete", "--session", self.seed["session_id"],
+                      "--expected-sha256", self.ref(self.state_path)["sha256"],
+                      "--task-id", self.seed["task_id"], "--request-digest", self.seed["request_digest"],
+                      "--result", str(self.result_path), "--review", str(self.final_review_path),
+                      "--review-sha256", self.ref(self.final_review_path)["sha256"]])
+        self.assertTrue(answer["complete"], answer)
+        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.snapshot.read_bytes(), original)
+        self.assertEqual(self.ref(self.scope_path), self.scope_ref)
+
+    def test_dirty_owner_snapshot_requires_exact_original_and_source_obligation(self):
+        self.dirty_owner_fixture(freeze=False)
+        cases = []
+        seed = copy.deepcopy(self.seed); seed.pop("owner_snapshots")
+        cases.append((seed, "requires committed original bytes"))
+        seed = copy.deepcopy(self.seed); seed["owner_snapshots"][str(self.owner)] = self.ref(self.request)
+        cases.append((seed, "differs from the frozen original"))
+        seed = copy.deepcopy(self.seed); seed["owner_snapshots"][str(self.owner)] = self.ref(self.owner)
+        cases.append((seed, "outside its source repository"))
+        seed = copy.deepcopy(self.seed); seed["owner_snapshots"][str(self.request)] = self.ref(self.request)
+        cases.append((seed, "exact bound owners"))
+        seed = copy.deepcopy(self.seed); seed["checks"][0]["target"]["files"].remove("README.md")
+        cases.append((seed, "outside the frozen source obligations"))
+        for seed, reason in cases:
+            with self.subTest(reason=reason), self.assertRaisesRegex(c.CompletionError, reason): c.prepare(seed)
+        for both in (False, True):
+            owners = c.prepare(self.seed)["owners"]
+            if both: owners[0]["original"]["revision"] = self.git("rev-parse", "HEAD")
+            else: owners[0]["original"].pop("snapshot")
+            with self.subTest(both=both), self.assertRaisesRegex(c.CompletionError, "exactly one"):
+                c.owner_refs(owners)
+
+    def test_dirty_owner_snapshot_drift_refuses_cli_without_output_or_index_changes(self):
+        self.dirty_owner_fixture(freeze=False)
+        seed_path, output = self.root / "dirty-seed.json", self.root / "refused-scope.json"
+        self.write(seed_path, self.seed)
+        self.snapshot.write_text("Unreviewed replacement original.\n")
+        index = (self.repo / ".git/index").read_bytes()
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), "prepare", "--seed", str(seed_path),
+                               "--output", str(output)], capture_output=True, timeout=35)
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertIn("source bytes changed", json.loads(done.stdout)["error"])
+        self.assertFalse(output.exists())
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+
+    def test_dirty_owner_snapshot_is_rechecked_after_observations(self):
+        self.dirty_owner_fixture(); self.update_owner_result(); self.snapshot_result()
+        self.assertTrue(self.inspect()["complete"])
+        original = c.observe
+        def drift(check, expected):
+            answer = original(check, expected)
+            if check["kind"] == "git_source": self.snapshot.write_text("Changed during inspection.\n")
+            return answer
+        with mock.patch.object(c, "observe", side_effect=drift), self.assertRaisesRegex(c.CompletionError, "source bytes changed"):
+            self.inspect()
+
     def update_owner_result(self):
         self.owner.write_text("Synthetic reviewed updated local tool contract.\n")
         self.git("add", "README.md"); self.git("commit", "-m", "test: update owner contract")

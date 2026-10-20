@@ -316,7 +316,7 @@ def tree(root):
 
 
 def owner_refs(values, recovery=None):
-    """Read unchanged live contracts or the committed original of a planned edit."""
+    """Read live contracts or the preserved original of a planned edit."""
     if not isinstance(values, list) or not 1 <= len(values) <= 32:
         raise CompletionError("expected 1..32 owner references")
     for ref in values:
@@ -326,19 +326,28 @@ def owner_refs(values, recovery=None):
             reference({"path": ref["path"], "sha256": current} if current else ref)
             continue
         original = ref["original"]
-        fields(original, ("repository", "revision", "file", "identity"))
+        fields(original, ("repository", "file", "identity"), ("revision", "snapshot"))
+        if ("revision" in original) == ("snapshot" in original):
+            raise CompletionError("owner original requires exactly one Git revision or snapshot")
         relative = Path(text(original["file"]))
         if relative.is_absolute() or ".." in relative.parts or str(relative).startswith(":"):
             raise CompletionError("invalid owner source path")
         if path(ref["path"]) != path(original["repository"]) / relative:
             raise CompletionError("owner source identity differs")
-        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", text(original["revision"])):
-            raise CompletionError("owner original requires a full Git revision")
         if repo_identity(original["repository"]) != original["identity"]:
             raise CompletionError("owner repository identity changed")
-        raw = git(original["repository"], "show", "--no-ext-diff", "--no-textconv", original["revision"] + ":" + original["file"])
-        if sha(raw) != digest(ref["sha256"]):
-            raise CompletionError("owner original bytes changed")
+        if "snapshot" in original:
+            snapshot = reference(original["snapshot"])
+            if path(snapshot["path"]).is_relative_to(path(original["repository"])):
+                raise CompletionError("owner snapshot must be preserved outside its source repository")
+            if snapshot["sha256"] != digest(ref["sha256"]):
+                raise CompletionError("owner snapshot differs from the frozen original bytes")
+        else:
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", text(original["revision"])):
+                raise CompletionError("owner original requires a full Git revision")
+            raw = git(original["repository"], "show", "--no-ext-diff", "--no-textconv", original["revision"] + ":" + original["file"])
+            if sha(raw) != digest(ref["sha256"]):
+                raise CompletionError("owner original bytes changed")
     return values
 
 
@@ -473,9 +482,13 @@ def validate_scope(scope, recovery=None):
 def prepare(seed):
     """Capture starting observations. The caller reviews/fixes these exact bytes."""
     fields(seed, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
-                  "repositories", "artifact_roots", "state_path", "workspace"))
+                  "repositories", "artifact_roots", "state_path", "workspace"), ("owner_snapshots",))
     seed = decode(canonical(seed))
     refs(seed["owners"])
+    snapshots = seed.pop("owner_snapshots", {})
+    if not isinstance(snapshots, dict) or snapshots.keys() - {owner["path"] for owner in seed["owners"]}:
+        raise CompletionError("owner snapshots must name exact bound owners")
+    used_snapshots = set()
     for owner in seed["owners"]:
         for check in seed["checks"]:
             if check["kind"] != "git_source":
@@ -485,12 +498,19 @@ def prepare(seed):
             for filename in target["files"]:
                 if path(owner["path"]) != path(repo) / filename:
                     continue
-                revision = git(repo, "rev-parse", "HEAD").decode().strip()
-                original = git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)
-                if sha(original) != owner["sha256"]:
-                    raise CompletionError("planned owner edit requires committed original bytes")
-                owner["original"] = {"repository": repo, "revision": revision, "file": filename,
-                                     "identity": repo_identity(repo)}
+                original = {"repository": repo, "file": filename, "identity": repo_identity(repo)}
+                if owner["path"] in snapshots:
+                    original["snapshot"] = snapshots[owner["path"]]
+                    used_snapshots.add(owner["path"])
+                else:
+                    revision = git(repo, "rev-parse", "HEAD").decode().strip()
+                    raw = git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)
+                    if sha(raw) != owner["sha256"]:
+                        raise CompletionError("planned owner edit requires committed original bytes or an explicit owner snapshot")
+                    original["revision"] = revision
+                owner["original"] = original
+    if snapshots.keys() != used_snapshots:
+        raise CompletionError("owner snapshot edit is outside the frozen source obligations")
     for check in seed["checks"]:
         if check["kind"] in {"git_source", "remote_ref_absent"}:
             target = check["target"]

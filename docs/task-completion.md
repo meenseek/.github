@@ -60,8 +60,30 @@ bytes가 HEAD에 보존된 경우 원래 계약의 repository identity·revision
 최종 독립 리뷰가 이 정확한 기대값을 result와 함께 검토한다. 원래 계약·요청·의무를
 바꾸지 않으며 선언하지 않은 owner 변경과 예상하지 않은 현재 bytes는 거부한다.
 N/A 근거는 고정한 원래 owner를 가리키고, 변경 뒤 타당성도 최종 리뷰에서 확인한다.
-Git에 원래 bytes가 없는 계약은 수정 대상으로 묶을 수 없으며, 미변경 계약은 현재 SHA를
-계속 대조한다. 이미 고정된 scope에 이 근거를 소급 추가하지 않는다.
+Git에 원래 bytes가 없는 기존 dirty owner는 첫 수정 전에 원본 bytes를 대상 저장소 밖의
+별도 일반 파일에 보존하고 seed의 `owner_snapshots`에 정확한 owner 경로별 사본 참조를
+명시할 수 있다. 사본은 symlink·hardlink가 아닌 1 MiB 이하 파일이며, 현재 owner와 같은
+SHA여야 한다. 해당 owner는 여전히 `git_source`에 선언해야 한다.
+
+```json
+{
+  "owner_snapshots": {
+    "/absolute/repository/README.md": {
+      "path": "/absolute/retained-originals/README.md",
+      "sha256": "SAME_SHA256_AS_THE_CURRENT_OWNER"
+    }
+  }
+}
+```
+
+`prepare`는 이 참조를 repository identity·상대 파일 경로와 함께 `owners[].original.snapshot`에
+고정한다. Git revision과 사본 중 하나만 원본으로 사용하며 묵시적인 대체는 하지 않는다.
+준비·검사는 원본을 쓰거나 Git index를 바꾸지 않는다. 범위 리뷰는 인계·수정 승인과 원본
+보존을 확인하고, 이후 `owner_updates`·최종 독립 리뷰·canonical source·baseline/index 보존
+검사는 그대로 적용한다. 사본은 매 검사 전후에 다시 확인하므로 삭제·변조하면 실패한다.
+사본은 임시 정리 대상으로 예약하지 않고, 원래 scope의 검사·복구가 의존하는 동안 해당
+작업 소유자의 근거로 보존한다. 사본 없이 dirty owner를 수정 대상으로 묶는 것은 계속 거부한다.
+미변경 계약은 현재 SHA를 계속 대조하며, 이미 고정된 scope에 이 근거를 소급 추가하지 않는다.
 
 독립 검토자가 실제 요청·승인·소유 계약과 이 정확한 범위 파일을 확인한다. 통과 후
 `scope_sha256`와 `status: No Findings`를 담은 검토 참조를 `bind`에 전달한다. 이 참조의
