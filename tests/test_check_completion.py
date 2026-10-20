@@ -95,8 +95,11 @@ class CompletionTests(unittest.TestCase):
         self.final_review()
 
     def final_review(self):
-        self.write(self.final_review_path, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings",
-                                           "result_sha256": self.ref(self.result_path)["sha256"]})
+        reviewed = {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings",
+                    "result_sha256": self.ref(self.result_path)["sha256"]}
+        if "source_preservation" in self.state:
+            reviewed["source_preservation_sha256"] = self.state["source_preservation"]["evidence"]["sha256"]
+        self.write(self.final_review_path, reviewed)
         self.state["final_review"] = self.ref(self.final_review_path)
         self.write(self.state_path, self.state)
 
@@ -623,6 +626,199 @@ class CompletionTests(unittest.TestCase):
             return answer
         with mock.patch.object(c, "observe", side_effect=drift), self.assertRaisesRegex(c.CompletionError, "source bytes changed"):
             self.inspect()
+
+    def preserved_source_fixture(self, attach=True, staged=False, index_only=False):
+        self.owner = self.repo / "README.md"
+        base = b"# Tool\nOwned: before\n"
+        fragments = [(f"## Report {name}\nBaseline {name}\nEnd {name}\n".encode(),
+                      f"## Report {name}\nOther task's pending {name}\nEnd {name}\n".encode()) for name in "ABC"]
+        base += b"".join(old for old, _ in fragments)
+        self.owner.write_bytes(base)
+        self.git("add", "README.md"); self.git("commit", "-m", "test: establish shared owner")
+        self.git("push", "origin", "main")
+        original = base
+        for old, new in fragments: original = original.replace(old, new)
+        if staged or index_only:
+            indexed = base.replace(*fragments[0]) if staged else base
+            if index_only: indexed = indexed.replace(b"Owned: before", b"Unregistered index-only draft")
+            self.owner.write_bytes(indexed); self.git("add", "README.md")
+        self.owner.write_bytes(original)
+        self.snapshot = self.root / "preserved-original.md"
+        self.snapshot.write_bytes(original)
+        self.seed["owners"] = [self.ref(self.owner)]
+        self.seed["owner_snapshots"] = {str(self.owner): self.ref(self.snapshot)}
+        self.seed["checks"][0]["target"]["files"].append("README.md")
+        self.state_path = self.root / (self.seed["session_id"] + ".json")
+        self.seed["state_path"] = str(self.state_path)
+        self.reset_categories(); self.freeze()
+        # Publish only this task's change, leaving the three other regions intact.
+        self.owner.write_bytes(base.replace(b"Owned: before", b"Owned: published"))
+        self.git("add", "README.md")
+        self.owner.write_bytes(original.replace(b"Owned: before", b"Owned: published"))
+        self.git("commit", "-m", "test: publish only the owned region"); self.git("push", "origin", "main")
+        if staged:
+            working = self.owner.read_bytes()
+            self.owner.write_bytes(base.replace(b"Owned: before", b"Owned: published").replace(*fragments[0]))
+            self.git("add", "README.md"); self.owner.write_bytes(working)
+        self.state.update(outcome="waiting", status_basis=self.ref(self.request))
+        self.write(self.state_path, self.state)
+        self.snapshot_result()
+        ranges = [{"base": [base.index(old), base.index(old) + len(old)],
+                   "snapshot": [original.index(new), original.index(new) + len(new)]} for old, new in fragments]
+        self.preservation_path = self.root / "source-preservation.json"
+        self.preservation_review = self.root / "source-preservation-review.json"
+        self.preservation = {"scope_sha256": self.scope_ref["sha256"], "task_id": self.seed["task_id"],
+                             "session_id": self.seed["session_id"], "previous_state_sha256": self.ref(self.state_path)["sha256"],
+                             "authorization": self.ref(self.request), "reason": "Preserve three independently owned report regions",
+                             "files": [{"check_id": "source", "file": "README.md", "owner": "synthetic other task",
+                                        "basis": [self.ref(self.request)], "ranges": ranges}]}
+        self.write_preservation()
+        if attach: self.attach_preservation()
+
+    def write_preservation(self):
+        self.write(self.preservation_path, self.preservation)
+        self.write(self.preservation_review, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings",
+                                             "source_preservation_sha256": self.ref(self.preservation_path)["sha256"]})
+
+    def preservation_call(self, ok=True):
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT.with_name("completion_hook.py")),
+                               "--bindings", str(self.root), "preserve-source", "--session", self.seed["session_id"],
+                               "--expected-sha256", self.ref(self.state_path)["sha256"],
+                               "--evidence", str(self.preservation_path), "--evidence-sha256", self.ref(self.preservation_path)["sha256"],
+                               "--review", str(self.preservation_review), "--review-sha256", self.ref(self.preservation_review)["sha256"]],
+                              capture_output=True, timeout=35)
+        self.assertEqual(done.returncode, 0 if ok else 2, done.stdout + done.stderr)
+        return json.loads(done.stdout)
+
+    def attach_preservation(self):
+        self.preservation_call()
+        self.state = json.loads(self.state_path.read_bytes())
+        self.state["outcome"] = "working"
+        self.write(self.state_path, self.state)
+        self.snapshot_result()
+
+    def test_preserved_regions_actual_cli_corrects_without_rewriting_scope_and_completes(self):
+        self.preserved_source_fixture(attach=False)
+        scope = self.scope_path.read_bytes()
+        before = json.loads(self.state_path.read_bytes())
+        index = (self.repo / ".git/index").read_bytes()
+        with self.assertRaisesRegex(c.CompletionError, "working source bytes differ"):
+            c.observe(json.loads(scope)["checks"][0], self.result["checks"]["source"])
+        self.preservation_call()
+        after = json.loads(self.state_path.read_bytes())
+        self.assertEqual({k: v for k, v in after.items() if k != "source_preservation"}, before)
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual(self.scope_path.read_bytes(), scope)
+        self.state = after
+        self.state["outcome"] = "working"; self.write(self.state_path, self.state)
+        self.snapshot_result()
+        self.assertTrue(self.inspect()["complete"])
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT.with_name("completion_hook.py")), "--bindings", str(self.root),
+                               "complete", "--session", self.seed["session_id"], "--expected-sha256", self.ref(self.state_path)["sha256"],
+                               "--task-id", self.seed["task_id"], "--request-digest", self.seed["request_digest"],
+                               "--result", str(self.result_path), "--review", str(self.final_review_path),
+                               "--review-sha256", self.ref(self.final_review_path)["sha256"]], capture_output=True, timeout=35)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(json.loads(done.stdout)["complete"])
+        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.scope_path.read_bytes(), scope)
+
+    def test_preserved_regions_reject_loss_unregistered_changes_and_unpublished_owned_bytes(self):
+        self.preserved_source_fixture()
+        original = self.owner.read_bytes()
+        variants = [original.replace(b"pending A", b"tampered A"),
+                    original.replace(b"## Report B\nOther task's pending B\nEnd B\n", b""),
+                    original.replace(b"Owned: published", b"Owned: not published"), original + b"Unregistered difference\n"]
+        for payload in variants:
+            with self.subTest(payload=payload):
+                self.owner.write_bytes(payload)
+                self.result["owner_updates"][str(self.owner)] = self.ref(self.owner)["sha256"]
+                self.write(self.result_path, self.result); self.final_review()
+                answer = self.inspect()
+                self.assertFalse(answer["complete"])
+                self.assertTrue(any("working source bytes differ" in f["reason"] for f in answer["failures"]), answer)
+        self.owner.unlink()
+        self.result["owner_updates"][str(self.owner)] = None
+        self.result["checks"]["source"]["files"]["README.md"] = None
+        self.write(self.result_path, self.result); self.final_review()
+        self.assertTrue(any("cannot delete" in f["reason"] for f in self.inspect()["failures"]))
+
+    def test_preserved_regions_cannot_omit_a_region_or_waive_baseline_index_checks(self):
+        self.preserved_source_fixture(attach=False)
+        self.preservation["files"][0]["ranges"].pop()
+        self.write_preservation(); self.attach_preservation()
+        self.assertFalse(self.inspect()["complete"])
+        # Only the already reviewed README classification exists; an unrelated
+        # index-only change still fails even with preservation bound.
+        working = (self.repo / "tool.py").read_bytes()
+        (self.repo / "tool.py").write_text("unreviewed staged bytes")
+        self.git("add", "tool.py"); (self.repo / "tool.py").write_bytes(working)
+        answer = self.inspect()
+        self.assertTrue(any(f["id"].endswith(":content:tool.py") for f in answer["failures"]), answer)
+
+    def test_preserved_regions_keep_same_file_staging_despite_a_content_exception(self):
+        self.preserved_source_fixture(staged=True)
+        self.assertTrue(self.inspect()["complete"])
+        working = self.owner.read_bytes()
+        published = c.git(str(self.repo), "show", "HEAD:README.md")
+        self.owner.write_bytes(published); self.git("add", "README.md"); self.owner.write_bytes(working)
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertTrue(any("retained staging" in f["reason"] for f in answer["failures"]), answer)
+        # Newly staging the two originally unstaged foreign regions also fails.
+        self.git("add", "README.md")
+        self.assertTrue(any("retained staging" in f["reason"] for f in self.inspect()["failures"]))
+
+    def test_preserved_regions_refuse_unexplained_starting_index_only_bytes(self):
+        self.preserved_source_fixture(attach=False, index_only=True)
+        before = self.state_path.read_bytes()
+        answer = self.preservation_call(ok=False)
+        self.assertIn("starting index", answer["error"])
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_source_preservation_cli_refuses_wrong_previous_scope_review_and_replacement(self):
+        self.preserved_source_fixture(attach=False)
+        before = self.state_path.read_bytes()
+        original = copy.deepcopy(self.preservation)
+        for key in ("scope_sha256", "previous_state_sha256"):
+            self.preservation = copy.deepcopy(original); self.preservation[key] = "f" * 64
+            self.write_preservation(); self.preservation_call(ok=False)
+            self.assertEqual(self.state_path.read_bytes(), before)
+        self.preservation = original; self.write_preservation()
+        self.preservation_review.write_text("{}")
+        self.preservation_call(ok=False); self.assertEqual(self.state_path.read_bytes(), before)
+        self.write_preservation(); self.preservation_call()
+        attached = self.state_path.read_bytes()
+        self.preservation_call(ok=False); self.assertEqual(self.state_path.read_bytes(), attached)
+
+    def test_preserved_regions_require_unique_ordered_original_context_and_final_review(self):
+        self.preserved_source_fixture(attach=False)
+        scope = json.loads(self.scope_path.read_bytes())
+        original = copy.deepcopy(self.preservation)
+        for mutate in (lambda r: r[0].update(base=[0, 1]), lambda r: r.append(copy.deepcopy(r[0]))):
+            self.preservation = copy.deepcopy(original); mutate(self.preservation["files"][0]["ranges"])
+            self.write_preservation()
+            binding = {"evidence": self.ref(self.preservation_path), "review": self.ref(self.preservation_review)}
+            with self.assertRaises(c.CompletionError): c.source_preservation(self.scope_ref, scope, binding)
+        self.preservation = original; self.write_preservation(); self.attach_preservation()
+        reviewed = json.loads(self.final_review_path.read_bytes()); reviewed.pop("source_preservation_sha256")
+        self.write(self.final_review_path, reviewed); self.state["final_review"] = self.ref(self.final_review_path)
+        self.write(self.state_path, self.state)
+        with self.assertRaisesRegex(c.CompletionError, "final review"):
+            self.inspect()
+
+    def test_preserved_regions_recheck_evidence_and_snapshot_after_observations(self):
+        self.preserved_source_fixture()
+        observe = c.observe
+        for target in (self.preservation_path, self.snapshot):
+            raw = target.read_bytes()
+            def mutate(check, expected, **kwargs):
+                answer = observe(check, expected, **kwargs)
+                if check["kind"] == "git_source": target.write_text("changed during observation")
+                return answer
+            try:
+                with mock.patch.object(c, "observe", side_effect=mutate), self.assertRaises(c.CompletionError): self.inspect()
+            finally: target.write_bytes(raw)
 
     def update_owner_result(self):
         self.owner.write_text("Synthetic reviewed updated local tool contract.\n")

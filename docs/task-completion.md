@@ -114,6 +114,59 @@ python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected
 확인한다. 다른 owner 변경, 새 drift, 원래 의무 실패·살아 있는 임시 자원은 계속 거부한다.
 이 hash 형식이 승인·독립 검토의 의미를 대신하지 않으며 선언 안 된 임의 작업을 허용하지 않는다.
 
+## 같은 파일의 타 소유 구간 보존
+
+`git_source`의 기본 검사는 게시된 local/remote main과 작업 파일의 전체 SHA를 대조한다.
+동일 파일의 독립된 타 작업 구간을 미커밋 상태로 보존해야 하면, 이를 타 작업의 완료
+조건으로 바꾸거나 파일 전체 검사를 끄지 않는다. 원래 `owner_snapshots`와 시작 main에
+이미 있던 차이 중 보존할 구간만 별도 evidence와 독립 리뷰로 고정한다.
+
+`preserve-source`는 기존 waiting pointer에 `source_preservation` evidence/review 한 쌍을
+CAS로 한 번만 추가한다. 원래 scope·요청·범위 리뷰·상태 근거·자원을 덮어쓰지 않는다.
+evidence는 `scope_sha256`, `task_id`, `session_id`, 바로 이전 pointer의
+`previous_state_sha256`, `authorization` 경로/SHA, 변경 `reason`, `files`를 담는다.
+각 file은 기존 `git_source`의 `check_id`와 `file`, 보존 구간의 타 소유 `owner`·`basis`
+경로/SHA 목록, `ranges`를 명시한다. 새 파일이나 의무 누락은 허용하지 않는다.
+
+```json
+{
+  "check_id": "owned-source",
+  "file": "README.md",
+  "owner": "the existing independent task",
+  "basis": [{"path": "/absolute/ownership-evidence.json", "sha256": "EVIDENCE_SHA256"}],
+  "ranges": [{"base": [10, 30], "snapshot": [10, 45]}]
+}
+```
+
+`base`는 baseline에 고정한 main의 파일, `snapshot`은 해당 owner의 기존 원본 사본을
+가리킨다. 구간은 UTF-8 문자나 행 번호가 아닌 **0부터 시작하는 byte 위치 `[시작, 끝)`**다.
+변경 부분과 함께 각 파일에서 한 번만 나타나는 정확한 문맥을 포함한다. 구간은 각 원본에서
+순서대로 겹침 없이 선언하며, 비어 있거나 모호한 문맥은 거부한다. 소유권은 문맥으로
+추정하지 않는다. 기존 승인·소유 근거와 독립 검토가 타 소유 구간의 경계를 판단한다.
+
+독립 리뷰는 정확히 `scope_sha256`, `source_preservation_sha256`, `status: No Findings`를
+묶는다. 다음 명령은 evidence가 기록한 바로 이전 pointer SHA를 요구한다.
+
+```sh
+python3 scripts/completion_hook.py preserve-source --session SESSION_ID --expected-sha256 POINTER_SHA --evidence /absolute/preservation.json --evidence-sha256 PRESERVATION_SHA --review /absolute/preservation-review.json --review-sha256 REVIEW_SHA
+```
+
+재개는 기존 `outcome working`으로 별도 수행한다. 선언을 교체하거나 scope를 다시 bind하지
+않는다. 최종 리뷰는 기존 scope/result SHA에 `source_preservation_sha256`도 묶는다.
+`owner_recovery`가 함께 있으면 그 SHA도 계속 요구한다.
+
+검사는 게시된 local/remote main의 전체 SHA를 유지하고, 검토된 게시본의 정확한 문맥에만
+원래 사본의 보존 구간을 다시 넣어 작업 파일 전체를 대조한다. fuzzy 적용은 하지 않는다.
+자기 변경이 미게시 상태이거나, 미등록 차이·타인 구간 손실·문맥 변경·파일 삭제가 있으면
+실패한다. baseline의 원래 index blob으로 각 보존 구간의 staged 여부도 확인한다. 시작 main에
+선언한 staged 구간을 적용한 bytes가 원래 index 전체와 같아야 한다. 그 밖의 초기 staged 변경은
+자기 변경이라도 이 계약에서 묵시적으로 인수하지 않고 정정 연결 전에 거부한다. 현재 index는
+게시본에 원래 staged였던 타 소유 구간만 적용한 bytes와 원래 mode를 유지해야 한다.
+부분 stage·충돌·모호한 문맥·원래 blob 부재는 거부한다. 같은 파일의 내용 예외로도 타 소유
+stage 손실이나 새 stage를 숨길 수 없다. 사본·승인·소유 근거·보존 리뷰는 검사 전후 재확인한다.
+이 연결은 baseline/index 변경의 예외를 자동 부여하지 않는다. 기존 정확한 분류·최종 리뷰·
+자원·CAS 검사도 유지한다.
+
 ## 완료 범주
 
 | 범주 | 확인할 결과 |

@@ -62,7 +62,7 @@ def replace(filename, value, expected):
 def load_state(filename):
     raw = c.raw_file(str(filename))
     value = c.decode(raw)
-    c.fields(value, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery"))
+    c.fields(value, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation"))
     if value["intent"] != "closure": raise c.CompletionError("invalid closure intent")
     return value, c.sha(raw)
 
@@ -150,7 +150,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner"):
+    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -166,7 +166,7 @@ def main(argv=None):
         if name == "attach": item.add_argument("--resource", required=True, help="JSON with fixed kind,target; actual tool handle and owner record")
         if name in {"finalize", "complete"}:
             item.add_argument("--result", required=True); item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
-        if name == "recover-owner":
+        if name in {"recover-owner", "preserve-source"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "outcome":
@@ -233,6 +233,21 @@ def main(argv=None):
                         recovery = c.owner_recovery(state["scope"], scope, binding)
                         c.validate_scope(scope, recovery)
                         state["owner_recovery"] = binding
+                    elif args.command == "preserve-source":
+                        if state["outcome"] != "waiting" or state["scope"] is None or "source_preservation" in state:
+                            raise c.CompletionError("source preservation requires the existing waiting binding and cannot replace a preservation")
+                        c.reference(state.get("status_basis"))
+                        binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                   "review": {"path": args.review, "sha256": args.review_sha256}}
+                        scope = c.read_reference(state["scope"])
+                        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
+                            raise c.CompletionError("scope task/session/resource pointer differs")
+                        if c.read_reference(binding["evidence"])["previous_state_sha256"] != before:
+                            raise c.CompletionError("source preservation is not for the exact previous pointer")
+                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"]) if "owner_recovery" in state else None
+                        c.validate_scope(scope, recovery)
+                        c.source_preservation(state["scope"], scope, binding)
+                        state["source_preservation"] = binding
                     elif args.command in {"finalize", "complete"}:
                         state.update(result_path=str(c.path(args.result)), final_review=c.reference({"path": args.review, "sha256": args.review_sha256}))
                         if args.command == "complete":

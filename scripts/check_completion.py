@@ -411,6 +411,105 @@ def owner_recovery(scope_ref, scope, binding):
     return recovered
 
 
+def source_preservation(scope_ref, scope, binding):
+    """Bind exact pre-existing foreign regions without replacing source obligations."""
+    fields(binding, ("evidence", "review"))
+    evidence = read_reference(binding["evidence"])
+    fields(evidence, ("scope_sha256", "task_id", "session_id", "previous_state_sha256", "authorization", "reason", "files"))
+    if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
+        raise CompletionError("source preservation differs from the frozen scope/task/session")
+    digest(evidence["previous_state_sha256"]); reference(evidence["authorization"]); text(evidence["reason"])
+    if read_reference(binding["review"]) != {"scope_sha256": scope_ref["sha256"],
+            "source_preservation_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
+        raise CompletionError("source preservation requires review of the exact scope and evidence")
+    files = evidence["files"]
+    if not isinstance(files, list) or not 1 <= len(files) <= 32:
+        raise CompletionError("expected 1..32 preserved source files")
+    preserved = {}
+    for entry in files:
+        fields(entry, ("check_id", "file", "owner", "basis", "ranges"))
+        text(entry["owner"]); refs(entry["basis"])
+        selected = [check for check in scope["checks"] if check["id"] == entry["check_id"] and check["kind"] == "git_source"]
+        if len(selected) != 1 or selected[0]["category"] != "source":
+            raise CompletionError("preservation requires an existing source obligation")
+        target = selected[0]["target"]
+        repo, filename = target["repository"], text(entry["file"])
+        if filename not in target["files"] or filename in preserved.get(entry["check_id"], {}):
+            raise CompletionError("preservation changed file coverage or repeated a file")
+        owners = [owner for owner in scope["owners"] if owner.get("original", {}).get("repository") == repo
+                  and owner["original"]["file"] == filename and "snapshot" in owner["original"]]
+        if len(owners) != 1:
+            raise CompletionError("preservation requires the existing original owner snapshot")
+        owner = owners[0]
+        owner_refs([owner])
+        before = scope["baseline"]["repositories"].get(repo, {})
+        if before.get("dirty_bytes", {}).get(filename, {}).get("worktree") != {"sha256": owner["sha256"]}:
+            raise CompletionError("preserved owner was not the captured starting dirty file")
+        mode, indexed = index_source_bytes(repo, before["dirty_bytes"][filename]["index"])
+        revision = before["refs"].get("refs/heads/" + target["main"])
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+            raise CompletionError("preservation requires the captured main revision")
+        base = git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)
+        original = raw_file(owner["original"]["snapshot"]["path"])
+        if sha(original) != owner["sha256"]:
+            raise CompletionError("preserved original owner bytes changed")
+        ranges = entry["ranges"]
+        if not isinstance(ranges, list) or not 1 <= len(ranges) <= 32:
+            raise CompletionError("expected 1..32 exact preserved byte ranges")
+        pairs, staged, ends = [], [], {"base": 0, "snapshot": 0}
+        for region in ranges:
+            fields(region, ("base", "snapshot"))
+            fragments = []
+            for name, raw in (("base", base), ("snapshot", original)):
+                interval = region[name]
+                if (not isinstance(interval, list) or len(interval) != 2 or any(type(i) is not int for i in interval)
+                        or not ends[name] <= interval[0] < interval[1] <= len(raw)):
+                    raise CompletionError("preserved ranges must be ordered, nonempty and disjoint")
+                fragment = raw[interval[0]:interval[1]]
+                if raw.find(fragment) != interval[0] or raw.rfind(fragment) != interval[0]:
+                    raise CompletionError("preserved range requires unique exact context")
+                fragments.append(fragment); ends[name] = interval[1]
+            if fragments[0] == fragments[1]:
+                raise CompletionError("preserved range must identify an existing difference")
+            pairs.append(tuple(fragments))
+            old, new = fragments
+            old_at, new_at = indexed.find(old), indexed.find(new)
+            if new_at >= 0 and new_at == indexed.rfind(new):
+                if old_at >= 0 and not (new_at <= old_at and indexed.rfind(old) + len(old) <= new_at + len(new)):
+                    raise CompletionError("captured index has ambiguous preserved context")
+                staged.append((old, new))
+            elif old_at < 0 or old_at != indexed.rfind(old) or new_at >= 0:
+                raise CompletionError("captured index has partial or ambiguous preserved staging")
+        if preserved_source_bytes(base, staged) != indexed:
+            raise CompletionError("starting index has undeclared changes outside preserved regions")
+        preserved.setdefault(entry["check_id"], {})[filename] = {"working": pairs, "index": staged, "mode": mode}
+    return preserved
+
+
+def index_source_bytes(repo, entries):
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise CompletionError("preservation requires one stage-zero index entry")
+    metadata = re.fullmatch(r"(100644|100755) ([0-9a-f]{40}|[0-9a-f]{64}) 0", text(entries[0]))
+    if metadata is None:
+        raise CompletionError("preservation requires a regular stage-zero index entry")
+    return metadata[1], git(repo, "cat-file", "blob", metadata[2])
+
+
+def preserved_source_bytes(published, pairs):
+    """Apply only exact, unique regions; never infer ownership or use fuzzy patches."""
+    result, end = bytearray(), 0
+    for before, after in pairs:
+        start = published.find(before)
+        if start < end or published.rfind(before) != start:
+            raise CompletionError("preserved source region is absent, ambiguous or overlapping")
+        result.extend(published[end:start]); result.extend(after)
+        end = start + len(before)
+    result.extend(published[end:])
+    if len(result) > MAX_BYTES:
+        raise CompletionError("preserved owner exceeds the bounded owner size")
+    return bytes(result)
+
+
 def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"))
@@ -559,11 +658,14 @@ def draft_result(scope_ref, expectations=None):
     recovery = None
     state_raw = raw_file(scope["state_path"]) if path(scope["state_path"]).is_file() else None
     state = decode(state_raw) if state_raw is not None else {}
-    if "owner_recovery" in state:
+    if "owner_recovery" in state or "source_preservation" in state:
         if (state.get("task_id"), state.get("session_id"), state.get("intent"), state.get("scope")) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
             raise CompletionError("current resource pointer differs from frozen task")
+    if "owner_recovery" in state:
         recovery = owner_recovery(scope_ref, scope, state["owner_recovery"])
     checks = validate_scope(scope, recovery)
+    if "source_preservation" in state:
+        source_preservation(scope_ref, scope, state["source_preservation"])
     planned = {(ref["original"]["repository"], ref["original"]["file"])
                for ref in scope["owners"] if "original" in ref}
     expectations = {} if expectations is None else decode(canonical(expectations))
@@ -611,6 +713,9 @@ def draft_result(scope_ref, expectations=None):
     reference(scope_ref); reference(scope["request"])
     if recovery:
         owner_recovery(scope_ref, scope, state["owner_recovery"])
+    if "source_preservation" in state:
+        source_preservation(scope_ref, scope, state["source_preservation"])
+    if recovery or "source_preservation" in state:
         if raw_file(scope["state_path"]) != state_raw:
             raise CompletionError("recovery binding changed during candidate collection")
     current_owners(scope["owners"], updates, recovery)
@@ -620,7 +725,7 @@ def draft_result(scope_ref, expectations=None):
     return result
 
 
-def observe(check, expected):
+def observe(check, expected, *, preserved=None):
     kind, target = check["kind"], check["target"]
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
@@ -720,6 +825,8 @@ def observe(check, expected):
             if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
                 raise CompletionError("invalid repository-relative source path")
             if wanted is None:
+                if preserved and filename in preserved:
+                    raise CompletionError("cannot delete a file with preserved foreign regions")
                 for revision in (local, remote_oid):
                     if git_source_present(repo, revision, filename):
                         raise CompletionError("reviewed source deletion is not preserved in both main revisions")
@@ -730,7 +837,16 @@ def observe(check, expected):
             for revision in (local, remote_oid):
                 if git_source_sha(repo, revision, filename) != wanted:
                     raise CompletionError("reviewed source bytes are not preserved in both main revisions")
-            if working_source_sha(path(repo) / filename) != wanted:
+            working = wanted
+            if preserved and filename in preserved:
+                proof = preserved[filename]
+                published = git(repo, "show", "--no-ext-diff", "--no-textconv", local + ":" + filename)
+                working = sha(preserved_source_bytes(published, proof["working"]))
+                rows = git(repo, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", filename).decode().split("\0")
+                mode, indexed = index_source_bytes(repo, [row.split("\t", 1)[0] for row in rows if row])
+                if mode != proof["mode"] or sha(indexed) != sha(preserved_source_bytes(published, proof["index"])):
+                    raise CompletionError("preserved source index differs from publication and retained staging")
+            if working_source_sha(path(repo) / filename) != working:
                 raise CompletionError("working source bytes differ from integrated source")
         return {"local_revision": local, "remote_revision": remote_oid}
     raise CompletionError("unsupported observer")
@@ -741,11 +857,12 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     scope = read_reference(scope_ref)
     state_raw = raw_file(scope["state_path"])
     state = decode(state_raw)
-    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery"))
+    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation"))
     if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"]) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
+    preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
     if workspace is not None and scope["environment"]["workspace"] != str(path(workspace)):
         raise CompletionError("observer workspace differs from host")
     if task_id is not None and scope["task_id"] != task_id:
@@ -784,6 +901,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     reviewed_final = read_reference(selected_final)
     expected_review = {"scope_sha256": scope_ref["sha256"], "result_sha256": sha(result_raw), "status": "No Findings"}
     if recovery: expected_review["owner_recovery_sha256"] = state["owner_recovery"]["evidence"]["sha256"]
+    if preserved: expected_review["source_preservation_sha256"] = state["source_preservation"]["evidence"]["sha256"]
     if stopped: expected_review["disposition"] = "stopped"
     if reviewed_final != expected_review:
         raise CompletionError("final review does not cover these exact expectations and exceptions")
@@ -794,7 +912,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         if stopped and definition["kind"] not in CLEANUP_KINDS:
             return key, {"unfulfilled": True, "reason": "terminal stop; original goal is not claimed complete"}, None
         try:
-            return key, observe(definition, wanted), None
+            return key, (observe(definition, wanted, preserved=preserved[key]) if key in preserved else observe(definition, wanted)), None
         except (CompletionError, OSError, ValueError, URLError, subprocess.TimeoutExpired) as exc:
             return key, None, str(exc)
 
@@ -862,6 +980,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     # Recheck immutable inputs and accumulated handles after observations.
     reference(scope_ref); reference(scope["request"])
     if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"])
+    if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
     reference(selected_final)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
@@ -879,6 +998,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         answer.update(categories=scope["categories"], expectations=result["checks"],
                       result={"path": str(path(result_path)), "sha256": sha(result_raw)},
                       scope_review=selected_review, final_review=selected_final)
+    if preserved: answer["source_preservation_sha256"] = state["source_preservation"]["evidence"]["sha256"]
     return answer
 
 
