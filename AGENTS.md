@@ -168,6 +168,17 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 ## Branch
 
+- 작업 시작 시 대상 저장소의 기존 변경 목록과 staged/unstaged diff·파일 SHA를 읽고
+  소유자·요청 범위·실제 의존 관계를 구분합니다. 미커밋 변경의 존재만으로 무관한 작업을
+  중단하지 않습니다. 파일이나 변경 구간이 독립적이면 기존 bytes를 보존하며 진행하고,
+  같은 구간이나 의존 관계에 충돌 위험이 있을 때만 해당 범위를 조정합니다. 소유자가
+  불명확한 변경도 보존하며, 그 불명확성 때문에 덮어쓸 위험이 있는 수정만 보류합니다.
+  기존 변경을 자기 작업에 포함하거나 일괄 stash/reset/clean/commit/delete로 해소하지 않습니다.
+- 공유 `AGENTS.md`도 이미 수정됐다는 이유만으로 승인된 별도 구간의 수정을 막지 않습니다.
+  수정 전 bytes와 이번 변경 범위를 고정하고 기존 변경 보존·독립 리뷰를 확인합니다.
+  이미 고정한 owner SHA와 다른 경우에는 [작업 완료 계약](docs/task-completion.md)의
+  planned edit·`recover-owner`로 그 연결만 처리하며, 이를 무관한 작업 전체의 중단이나
+  기존 승인·소유권·완료 검사의 생략으로 확대하지 않습니다.
 - 이름: `<type>-<lowercase-kebab-case>`
 - `type`: `feature`, `fix`, `docs`, `chore`, `refactor`, `test`, `build`, `ci`,
   `perf`
