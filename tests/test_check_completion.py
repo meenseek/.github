@@ -684,8 +684,9 @@ class CompletionTests(unittest.TestCase):
                     f.write(f.final_review_path, reviewed)
                     f.state["final_review"] = f.ref(f.final_review_path)
                     f.write(f.state_path, f.state)
+                goal = ["--task-id", f.seed["task_id"], "--request-digest", f.seed["request_digest"]] if command == "unbind" else []
                 done = subprocess.run([sys.executable, "-I", str(SCRIPT.with_name("completion_hook.py")), "--bindings", str(f.root), command,
-                                       "--session", f.seed["session_id"], "--expected-sha256", f.ref(f.state_path)["sha256"]],
+                                       "--session", f.seed["session_id"], "--expected-sha256", f.ref(f.state_path)["sha256"], *goal],
                                       capture_output=True, timeout=35)
                 self.assertEqual(done.returncode, 0, done.stdout)
                 answer = json.loads(done.stdout)

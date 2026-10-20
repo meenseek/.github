@@ -67,6 +67,22 @@ def load_state(filename):
     return value, c.sha(raw)
 
 
+def task_context(state, filename, session):
+    """Read the bound goal, without executing its observations or inferring a new one."""
+    if state["session_id"] != session:
+        raise c.CompletionError("session binding changed")
+    context = {"task_id": state["task_id"], "outcome": state["outcome"], "scope": state["scope"]}
+    if state["scope"] is not None:
+        scope = c.read_reference(state["scope"])
+        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], session, str(filename)):
+            raise c.CompletionError("goal differs from the frozen session binding")
+        context.update(request=c.reference(scope["request"]), request_digest=c.digest(scope["request_digest"]),
+                       obligations=[check["id"] for check in scope["checks"]])
+    if state["outcome"] in {"waiting", "blocked", "cancelled"}:
+        context["status_basis"] = c.reference(state["status_basis"])
+    return context
+
+
 def hook(payload, root=ROOT):
     event = payload.get("hook_event_name")
     if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return {}
@@ -76,7 +92,18 @@ def hook(payload, root=ROOT):
     # Bound worktree sessions stay covered even when their cwd is outside Desktop.
     if not filename.exists() and not cwd.is_relative_to(desktop): return {}
     if event != "Stop":
-        return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": GUIDANCE + " 현재 session_id=" + payload["session_id"]}}
+        context = GUIDANCE + " 현재 session_id=" + payload["session_id"]
+        if filename.exists():
+            try:
+                state, _ = load_state(filename)
+                goal = task_context(state, filename, payload["session_id"])
+                context += ("\n기존 연결 작업=" + json.dumps(goal, ensure_ascii=False) +
+                            "\n이 상태·대기는 위 작업에 한정됩니다. 현재 사용자 지시·우선순위·승인 철회를 따르되, "
+                            "독립 작업까지 차단하거나 과거 질문의 답을 이 작업의 산출물로 대신하지 마세요. "
+                            "complete/unbind에는 현재 목표의 --task-id와 --request-digest를 명시하세요.")
+            except (c.CompletionError, OSError, ValueError, TypeError, KeyError) as exc:
+                context += "\n기존 목표 연결 미확인: " + str(exc)[:1000] + ". 이 오류로 다른 독립 작업의 승인 상태를 추정하지 마세요."
+        return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
     if not filename.exists():
         return {"systemMessage": "정리 완료 검증에 연결되지 않은 세션입니다. 정리 의도가 있으면 먼저 arm/bind 하세요. 미연결 상태는 완료 보증이 아닙니다."}
     try:
@@ -128,6 +155,9 @@ def main(argv=None):
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
+        if name in {"complete", "unbind"}:
+            item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
+            item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
         if name == "bind":
             item.add_argument("--scope", required=True); item.add_argument("--scope-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
@@ -160,6 +190,10 @@ def main(argv=None):
                     state, before = load_state(filename)
                     if before != c.digest(args.expected_sha256) or state["session_id"] != args.session:
                         raise c.CompletionError("stale pointer or wrong session")
+                    if args.command in {"complete", "unbind"}:
+                        goal = task_context(state, filename, args.session)
+                        if (c.text(args.task_id), c.digest(args.request_digest)) != (goal["task_id"], goal.get("request_digest")):
+                            raise c.CompletionError("current task/request differs from the frozen binding; preserve it and review the current goal")
                     if args.command == "bind":
                         if state["scope"] is not None: raise c.CompletionError("scope already frozen; recovery must not replace original obligations")
                         scope_ref = c.reference({"path": args.scope, "sha256": args.scope_sha256})
@@ -207,7 +241,7 @@ def main(argv=None):
                             before = replace(filename, state, before)["sha256"]
                             scope = c.read_reference(state["scope"])
                             answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
-                                                   workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
+                                                   request_digest=args.request_digest, workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
                             if answer["complete"]:
                                 if c.sha(c.raw_file(str(filename))) != before: raise c.CompletionError("pointer changed")
                                 filename.unlink()

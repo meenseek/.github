@@ -28,6 +28,7 @@ class HookTests(unittest.TestCase):
     def call(self, command, *args, ok=True):
         argv = [sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root), command, "--session", self.f.seed["session_id"]]
         if command != "arm": argv += ["--expected-sha256", h.c.sha(h.c.raw_file(str(self.state)))]
+        if command in {"complete", "unbind"}: argv += self.goal_args()
         done = subprocess.run([*argv, *args], capture_output=True, timeout=35)
         self.assertEqual(done.returncode, 0 if ok else 2, done.stdout)
         return json.loads(done.stdout)
@@ -46,6 +47,9 @@ class HookTests(unittest.TestCase):
         return ["--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
                 "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"]]
 
+    def goal_args(self):
+        return ["--task-id", self.f.seed["task_id"], "--request-digest", self.f.seed["request_digest"]]
+
     def test_complete_actual_cli_finalizes_inspects_and_releases_once(self):
         self.arm_bind(finalize=False)
         answer = self.call("complete", *self.completion_args())
@@ -53,6 +57,96 @@ class HookTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
         self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
         self.assertEqual(answer["final_review"], self.f.ref(self.f.final_review_path))
+
+    def test_complete_requires_current_goal_before_mutating_old_binding(self):
+        # Reproduction: a valid old task must not close a later request merely
+        # because the caller reused this session and its old result/review.
+        self.arm_bind(finalize=False)
+        before = self.state.read_bytes()
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root),
+                               "complete", "--session", self.f.seed["session_id"],
+                               "--expected-sha256", h.c.sha(before), *self.completion_args()],
+                              capture_output=True, timeout=10)
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_new_input_carries_frozen_goal_and_scoped_wait_without_mutation(self):
+        self.arm_bind()
+        unrelated = self.f.root / "unrelated-approval.txt"
+        unrelated.write_text("An older, unrelated question is waiting for approval.")
+        self.call("outcome", "--status", "waiting", "--basis", str(unrelated),
+                  "--basis-sha256", self.f.ref(unrelated)["sha256"])
+        before = self.state.read_bytes()
+        with mock.patch.object(h.c, "check_scope", side_effect=AssertionError("input must not run completion observations")):
+            answer = h.hook({**self.payload, "hook_event_name": "UserPromptSubmit"}, self.root)
+        context = answer["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(self.f.seed["task_id"], context)
+        self.assertIn(self.f.scope_ref["sha256"], context)
+        self.assertIn(self.f.seed["request"]["path"], context)
+        self.assertIn("waiting", context)
+        self.assertNotIn("decision", answer)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_wrong_deliverable_and_missing_deliverable_cannot_close_goal(self):
+        artifact = self.f.artifacts / "deliverable.txt"
+        expected = b"Reviewed UI deliverable."
+        artifact.write_bytes(expected)
+        self.f.seed["checks"].append({"id": "deliverable", "category": "artifacts", "kind": "file",
+                                      "target": {"path": str(artifact)}})
+        self.f.reset_categories()
+        self.arm_bind(finalize=False)
+        self.f.result["checks"]["deliverable"] = self.f.ref(artifact)
+        self.f.result["checks"]["deliverable"].pop("path")
+        self.f.write(self.f.result_path, self.f.result)
+        self.f.final_review()
+        self.call("finalize", *self.completion_args())
+        artifact.write_text("Answer to an unrelated old policy question.")
+        self.assertFalse(self.call("complete", *self.completion_args(), ok=False)["complete"])
+        artifact.unlink()
+        self.assertFalse(self.call("complete", *self.completion_args(), ok=False)["complete"])
+        self.assertTrue(self.state.exists())
+        artifact.write_bytes(expected)
+        self.assertTrue(self.call("complete", *self.completion_args())["complete"])
+
+    def test_current_goal_mismatch_preserves_reviewed_result_and_binding(self):
+        self.arm_bind()
+        before = self.state.read_bytes()
+        # Evaluation cases differ from the missing-goal reproduction above.
+        for command in ("complete", "unbind"):
+            for task, digest in (("different-current-task", self.f.seed["request_digest"]),
+                                 (self.f.seed["task_id"], "1" * 64)):
+                with self.subTest(command=command, task=task, digest=digest):
+                    argv = ["--bindings", str(self.root), command, "--session", self.f.seed["session_id"],
+                            "--expected-sha256", h.c.sha(before), "--task-id", task, "--request-digest", digest]
+                    if command == "complete": argv += self.completion_args()
+                    with redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(h.main(argv), 2)
+                    self.assertIn("current task/request differs", output.getvalue())
+                    self.assertEqual(self.state.read_bytes(), before)
+
+    def test_new_input_preserves_real_cancellation_without_global_block(self):
+        self.arm_bind()
+        self.call("outcome", "--status", "cancelled", *self.basis())
+        before = self.state.read_bytes()
+        answer = h.hook({**self.payload, "hook_event_name": "UserPromptSubmit"}, self.root)
+        self.assertIn("cancelled", answer["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("decision", answer)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.state.exists())
+
+    def test_resumed_work_does_not_revalidate_an_old_wait_basis(self):
+        self.arm_bind()
+        old_basis = self.f.root / "old-wait.txt"
+        old_basis.write_text("An unrelated approval was previously pending.")
+        basis = ["--basis", str(old_basis), "--basis-sha256", self.f.ref(old_basis)["sha256"]]
+        self.call("outcome", "--status", "waiting", *basis)
+        self.call("outcome", "--status", "working", *basis)
+        old_basis.unlink()
+        answer = h.hook({**self.payload, "hook_event_name": "UserPromptSubmit"}, self.root)
+        self.assertIn(self.f.scope_ref["sha256"], answer["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("기존 목표 연결 미확인", answer["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(self.call("complete", *self.completion_args())["complete"])
 
     def test_complete_actual_cli_releases_reviewed_planned_owner_deletion(self):
         self.f.owner_edit_fixture()
@@ -114,7 +208,7 @@ class HookTests(unittest.TestCase):
     def test_complete_refuses_changed_review_and_stale_pointer(self):
         self.arm_bind(finalize=False)
         argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
-                "--expected-sha256", "1"*64, *self.completion_args()]
+                "--expected-sha256", "1"*64, *self.goal_args(), *self.completion_args()]
         before = self.state.read_bytes()
         with redirect_stdout(io.StringIO()): self.assertEqual(h.main(argv), 2)
         self.assertEqual(self.state.read_bytes(), before)
@@ -125,7 +219,7 @@ class HookTests(unittest.TestCase):
     def test_complete_reuses_one_inspection_and_retains_mid_inspection_mutation(self):
         self.arm_bind(finalize=False)
         argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
-                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.completion_args()]
+                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.goal_args(), *self.completion_args()]
         original = h.c.observe
         def drift(check, expected):
             answer = original(check, expected)

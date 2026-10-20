@@ -147,8 +147,14 @@ dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하�
 
 ```sh
 python3 scripts/check_completion.py draft --scope /absolute/scope.json --sha256 SCOPE_SHA --output /absolute/result.json
-python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha256 POINTER_SHA --result /absolute/result.json --review /absolute/final-review.json --review-sha256 REVIEW_SHA
+python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha256 POINTER_SHA --task-id TASK_ID --request-digest REQUEST_DIGEST --result /absolute/result.json --review /absolute/final-review.json --review-sha256 REVIEW_SHA
 ```
+
+`complete`와 `unbind`에는 현재 마무리할 요청의 `task_id`와 범위 고정 때 묶은
+`request_digest`를 명시한다. 세션의 과거 연결만으로 현재 목표를 추정하지 않는다.
+전달한 값이 고정 범위와 다르면 pointer 변경 전에 거절하며 원래 연결은 보존한다.
+이는 식별값의 일치 검사다. 현재 대화의 의도, 산출물의 의미나 승인 근거의 관련성을
+자동 판정하지 않는다.
 
 두 명령 사이에 독립 최종 리뷰를 수행한다. 후보는 파일 bytes와 현재 local/remote main을
 수집하며 source 파일 SHA는 local main의 committed bytes를 사용한다. HTTP 검사에는
@@ -169,6 +175,13 @@ SHA의 리뷰 참조를 전달한다. 그대로인 범위의 검증을 반복할
 함께 나온다. file hash와 N/A 사유의 의미는 계속 소유자와 독립 검토자가 판단한다.
 
 기존 `finalize`, `inspect`, `unbind`는 중간 확인·복구에 계속 사용할 수 있다.
+아래 `unbind`는 `finalize`·`inspect`를 거친 연결을 해제하는 대체 경로다.
+`complete`가 성공했다면 이미 연결이 해제된 상태다.
+
+```sh
+python3 scripts/completion_hook.py unbind --session SESSION_ID --expected-sha256 POINTER_SHA --task-id TASK_ID --request-digest REQUEST_DIGEST
+```
+
 큐에서는 원래 request의 `completion`에
 scope·범위 리뷰·검사기 SHA를 고정해 제출하고, 실제 `finish`에 `--completion-result`를
 전달한다. `finalize`로 최종 참조를 연결한 뒤 `finish`의 완료 전이가 성공하면 `complete`로
