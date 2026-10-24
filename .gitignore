@@ -3,5 +3,7 @@ __pycache__/
 
 # Private per-session completion pointers (no task content in Git).
 .completion/
+# Private task evidence and native source views.
+.verification/
 __pycache__/
 *.pyc

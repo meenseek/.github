@@ -10,6 +10,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,11 +33,18 @@ MAX_FILES = 4096
 TIMEOUT = 5
 CLEANUP_KINDS = {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"}
 KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote_ref_absent",
-         "worktree_absent", "process_absent", "http_json", "evidence"}
+         "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
 
 
 class CompletionError(ValueError):
     pass
+
+
+def improvement_observer():
+    spec = importlib.util.spec_from_file_location("completion_improvement", Path(__file__).with_name("check_improvement.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def canonical(value):
@@ -529,6 +537,12 @@ def validate_scope(scope, recovery=None):
             raise CompletionError("check target must be an object")
         if check["kind"] in {"ref_absent", "remote_ref_absent"}:
             validate_ref_observer(check["kind"], check["target"].get("ref"))
+        if check["kind"] == "improvement":
+            fields(check["target"], ("path", "plan"))
+            path(check["target"]["path"])
+            if check["category"] != "quality":
+                raise CompletionError("improvement observations belong to quality")
+            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"])
         checks[key] = check
     for owner in owners:
         if "original" in owner and not any(
@@ -681,7 +695,10 @@ def draft_result(scope_ref, expectations=None):
             return key, expectations[key]
         if kind in CLEANUP_KINDS:
             return key, {}  # Absence is still checked after independent review.
-        if kind in {"file", "evidence", "installed_file"}:
+        if kind in {"file", "evidence", "installed_file", "improvement"}:
+            if kind == "improvement":
+                fields(target, ("path", "plan"))
+                return key, {"sha256": sha(raw_file(target["path"]))}
             fields(target, ("path",), ("source",))
             return key, {"sha256": sha(raw_file(target["path"], links=kind == "installed_file"))}
         if kind == "git_source":
@@ -727,6 +744,9 @@ def draft_result(scope_ref, expectations=None):
 
 def observe(check, expected, *, preserved=None):
     kind, target = check["kind"], check["target"]
+    if kind == "improvement":
+        fields(target, ("path", "plan")); fields(expected, ("sha256",))
+        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])})
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
         fields(expected, ("sha256",))
@@ -970,10 +990,11 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     # Re-observe source after all other checks: main/remote changes seen inside
     # this inspection are never hidden by the expected main inventory exception.
     for key, definition in checks.items():
-        if definition["kind"] == "git_source" and not stopped:
+        if definition["kind"] in {"git_source", "improvement"} and not stopped:
             _, _, failure = inspect((key, definition, result["checks"][key]))
             if failure:
-                failures.append({"id": key, "reason": "final source observation: " + failure})
+                label = "source" if definition["kind"] == "git_source" else "improvement"
+                failures.append({"id": key, "reason": "final " + label + " observation: " + failure})
     for item in unclassified:
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})

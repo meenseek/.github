@@ -1062,6 +1062,40 @@ class CompletionTests(unittest.TestCase):
         seed["checks"][0]["target"] = {"command": "touch arbitrary-file"}
         with self.assertRaises(c.CompletionError): c.prepare(seed)
 
+    def test_frozen_improvement_cannot_be_omitted_or_replaced_by_a_promise(self):
+        fixture_spec = importlib.util.spec_from_file_location("improvement_fixture", Path(__file__).with_name("test_improvement.py"))
+        fixture_module = importlib.util.module_from_spec(fixture_spec)
+        fixture_spec.loader.exec_module(fixture_module)
+        fixture = fixture_module.ImprovementTests()
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        fixture.plan["task_id"] = self.seed["task_id"]; fixture.freeze()
+        self.seed["checks"].append({"id": "prevention", "category": "quality", "kind": "improvement",
+                                    "target": {"path": fixture.record_ref["path"], "plan": fixture.plan_ref}})
+        self.reset_categories()
+        for invalid in ([], {}):
+            fixture.plan["cases"][0]["phase"] = invalid; fixture.freeze()
+            self.seed["checks"][-1]["target"]["plan"] = fixture.plan_ref
+            seed_path = self.root / "invalid-phase-seed.json"; self.write(seed_path, self.seed)
+            output = self.root / "invalid-phase-scope.json"
+            result = subprocess.run([sys.executable, "-B", str(SCRIPT), "prepare", "--seed", str(seed_path),
+                                     "--output", str(output)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(json.loads(result.stdout)["complete"])
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(output.exists())
+        fixture.plan["cases"][0]["phase"] = "reproduction"; fixture.freeze()
+        self.seed["checks"][-1]["target"]["plan"] = fixture.plan_ref
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "missing|coverage|obligation"):
+            self.inspect()
+        self.result["checks"]["prevention"] = {"sha256": fixture.record_ref["sha256"]}
+        self.write(self.result_path, self.result); self.final_review()
+        self.assertTrue(self.inspect()["complete"])
+        fixture.record = {"promise": "be careful next time"}; fixture.freeze()
+        self.result["checks"]["prevention"] = {"sha256": fixture.record_ref["sha256"]}
+        self.write(self.result_path, self.result); self.final_review()
+        self.assertFalse(self.inspect()["complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -169,6 +169,71 @@ stage 손실이나 새 stage를 숨길 수 없다. 사본·승인·소유 근거
 
 ## 완료 범주
 
+### 재발 방지 검증
+
+실패를 고치거나 재발 방지를 요청받은 작업은 범위 리뷰에서 `quality`에 `improvement`
+검사를 연결한다. “주의하겠다”, 규칙 추가나 파일의 존재만으로 해결을 판정하지 않는다.
+개선 요청인데 이 검사가 빠진 범위는 독립 범위 리뷰에서 수정한다. 자연어 의도의 판별과
+기준·표본의 적절성은 그 리뷰의 책임이며, 검사기는 선언하지 않은 임의 채팅을 감지하지 않는다.
+
+[check_improvement.py](../scripts/check_improvement.py)는 사전 고정한 JSON 관측의 값과
+정확한 입력·후보·실제 사용 파일을 대조한다. 명령·모델·배포를 실행하거나 새 원장을 만들지
+않는다. 관측 생성은 원래 도메인의 실행 도구가, 의미·실행의 진실성과 독립성은 기존 리뷰가
+담당한다. 결과 파일의 `passed: true` 자기신고를 읽는 방식으로 대체하지 않는다.
+
+1. 기존 작업 기록에서 관측된 문제, 판정 기준과 근거, 수정 전 구현 SHA, 서로 다른 재현·전이
+   입력과 수정 전 관측을 준비한다. 기준이 없으면 원래 소유 위치에서 기준을 수립·검토하고
+   고정한다. 기준이 없는 채로 완료하거나, 실패한 후보에 맞춰 기대값을 고치지 않는다.
+2. 아래 계획을 확인한 뒤 그 정확한 path/SHA를 scope에 묶는다. 재현 사례에서 실제 기준
+   위반이 하나 이상 확인돼야 하며, 별도 입력의 전이 사례도 있어야 한다. 실제 도메인 실행이
+   없으면 합성 사례라고 밝히며 채용·시청 성과로 표시하지 않는다.
+3. 승인된 후보를 원래 도구로 실행해 같은 입력의 수정 후 관측을 만든다. 사례 전체의 고정
+   기대값을 통과하고 검토한 후보가 실제 사용 경로와 일치해야 한다. 후보 실패는 기각한다.
+4. 최종 완료 리뷰에서 정확한 계획·관측·후보·적용 및 남은 실제 성과 관측 조건을 함께 확인한다.
+   다음 실제 관측에서 재발과 결과를 기존 owner 기록에 누적한다. 검증된 수정과 미래 성과
+   관측 대기는 구분하며, 예정되지 않은 자동 확인을 약속하지 않는다.
+
+계획의 필수 필드는 `task_id`, `problem`, `criterion`, `basis`(기존 owner 근거 path/SHA),
+`baseline_sha256`, `cases`다. 각 case는 `id`, `phase` (`reproduction` 또는 `transfer`),
+`input`과 `baseline`(각 path/SHA), `assertions`를 가진다. assertion은 JSON object의 key
+경로 `path: ["complete"]`와 고정한 `equals: false` 같은 값 비교다. case·assertion은 각각
+최대 32개, key 경로는 최대 16개이며 입력 bytes와 path는 사례 사이에 중복하지 않는다.
+
+각 수정 전후 관측은 `case_id`, `input_sha256`, `implementation_sha256`, `result`를 가진다.
+수정 전 implementation은 계획의 baseline SHA, 수정 후는 아래 candidate 참조 목록의
+canonical JSON (`sort_keys=True`, separators `(',', ':')`, UTF-8, 추가 newline 없음)의 SHA다.
+`result`에는 원래 도구가 실제로 관측한 JSON 값을 넣으며 checker가 assertion을 직접 비교한다.
+
+최종 record는 `plan_sha256`, `candidate`(정확한 source path/SHA 목록), 계획 순서의
+`cases: [{"id": "…", "after": {"path": "…", "sha256": "…"}}]`, candidate와 같은 순서의
+`application: [{"source": {"path": "…", "sha256": "…"}, "installed_path": "…"}]`를 가진다.
+설치 없이 원본 경로를 직접 사용하는 도구는 그 실제 파일 경로를 `installed_path`로 쓴다.
+관측과 참조는 일반 UTF-8 JSON 파일이며 원문 값·비밀정보를 공개 Git에 넣지 않는다.
+
+```sh
+python3 scripts/check_improvement.py --plan /absolute/plan.json --plan-sha256 PLAN_SHA --task-id TASK_ID
+python3 scripts/check_improvement.py --plan /absolute/plan.json --plan-sha256 PLAN_SHA --task-id TASK_ID --record /absolute/record.json --record-sha256 RECORD_SHA
+```
+
+첫 명령은 수정 전 계획 검증일 뿐 개선 완료가 아니다. 다음 검사를 범위의 `checks`에 넣는다.
+
+```json
+{
+  "id": "prevention",
+  "category": "quality",
+  "kind": "improvement",
+  "target": {
+    "path": "/absolute/record.json",
+    "plan": {"path": "/absolute/plan.json", "sha256": "PLAN_SHA"}
+  }
+}
+```
+
+최종 result의 같은 ID는 `{"sha256": "RECORD_SHA"}`다. 계획·입력·관측의 누락/변조,
+재현 실패 부재, 수정 후 실패·전이 회귀, 적용본 불일치나 고정한 검사 result 누락은 완료를
+거부한다. 검사 후에도 참조와 적용본을 재대조한다. 값·hash의 일치는 실제 실행·의미 품질,
+원인 해결의 일반성이나 미래 성과를 증명하지 않는다. 관측된 사례에서의 통과만 보고한다.
+
 | 범주 | 확인할 결과 |
 | --- | --- |
 | source | 승인된 변경의 commit, main 반영, 허용된 원격의 현재 ref 및 정확한 변경 파일 보존 |
