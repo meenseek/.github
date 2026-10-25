@@ -114,6 +114,15 @@ python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected
 확인한다. 다른 owner 변경, 새 drift, 원래 의무 실패·살아 있는 임시 자원은 계속 거부한다.
 이 hash 형식이 승인·독립 검토의 의미를 대신하지 않으며 선언 안 된 임의 작업을 허용하지 않는다.
 
+원래 owner가 `original` 없는 path/SHA 참조라면 Git 이력 대신 확보된 원문 사본을
+명시적으로 결속할 수 있다. owner 항목은 `owner_path`와
+`snapshots: {original: {path, sha256}, current: {path, sha256}}`만 담는다.
+original 사본의 SHA는 고정 scope의 원래 SHA와 같아야 하고, current 사본의 SHA는
+동일 owner 경로의 실제 현재 bytes와 같아야 한다. 두 사본은 owner 경로와 별개인
+보존 파일이며 일반 입력의 크기·symlink·hardlink 검사를 그대로 받는다.
+원문을 추측하거나 Git 검증 실패 뒤 자동 대체하지 않는다. planned edit은 이 형식을
+사용할 수 없다. 기존 scope·권한 근거·독립 리뷰·waiting/CAS·최종 재대조는 유지한다.
+
 ## 같은 파일의 타 소유 구간 보존
 
 `git_source`의 기본 검사는 게시된 local/remote main과 작업 파일의 전체 SHA를 대조한다.
@@ -281,6 +290,16 @@ worktree 정리는 점유·보존 확인과 해당 앱의 archive 경계를 따�
 dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하지 않는다.
 
 최종 result는 고정 scope SHA, 모든 obligation ID의 실제 기대값, 정확한 예외만 담는다.
+
+여러 자원이 같은 보존 판단을 공유하면 optional `exception_groups`에
+`{items: [정확한 resource key, ...], classification: 기존 예외 판단}`을 기록한다.
+`exceptions`는 기존 개별 예외를 담는다. 각 그룹의 classification은 기존과 같은
+owner·reason·scope·removal_condition·basis를 모두 가져야 하며, items는 비어 있지 않은
+명시 목록이다. 그룹 안·그룹 사이·개별 예외와의 중복을 거부하고 wildcard나 prefix를
+해석하지 않는다. 실제 변경 자원 중 어느 쪽에도 없는 key는 계속 실패한다.
+사용되지 않는 명시 key의 처리는 기존 개별 예외와 같다. 원문 1 MiB 제한과 exact result
+SHA의 최종 리뷰를 유지하며 보고서도 그룹을 펼치지 않는다. 검사 마지막에 각 판단의
+근거 파일을 다시 대조해 검사 중 변조를 거부한다.
 소유 도구의 적용·정리 뒤 `draft`로 이 결과의 후보를 수집할 수 있다.
 아래 `complete`는 직접 채팅의 종료 명령이다. 큐에서는 `finish --status completed`가
 연결된 pointer를 검사하므로 그 전에는 해제하지 않는다.

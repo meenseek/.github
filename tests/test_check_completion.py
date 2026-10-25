@@ -106,6 +106,170 @@ class CompletionTests(unittest.TestCase):
     def inspect(self):
         return c.check_scope(self.scope_ref, str(self.result_path), task_id=self.seed["task_id"], request_digest="0" * 64)
 
+    def retained_classification(self):
+        return {"owner": "synthetic task", "reason": "Keep reviewed originals and their exact provenance. " * 6,
+                "scope": "Explicit resource keys only", "removal_condition": "Reviewed owner retention change",
+                "basis": [self.ref(self.owner)]}
+
+    def grouped_result(self, items):
+        self.result["exception_groups"] = [{"items": items, "classification": self.retained_classification()}]
+        self.write(self.result_path, self.result); self.final_review()
+
+    def test_exception_groups_preserve_large_exact_inventory_with_bounded_input_and_report(self):
+        items = []
+        for number in range(4000):
+            filename = self.artifacts / (f"asset-{number:04d}-" + "retained-original-" * 4)
+            filename.write_bytes(b"original")
+            items.append("path:" + str(filename))
+        inline = {**self.result, "exceptions": {key: self.retained_classification() for key in items}}
+        self.assertGreater(len(c.canonical(inline)), c.MAX_BYTES)
+        frozen = self.scope_path.read_bytes()
+        self.grouped_result(items)
+        self.assertLess(self.result_path.stat().st_size, c.MAX_BYTES)
+        answer = c.check_scope(self.scope_ref, str(self.result_path), task_id=self.seed["task_id"],
+                               request_digest="0" * 64, report=True)
+        self.assertTrue(answer["complete"], answer["failures"])
+        self.assertLess(len(c.canonical(answer)), c.MAX_BYTES)
+        self.assertEqual(answer["exception_groups"], self.result["exception_groups"])
+        self.assertEqual(self.scope_path.read_bytes(), frozen)
+
+    def test_exception_groups_do_not_cover_omissions_or_prefixes(self):
+        (self.artifacts / "retained.txt").write_text("original")
+        missing = self.artifacts / "unclassified.txt"
+        missing.write_text("also original")
+        self.grouped_result(["path:" + str(self.artifacts / "retained.txt"), "path:" + str(self.artifacts) + "/*"])
+        answer = self.inspect()
+        self.assertFalse(answer["complete"])
+        self.assertIn("path:" + str(missing), [item["id"] for item in answer["failures"]])
+
+    def test_exception_groups_reject_overlap_empty_and_invalid_classification(self):
+        key = "path:" + str(self.artifacts / "retained.txt")
+        good = {"items": [key], "classification": self.retained_classification()}
+        bad_groups = [[{**good, "items": [key, key]}], [good, good],
+                      [{**good, "items": []}], [{**good, "classification": {"owner": "incomplete"}}]]
+        for groups in bad_groups:
+            with self.subTest(groups=groups):
+                self.result["exception_groups"] = groups
+                self.write(self.result_path, self.result); self.final_review()
+                with self.assertRaises(c.CompletionError): self.inspect()
+        self.result["exceptions"] = {key: self.retained_classification()}
+        self.grouped_result([key])
+        with self.assertRaises(c.CompletionError): self.inspect()
+
+    def test_exception_groups_remain_bound_to_the_exact_final_review(self):
+        self.grouped_result(["path:" + str(self.artifacts / "retained.txt")])
+        self.result["exception_groups"][0]["items"].append("path:" + str(self.artifacts / "added.txt"))
+        self.write(self.result_path, self.result)
+        with self.assertRaisesRegex(c.CompletionError, "final review"): self.inspect()
+
+    def test_exception_groups_keep_the_exact_input_limit(self):
+        self.grouped_result(["path:" + str(self.artifacts / "retained.txt")])
+        payload = self.result_path.read_bytes()
+        self.result_path.write_bytes(payload + b" " * (c.MAX_BYTES - len(payload)))
+        self.final_review()
+        self.assertTrue(self.inspect()["complete"])
+        self.result_path.write_bytes(self.result_path.read_bytes() + b" ")
+        with self.assertRaises(c.CompletionError): self.inspect()
+
+    def test_exception_basis_is_rechecked_after_resource_inventory(self):
+        basis = self.root / "classification-basis.md"
+        basis.write_text("Reviewed retention decision")
+        classification = self.retained_classification()
+        classification["basis"] = [self.ref(basis)]
+        self.result["exceptions"] = {"path:" + str(self.artifacts / "retained.txt"): classification}
+        self.write(self.result_path, self.result); self.final_review()
+        original_tree = c.tree
+        def changed(root):
+            result = original_tree(root)
+            basis.write_text("Changed while checking resources")
+            return result
+        with mock.patch.object(c, "tree", side_effect=changed):
+            with self.assertRaises(c.CompletionError): self.inspect()
+
+    def snapshot_recovery_fixture(self):
+        frozen = self.scope_path.read_bytes()
+        before = self.root / "owner-before.md"
+        before.write_bytes(self.owner.read_bytes())
+        self.owner.write_text("Reviewed current operating owner, with original retained.\n")
+        current = self.root / "owner-current.md"
+        current.write_bytes(self.owner.read_bytes())
+        self.recovery_path = self.root / "recovery.json"
+        self.recovery_review_path = self.root / "recovery-review.json"
+        self.recovery = {"scope_sha256": self.scope_ref["sha256"], "task_id": self.seed["task_id"],
+                         "session_id": self.seed["session_id"], "authorization": self.ref(self.request),
+                         "owners": [{"owner_path": str(self.owner), "snapshots": {
+                             "original": self.ref(before), "current": self.ref(current)}}]}
+        self.bind_snapshot_recovery()
+        return frozen, before, current
+
+    def bind_snapshot_recovery(self):
+        self.write(self.recovery_path, self.recovery)
+        evidence = self.ref(self.recovery_path)
+        self.write(self.recovery_review_path, {"scope_sha256": self.scope_ref["sha256"],
+                                             "recovery_sha256": evidence["sha256"], "status": "No Findings"})
+        self.state["owner_recovery"] = {"evidence": evidence, "review": self.ref(self.recovery_review_path)}
+        self.write(self.final_review_path, {"scope_sha256": self.scope_ref["sha256"],
+                                           "result_sha256": self.ref(self.result_path)["sha256"],
+                                           "owner_recovery_sha256": evidence["sha256"], "status": "No Findings"})
+        self.state["final_review"] = self.ref(self.final_review_path)
+        self.write(self.state_path, self.state)
+
+    def test_snapshot_recovery_preserves_unversioned_original_and_frozen_scope(self):
+        frozen, before, current = self.snapshot_recovery_fixture()
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(c.draft_result(self.scope_ref), self.result)
+        self.assertEqual(self.scope_path.read_bytes(), frozen)
+        self.assertEqual(self.ref(before)["sha256"], self.seed["owners"][0]["sha256"])
+        self.assertEqual(current.read_bytes(), self.owner.read_bytes())
+        self.installed.unlink(); self.installed.write_text("stale installation")
+        self.assertFalse(self.inspect()["complete"])
+
+    def test_snapshot_recovery_rejects_forged_original_new_owner_and_new_drift(self):
+        frozen, before, current = self.snapshot_recovery_fixture()
+        original = copy.deepcopy(self.recovery)
+        before.write_text("Not the frozen original")
+        self.recovery["owners"][0]["snapshots"]["original"] = self.ref(before)
+        self.bind_snapshot_recovery()
+        with self.assertRaises(c.CompletionError): self.inspect()
+        self.recovery = copy.deepcopy(original)
+        before.write_text("Synthetic owner: local Python tool, no service deployment.\n")
+        self.recovery["owners"][0]["owner_path"] = str(self.request)
+        self.bind_snapshot_recovery()
+        with self.assertRaises(c.CompletionError): self.inspect()
+        self.recovery = original; self.bind_snapshot_recovery()
+        self.owner.write_text("Unreviewed later change")
+        with self.assertRaises(c.CompletionError): self.inspect()
+
+    def test_snapshot_recovery_can_mix_with_existing_git_provenance(self):
+        frozen = self.recovery_fixture(two_owners=True)
+        entry = self.recovery["owners"][1]
+        before = self.root / "second-before.md"
+        before.write_bytes(subprocess.check_output(["git", "-C", str(self.repo), "show",
+                           entry["original"]["revision"] + ":" + entry["original"]["file"]]))
+        current = self.root / "second-current.md"
+        current.write_bytes(Path(entry["owner_path"]).read_bytes())
+        self.recovery["owners"][1] = {"owner_path": entry["owner_path"], "snapshots": {
+            "original": self.ref(before), "current": self.ref(current)}}
+        self.bind_snapshot_recovery()
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(self.scope_path.read_bytes(), frozen)
+
+    def test_snapshot_recovery_rejects_planned_owner_and_snapshot_tampering(self):
+        self.owner_edit_fixture()
+        self.snapshot_recovery_fixture()
+        with self.assertRaises(c.CompletionError): self.inspect()
+        self.setUp_snapshot_tampering_case()
+
+    def setUp_snapshot_tampering_case(self):
+        # Use a separate ordinary raw-hash owner, without changing the Git-bound owner fixture.
+        owner = self.root / "another-owner.md"
+        owner.write_text("Frozen ordinary owner")
+        self.owner = owner; self.seed["owners"] = [self.ref(owner)]
+        self.reset_categories(); self.freeze()
+        frozen, before, current = self.snapshot_recovery_fixture()
+        current.write_text("Changed retained snapshot")
+        with self.assertRaises(c.CompletionError): self.inspect()
+
     def test_real_observations_are_read_only_and_complete(self):
         before = {p: p.read_bytes() for p in (self.scope_path, self.state_path, self.result_path, self.repo / ".git/index")}
         answer = self.inspect()

@@ -391,10 +391,25 @@ def owner_recovery(scope_ref, scope, binding):
         raise CompletionError("recovery requires a bounded list of frozen owners")
     recovered = {}
     for owner in evidence["owners"]:
-        fields(owner, ("owner_path", "repository", "identity", "original", "current", "source"))
+        fields(owner, ("owner_path",), ("repository", "identity", "original", "current", "source", "snapshots"))
         selected = [ref for ref in scope["owners"] if ref["path"] == owner["owner_path"]]
         if len(selected) != 1 or "original" in selected[0] or owner["owner_path"] in recovered:
             raise CompletionError("recovery requires unique unchanged frozen owners; planned edits use owner_updates")
+        if "snapshots" in owner:
+            fields(owner, ("owner_path", "snapshots"))
+            snapshots = owner["snapshots"]
+            fields(snapshots, ("original", "current"))
+            for snapshot in snapshots.values():
+                reference(snapshot)
+                if path(snapshot["path"]) == path(owner["owner_path"]):
+                    raise CompletionError("owner recovery snapshots must retain separate source files")
+            if snapshots["original"]["sha256"] != selected[0]["sha256"]:
+                raise CompletionError("owner recovery snapshot differs from the frozen original")
+            current = snapshots["current"]["sha256"]
+            reference({"path": owner["owner_path"], "sha256": current})
+            recovered[owner["owner_path"]] = current
+            continue
+        fields(owner, ("owner_path", "repository", "identity", "original", "current", "source"))
         if repo_identity(owner["repository"]) != owner["identity"]:
             raise CompletionError("recovery owner repository identity changed")
         for key in ("original", "current"):
@@ -872,6 +887,38 @@ def observe(check, expected, *, preserved=None):
     raise CompletionError("unsupported observer")
 
 
+def exception_view(result):
+    """Share classifications while retaining exact, independently reviewed keys."""
+    inline = result["exceptions"]
+    if not isinstance(inline, dict):
+        raise CompletionError("exceptions must be an object")
+
+    def classification(value):
+        fields(value, ("owner", "reason", "scope", "removal_condition", "basis"))
+        for key in ("owner", "reason", "scope", "removal_condition"):
+            text(value[key])
+        refs(value["basis"])
+
+    for value in inline.values():
+        classification(value)
+    groups = result.get("exception_groups", [])
+    if not isinstance(groups, list) or len(groups) > MAX_FILES:
+        raise CompletionError("exception groups must be a bounded list")
+    merged = dict(inline)
+    for group in groups:
+        fields(group, ("items", "classification"))
+        items = group["items"]
+        if not isinstance(items, list) or not 1 <= len(items) <= MAX_FILES:
+            raise CompletionError("exception group needs bounded explicit resource keys")
+        classification(group["classification"])
+        for key in items:
+            text(key)
+            if key in merged:
+                raise CompletionError("duplicate exception key")
+            merged[key] = group["classification"]
+    return merged
+
+
 def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
     started = time.monotonic()
     scope = read_reference(scope_ref)
@@ -891,7 +938,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         raise CompletionError("original request differs from host")
     result_raw = raw_file(result_path)
     result = decode(result_raw)
-    fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates",))
+    fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates", "exception_groups"))
     if not isinstance(result["checks"], dict) or result["scope_sha256"] != scope_ref["sha256"] or set(result["checks"]) != set(checks):
         raise CompletionError("final result changed or omitted fixed obligations")
     planned = {(ref["original"]["repository"], ref["original"]["file"])
@@ -955,14 +1002,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
             observe(resource, {})
         except (CompletionError, OSError, subprocess.TimeoutExpired) as exc:
             failures.append({"id": "resource:" + resource["id"], "reason": str(exc)})
-    exceptions = result["exceptions"]
-    if not isinstance(exceptions, dict):
-        raise CompletionError("exceptions must be an object")
-    for exception in exceptions.values():
-        fields(exception, ("owner", "reason", "scope", "removal_condition", "basis"))
-        for key in ("owner", "reason", "scope", "removal_condition"):
-            text(exception[key])
-        refs(exception["basis"])
+    exceptions = exception_view(result)
     unclassified = []
     for repo, before in scope["baseline"]["repositories"].items():
         after = inventory(repo)
@@ -1004,6 +1044,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
     reference(selected_final)
+    exception_view(result)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
         raise CompletionError("observer environment changed during inspection")
     if raw_file(result_path) != result_raw or raw_file(scope["state_path"]) != state_raw:
@@ -1011,10 +1052,12 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     if stopped: reference(state["status_basis"])
     answer = {"complete": not failures and not stopped, "stopped": stopped and not failures, "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
             "checked_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
-            "observed": observed, "failures": failures, "exceptions": exceptions,
+            "observed": observed, "failures": failures, "exceptions": result["exceptions"],
             "resource_state": {"path": scope["state_path"], "sha256": sha(state_raw)},
             "owner_paths": [ref["path"] for ref in scope["owners"]],
             "assurance": "mechanical observations; scope, consent, quality and reviewer independence remain owner judgments"}
+    if "exception_groups" in result:
+        answer["exception_groups"] = result["exception_groups"]
     if report:
         answer.update(categories=scope["categories"], expectations=result["checks"],
                       result={"path": str(path(result_path)), "sha256": sha(result_raw)},
