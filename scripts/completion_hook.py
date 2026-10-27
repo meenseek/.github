@@ -17,10 +17,12 @@ SPEC = importlib.util.spec_from_file_location("completion", Path(__file__).with_
 c = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(c)
 ROOT = Path(__file__).resolve().parents[1] / ".completion"
-GUIDANCE = ("Desktop 정리 요청은 변경 전에 completion_hook.py arm으로 이 session_id를 연결하고 "
+GUIDANCE = ("Desktop 저장소 변경 작업은 별도 정리 요청이 없어도 첫 변경·작업 branch/worktree 생성 전에 "
+            "completion_hook.py arm으로 이 session_id를 연결하고 "
             "docs/task-completion.md의 범위 고정·검증·리뷰·실제 적용·자원 정리를 끝까지 수행하세요. "
             "정리에는 commit/main/remote, 실제 최신 사용본, 배포 판단·상태, 산출물, 브랜치/worktree, "
-            "임시 파일/프로세스/탭/자식 작업, 중단 복구가 포함됩니다. 완료는 현재 관측으로 확인하세요.")
+            "임시 파일/프로세스/탭/자식 작업, 중단 복구가 포함됩니다. 명시적인 정리 요청도 같은 계약을 따릅니다. "
+            "읽기 전용 조사·리뷰와 단순 질문만 하는 작업은 새 변경 작업으로 추정하지 마세요. 완료는 현재 관측으로 확인하세요.")
 
 
 def pointer(root, session):
@@ -83,14 +85,24 @@ def task_context(state, filename, session):
     return context
 
 
+def desktop_workspace(cwd, desktop):
+    if cwd.is_relative_to(desktop):
+        return True
+    try:
+        common = c.git(str(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip()
+        return c.path(common).resolve().is_relative_to(desktop)
+    except (c.CompletionError, OSError, ValueError):
+        return False
+
+
 def hook(payload, root=ROOT):
     event = payload.get("hook_event_name")
     if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return {}
     filename = pointer(root, c.text(payload.get("session_id")))
     cwd = c.path(payload.get("cwd"))
     desktop = Path(__file__).resolve().parents[2]
-    # Bound worktree sessions stay covered even when their cwd is outside Desktop.
-    if not filename.exists() and not cwd.is_relative_to(desktop): return {}
+    # Bound sessions and new worktrees of Desktop repositories keep the same entry.
+    if not filename.exists() and not desktop_workspace(cwd, desktop): return {}
     if event != "Stop":
         context = GUIDANCE + " 현재 session_id=" + payload["session_id"]
         if filename.exists():

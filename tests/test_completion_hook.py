@@ -255,6 +255,44 @@ class HookTests(unittest.TestCase):
                 answer = h.hook({**self.payload, "hook_event_name": event}, self.root)
                 self.assertIn(self.payload["session_id"], answer["hookSpecificOutput"]["additionalContext"])
 
+    def test_fresh_cli_covers_external_worktree_of_desktop_repository(self):
+        import shutil
+        runtime = self.f.root / ".github" / "scripts"
+        runtime.mkdir(parents=True)
+        for name in ("completion_hook.py", "check_completion.py"):
+            shutil.copyfile(SCRIPT.with_name(name), runtime / name)
+        with tempfile.TemporaryDirectory() as temporary:
+            linked = Path(temporary).resolve() / "linked"
+            self.f.git("worktree", "add", "--detach", str(linked), "HEAD")
+            before = (self.f.git("status", "--porcelain"), self.f.git("worktree", "list", "--porcelain"))
+            try:
+                for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+                    with self.subTest(event=event):
+                        payload = {**self.payload, "cwd": str(linked), "hook_event_name": event}
+                        done = subprocess.run([sys.executable, "-I", str(runtime / "completion_hook.py"),
+                                               "--bindings", str(self.root), "hook"],
+                                              input=json.dumps(payload).encode(), capture_output=True, timeout=10)
+                        self.assertEqual(done.returncode, 0, done.stdout)
+                        answer = json.loads(done.stdout)
+                        if event == "Stop":
+                            self.assertIn("systemMessage", answer)
+                        else:
+                            self.assertIn(self.payload["session_id"], answer["hookSpecificOutput"]["additionalContext"])
+                        self.assertNotIn("decision", answer)
+                self.assertEqual((self.f.git("status", "--porcelain"), self.f.git("worktree", "list", "--porcelain")), before)
+                self.assertFalse(self.root.exists())
+                self.assertFalse((runtime / "__pycache__").exists())
+            finally:
+                self.f.git("worktree", "remove", str(linked))
+
+    def test_unbound_foreign_repository_and_unavailable_git_are_not_adopted(self):
+        payload = {**self.payload, "cwd": str(self.f.repo)}
+        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+            self.assertEqual(h.hook({**payload, "hook_event_name": event}, self.root), {})
+        with mock.patch.object(h.c, "git", side_effect=h.c.CompletionError("synthetic unavailable Git")):
+            self.assertEqual(h.hook(payload, self.root), {})
+        self.assertFalse(self.root.exists())
+
     def test_armed_missing_scope_continues_once_then_reports_unfinished(self):
         self.call("arm", "--task-id", self.f.seed["task_id"])
         self.assertEqual(h.hook(self.payload, self.root)["decision"], "block")

@@ -183,6 +183,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 - `type`: `feature`, `fix`, `docs`, `chore`, `refactor`, `test`, `build`, `ci`,
   `perf`
 - 하나의 검토 가능한 변경 범위만 담습니다.
+- 작업 시작과 종료는 [작업 정리 검사](#작업-정리-검사)로 연결합니다.
 - 검증과 리뷰가 끝난 변경은 `main` 반영과 원격 확인 뒤, 이번 작업의 로컬·원격
   브랜치, 전용 worktree와 임시 산출물을 정리하고 기본 작업 경로를 `main`으로 되돌립니다.
 - `정리 완료`를 보고하기 전에는 시작 상태와 종료 상태를 대조해 이번 작업이 만들거나
@@ -254,8 +255,10 @@ Git commit·branch·변경 여부와 README/AGENTS 파일의 SHA·크기만 추�
 
 ## 작업 정리 검사
 
-Desktop의 정리 요청과 operations 완료 전이는 [작업 완료 계약](docs/task-completion.md)을
-읽고 연결한다. 현재 요청·승인·소유 계약을 먼저 확정하고 첫 변경 전에 해당 session을 arm한다.
+저장소 변경 작업은 별도 정리 요청이 없어도 [작업 완료 계약](docs/task-completion.md)을
+사용한다. Desktop의 정리 요청과 operations 완료 전이도 같은 계약에 연결한다.
+읽기 전용 조사·리뷰와 단순 질문은 변경 작업으로 추정하지 않는다. 현재 요청·승인·소유 계약을
+먼저 확정하고 첫 변경·작업 branch/worktree 생성 전에 해당 session을 arm한다.
 모든 완료 범주를 고정한 독립 범위 검토 뒤 bind하고, 새 임시 자원은 생성 전에 reserve한다.
 정확한 최신 결과의 검증·독립 리뷰와 실제 적용·배포 판단·자원 정리를 마친 뒤 검사한다.
 완료 근거 없는 보존·N/A·미연결 상태를 완료로 보고하지 않는다. 큐는 강제 검사이고
