@@ -306,6 +306,41 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(c.working_source_sha(source), expected)
         self.assertEqual(c.working_source_sha(self.installed), self.ref(self.repo / "tool.py")["sha256"])
 
+    def test_large_installed_copy_draft_and_check_preserve_exact_bytes(self):
+        source = self.repo / "tool.py"
+        payload = bytes(range(256)) * 8193
+        source.write_bytes(payload)
+        self.git("commit", "-am", "test: add large installed binary")
+        self.git("push", "origin", "main")
+        self.installed.unlink(); self.installed.write_bytes(payload)
+        self.freeze()
+        self.assertEqual(c.draft_result(self.scope_ref), self.result)
+        self.assertTrue(self.inspect()["complete"])
+        check = json.loads(self.scope_path.read_bytes())["checks"][1]
+        expected = self.result["checks"]["installed"]
+        self.installed.write_bytes(payload[:-1] + b"x")
+        with self.assertRaisesRegex(c.CompletionError, "file differs from reviewed bytes"):
+            c.observe(check, expected)
+        self.installed.write_bytes(payload)
+        source.write_bytes(payload[:-1] + b"x")
+        with self.assertRaisesRegex(c.CompletionError, "installed and owner source bytes differ"):
+            c.observe(check, expected)
+
+    def test_installed_binary_reads_keep_the_existing_binary_limit(self):
+        oversized = self.root / "oversized-binary"
+        with oversized.open("wb") as stream:
+            stream.truncate(129 * c.MAX_BYTES)
+        self.installed.unlink(); self.installed.symlink_to(oversized)
+        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
+            c.draft_result(self.scope_ref)
+        check = json.loads(self.scope_path.read_bytes())["checks"][1]
+        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
+            c.observe(check, self.result["checks"]["installed"])
+        self.installed.unlink(); self.installed.symlink_to(self.repo / "tool.py")
+        check["target"]["source"] = str(oversized)
+        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
+            c.observe(check, self.result["checks"]["installed"])
+
     def test_source_hash_rejects_missing_blob_nonregular_file_and_timeout(self):
         revision = self.git("rev-parse", "main")
         with self.assertRaisesRegex(c.CompletionError, "source observation failed"):

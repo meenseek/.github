@@ -715,7 +715,8 @@ def draft_result(scope_ref, expectations=None):
                 fields(target, ("path", "plan"))
                 return key, {"sha256": sha(raw_file(target["path"]))}
             fields(target, ("path",), ("source",))
-            return key, {"sha256": sha(raw_file(target["path"], links=kind == "installed_file"))}
+            return key, {"sha256": sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
+                                               links=kind == "installed_file"))}
         if kind == "git_source":
             fields(target, ("repository", "remote", "main", "files", "remote_binding"))
             repo = target["repository"]
@@ -765,11 +766,12 @@ def observe(check, expected, *, preserved=None):
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
         fields(expected, ("sha256",))
-        actual = sha(raw_file(target["path"], links=kind == "installed_file"))
+        actual = sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
+                              links=kind == "installed_file"))
         if actual != digest(expected["sha256"]):
             raise CompletionError("file differs from reviewed bytes")
         if kind == "installed_file":
-            if "source" not in target or sha(raw_file(target["source"], links=True)) != actual:
+            if "source" not in target or sha(raw_file(target["source"], limit=128*MAX_BYTES, links=True)) != actual:
                 raise CompletionError("installed and owner source bytes differ")
         return {"sha256": actual, "observation": "bytes only; invocation/quality remain owner checks"}
     if kind == "absent":
