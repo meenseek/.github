@@ -533,6 +533,74 @@ def preserved_source_bytes(published, pairs):
     return bytes(result)
 
 
+def filesystem_scope(scope_ref, scope, state):
+    """Project reviewed device-only changes; never rewrite the frozen scope."""
+    if "filesystem_recovery" not in state:
+        return scope
+    binding = state["filesystem_recovery"]
+    fields(binding, ("evidence", "review"))
+    evidence = read_reference(binding["evidence"])
+    fields(evidence, ("scope_sha256", "task_id", "session_id", "previous_state_sha256", "authorization", "identities"))
+    if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
+        raise CompletionError("filesystem recovery belongs to another task")
+    if (state.get("task_id"), state.get("session_id"), state.get("scope")) != (scope["task_id"], scope["session_id"], scope_ref):
+        raise CompletionError("filesystem recovery binding differs")
+    digest(evidence["previous_state_sha256"])
+    reference(evidence["authorization"])
+    if read_reference(binding["review"]) != {"scope_sha256": scope_ref["sha256"], "filesystem_recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
+        raise CompletionError("filesystem recovery needs exact independent review")
+    projected = decode(canonical(scope))
+    slots = []
+    for owner in projected["owners"]:
+        if "original" in owner:
+            slots.append(owner["original"]["identity"])
+    slots.extend(item["identity"] for item in projected["baseline"]["repositories"].values())
+    for check in projected["checks"]:
+        remote = check["target"].get("remote_binding", {})
+        for key in ("local", "destination"):
+            if key in remote:
+                slots.append(remote[key])
+    if "record_root" in projected:
+        slots.append(projected["record_root"])
+    identities = evidence["identities"]
+    if not isinstance(identities, list) or not 1 <= len(identities) <= 64:
+        raise CompletionError("filesystem recovery needs bounded exact identities")
+    replacements = {}
+    for row in identities:
+        fields(row, ("path", "before", "after"))
+        location = str(path(row["path"]))
+        if location in replacements:
+            raise CompletionError("duplicate filesystem recovery path")
+        for value in (row["before"], row["after"]):
+            fields(value, ("device", "inode"))
+            if any(type(value[k]) is not int or value[k] < 0 for k in value):
+                raise CompletionError("invalid filesystem identity")
+        if row["before"]["inode"] != row["after"]["inode"] or row["before"]["device"] == row["after"]["device"]:
+            raise CompletionError("only a device change with the same inode is recoverable")
+        replacements[location] = row
+    changed, seen = set(), {}
+    for slot in slots:
+        location = slot.get("common_dir", slot.get("path"))
+        original = {k: slot[k] for k in ("device", "inode")}
+        if location in seen and seen[location] != original:
+            raise CompletionError("inconsistent frozen filesystem identities")
+        seen[location] = original
+        current = record_directory(location)
+        current = {k: current[k] for k in ("device", "inode")}
+        if current != original:
+            row = replacements.get(location)
+            if row is None or row["before"] != original or row["after"] != current:
+                raise CompletionError("filesystem recovery differs from frozen/current identity")
+            changed.add(location)
+            slot.update(current)
+    if changed != set(replacements):
+        raise CompletionError("filesystem recovery omitted changes or added unrelated paths")
+    reference(scope_ref)
+    reference(binding["evidence"]); reference(binding["review"])
+    reference(evidence["authorization"])
+    return projected
+
+
 def record_directory(value):
     """A dedicated, identity-bound directory; never a source or installed output."""
     root = path(value)
@@ -759,6 +827,7 @@ def draft_result(scope_ref, expectations=None):
     if "owner_recovery" in state or "source_preservation" in state:
         if (state.get("task_id"), state.get("session_id"), state.get("intent"), state.get("scope")) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
             raise CompletionError("current resource pointer differs from frozen task")
+    scope = filesystem_scope(scope_ref, scope, state)
     if "owner_recovery" in state:
         recovery = owner_recovery(scope_ref, scope, state["owner_recovery"])
     checks = validate_scope(scope, recovery)
@@ -995,9 +1064,10 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     scope = read_reference(scope_ref)
     state_raw = raw_file(scope["state_path"])
     state = decode(state_raw)
-    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation"))
+    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery"))
     if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
+    scope = filesystem_scope(scope_ref, scope, state)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"]) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
     preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
@@ -1038,6 +1108,8 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     selected_final = reference(final_review_ref if final_review_ref is not None else state["final_review"])
     reviewed_final = read_reference(selected_final)
     expected_review = {"scope_sha256": scope_ref["sha256"], "result_sha256": sha(result_raw), "status": "No Findings"}
+    if "filesystem_recovery" in state:
+        expected_review["filesystem_recovery_sha256"] = state["filesystem_recovery"]["evidence"]["sha256"]
     if "record_root" in scope:
         expected_review["record_inventory_sha256"] = reviewed_record_inventory(scope["record_root"], selected_final["path"])
     if recovery: expected_review["owner_recovery_sha256"] = state["owner_recovery"]["evidence"]["sha256"]
@@ -1112,6 +1184,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
     # Recheck immutable inputs and accumulated handles after observations.
+    filesystem_scope(scope_ref, read_reference(scope_ref), state)
     reference(scope_ref); reference(scope["request"])
     if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"])
     if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
