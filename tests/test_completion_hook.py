@@ -50,6 +50,156 @@ class HookTests(unittest.TestCase):
     def goal_args(self):
         return ["--task-id", self.f.seed["task_id"], "--request-digest", self.f.seed["request_digest"]]
 
+    def record_fixture(self, nested=False):
+        self.records = self.f.root / "task-records"
+        self.records.mkdir()
+        if nested:
+            (self.records / "nested").mkdir()
+            (self.records / "nested" / "scratch.txt").write_text("task-only scratch")
+        self.f.request = self.records / "request.txt"
+        self.f.request.write_text("Synthetic request to finish and remove task-only records.")
+        self.f.seed.update(request=self.f.ref(self.f.request), record_root=str(self.records))
+        for attribute, name in (("scope_path", "scope.json"), ("review_path", "scope-review.json"),
+                                ("result_path", "result.json"), ("final_review_path", "final-review.json")):
+            setattr(self.f, attribute, self.records / name)
+        original = self.f.final_review
+        def final_review():
+            original()
+            value = json.loads(self.f.final_review_path.read_bytes())
+            value["record_inventory_sha256"] = h.c.reviewed_record_inventory(
+                h.c.record_directory(str(self.records)), str(self.f.final_review_path))
+            self.f.write(self.f.final_review_path, value)
+            self.f.state["final_review"] = self.f.ref(self.f.final_review_path)
+            self.f.write(self.f.state_path, self.f.state)
+        self.f.final_review = final_review
+
+    def test_complete_actual_cli_removes_reviewed_task_records_and_binding(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"])
+        self.assertEqual(answer["records_removed"], str(self.records))
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+        self.assertTrue(self.f.owner.exists()); self.assertTrue(self.f.repo.exists())
+
+    def test_unbind_actual_cli_removes_nested_task_records(self):
+        self.record_fixture(nested=True)
+        self.arm_bind()
+        answer = self.call("unbind")
+        self.assertTrue(answer["complete"])
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    def test_failed_completion_preserves_task_records_for_retry(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "unresolved", *self.basis())
+        before = h.c.record_inventory(h.c.record_directory(str(self.records)))
+        answer = self.call("complete", *self.completion_args(), ok=False)
+        self.assertFalse(answer["complete"])
+        self.assertEqual(h.c.record_inventory(h.c.record_directory(str(self.records))), before)
+        self.assertTrue(self.state.exists())
+
+    def test_final_review_rejects_new_record_before_any_deletion(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        (self.records / "unreviewed.txt").write_text("do not delete")
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.f.scope_path.exists())
+        self.assertEqual((self.records / "unreviewed.txt").read_text(), "do not delete")
+        self.assertNotIn("cleanup", json.loads(self.state.read_bytes()))
+
+    def test_file_added_after_checked_snapshot_is_not_adopted_for_deletion(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        args = self.completion_args()
+        argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
+                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.goal_args(), *args]
+        checked = False
+        original_check, original_inventory = h.c.check_scope, h.c.record_inventory
+        extra = self.records / "late-unreviewed.txt"
+        def inspect(*args, **kwargs):
+            nonlocal checked
+            answer = original_check(*args, **kwargs); checked = True
+            return answer
+        def snapshot(record):
+            inventory = original_inventory(record)
+            if checked and not extra.exists(): extra.write_text("preserve late addition")
+            return inventory
+        with mock.patch.object(h.c, "check_scope", side_effect=inspect), mock.patch.object(h.c, "record_inventory", side_effect=snapshot), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(argv), 2)
+        self.assertTrue(extra.exists()); self.assertTrue(self.f.scope_path.exists())
+        extra.unlink()
+        self.assertTrue(self.call("complete", *args)["binding_released"])
+        self.assertFalse(self.records.exists())
+
+    def test_partial_cleanup_retry_checks_goal_and_keeps_stop_read_only(self):
+        self.record_fixture(nested=True)
+        self.arm_bind(finalize=False)
+        args = self.completion_args()
+        argv = ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
+                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.goal_args(), *args]
+        original = h.os.unlink
+        def interrupted(name, *positional, **keywords):
+            if name == "request.txt":
+                raise PermissionError("synthetic interrupted cleanup")
+            return original(name, *positional, **keywords)
+        with mock.patch.object(h.os, "unlink", side_effect=interrupted), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(argv), 2)
+        self.assertFalse(self.f.scope_path.exists())  # ordinary scope-based retry is no longer possible
+        self.assertTrue(self.state.exists()); self.assertTrue(self.records.exists())
+        before = self.state.read_bytes()
+        self.call("complete", *args, "--task-id", "wrong-current-goal", ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        with mock.patch.object(h.c, "check_scope", side_effect=AssertionError("pending cleanup must not inspect deleted inputs")):
+            self.assertEqual(h.hook(self.payload, self.root)["decision"], "block")
+        self.assertEqual(self.state.read_bytes(), before)
+        extra = self.records / "unreviewed.txt"; extra.write_text("preserve new bytes")
+        self.call("complete", *args, ok=False)
+        self.assertTrue(extra.exists()); self.assertEqual(self.state.read_bytes(), before)
+        extra.unlink()
+        self.assertTrue(self.call("complete", *args)["binding_released"])
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    def test_record_cleanup_refuses_links_and_replaced_root(self):
+        import os
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                link = self.records / "unsafe"
+                if kind == "symlink": link.symlink_to(self.f.owner)
+                else: os.link(self.f.owner, link)
+                self.call("complete", *self.completion_args(), ok=False)
+                self.assertTrue(self.f.owner.exists()); self.assertTrue(self.f.scope_path.exists())
+                link.unlink()
+        moved = self.records.with_name("moved-records")
+        args = self.completion_args()
+        self.records.rename(moved); self.records.mkdir()
+        self.call("complete", *args, ok=False)
+        self.assertTrue((moved / "scope.json").exists()); self.assertTrue(self.records.exists())
+
+    def test_record_root_cannot_overlap_product_source_or_retained_artifacts(self):
+        for root in (self.f.repo, self.f.artifacts, self.f.root):
+            with self.subTest(root=root):
+                seed = {**self.f.seed, "record_root": str(root)}
+                with self.assertRaises(h.c.CompletionError): h.c.prepare(seed)
+
+    def test_record_root_cannot_hold_a_symlinked_installed_output(self):
+        self.record_fixture()
+        output = self.records / "installed-output.py"; output.write_text("keep installed output")
+        self.f.installed.unlink(); self.f.installed.symlink_to(output)
+        with self.assertRaises(h.c.CompletionError): h.c.prepare(self.f.seed)
+        self.assertEqual(output.read_text(), "keep installed output")
+
+    def test_record_root_protects_source_omitted_from_repository_inventory(self):
+        request = self.f.repo / "cleanup-request.txt"; request.write_text("keep this source checkout")
+        self.f.seed.update(request=self.f.ref(request), record_root=str(self.f.repo), repositories=[])
+        self.f.seed["checks"] = [self.f.seed["checks"][0]]  # no installed-file alias to mask this source path
+        self.f.reset_categories()
+        with self.assertRaisesRegex(h.c.CompletionError, "overlaps"):
+            h.c.prepare(self.f.seed)
+        self.assertTrue((self.f.repo / "tool.py").exists())
+
     def test_complete_actual_cli_finalizes_inspects_and_releases_once(self):
         self.arm_bind(finalize=False)
         answer = self.call("complete", *self.completion_args())

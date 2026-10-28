@@ -1,7 +1,8 @@
 # 작업 정리의 실행과 확인
 
 이 도구는 기존 소유자의 승인·판단을 바탕으로 정리의 현재 상태를 읽기 전용으로 확인한다.
-작업 실행, Git 변경, 배포, 파일 삭제는 해당 소유자의 기존 도구가 수행한다.
+작업 실행, Git 변경, 배포와 제품 파일 삭제는 해당 소유자의 기존 도구가 수행한다.
+직접 완료 명령은 아래에서 명시적으로 검토한 작업 전용 기록만 삭제할 수 있다.
 저장소 변경 작업과 `정리` 요청의 범위·완료 조건은 현재 사용자 지시와 적용되는 원래 규칙이 소유한다.
 이 문서는 private native 정책의 복사본이나 새 실행 권한이 아니다.
 
@@ -54,6 +55,16 @@ python3 scripts/check_completion.py prepare --seed /absolute/seed.json --output 
 - 큐에서는 `ops.py request-digest --request /absolute/request.json`의 정규화한 요청 SHA.
   이 SHA는 `completion` 필드만 제외하므로 서로를 hash하는 순환을 만들지 않는다.
   직접 채팅에서는 원래 요청 바이트의 SHA를 사용한다.
+
+직접 작업의 요청·seed·scope·관측·result·리뷰는 저장소 밖의 전용 임시 폴더에 모으고
+seed의 `record_root`에 그 절대경로를 지정한다. `prepare`는 폴더의 device/inode를 고정한다.
+이 폴더는 제품 산출물이나 영구 기록이 아니며 Git ignore 여부로 보존하지 않는다.
+소스·사용본·소유 계약·workspace·자원 목록과 겹치는 경로는 거부한다. 최종 리뷰는
+scope/result SHA와 함께 `record_inventory_sha256`을 묶는다. 값은
+`check_completion.reviewed_record_inventory(scope["record_root"], final_review_path)`로 구한다.
+리뷰 자신의 파일은 목록에서 제외하고 호출자가 전달한 최종 리뷰 SHA로 별도 결속한다.
+리뷰는 다른 파일과 하위 폴더의 정확한 목록·bytes·identity가 모두 폐기 가능한지 확인한다.
+이미 정식 작업 기록에 필요한 결과가 있으면 완료 receipt나 별도 보고 파일을 추가하지 않는다.
 
 `prepare`는 시작 Git ref·worktree·dirty bytes·stash와 산출물 bytes, 저장소 common-dir
 identity, 허용된 원격 identity, 실제 검사 바이너리·환경을 고정한다. 불필요한 전체 Desktop
@@ -336,16 +347,24 @@ python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha2
 검토한다. 수정 뒤에는 영향받은 부분과 연결 계약을 재검증·재리뷰하며, 정확한 최신 result
 SHA의 리뷰 참조를 전달한다. 그대로인 범위의 검증을 반복할 필요는 없다.
 `complete`는 잠금과 pointer CAS 아래 검토된 참조를 먼저 보존하고 기존 검사기를 한 번
-호출한다. 성공하면 pointer를 제거하고 `binding_released: true`와 현재 관측을 JSON으로
-보고한다. 실패·관측 중 변경·미해결 예약이면 pointer와 참조를 남기고 종료 코드 2를 반환한다.
-원인을 해소한 뒤 현재 pointer SHA로 재시도한다. 원래 scope·결과·리뷰는 소유 기록에
-보존하며 출력은 그 기록의 기존 검증 요약으로 연결한다. 별도 보고 파일을 강제하지 않는다.
+호출한다. 성공하면 검토된 `record_root`의 정확한 파일 목록을 기존 pointer에 연결하고,
+변경되지 않은 파일과 빈 하위 폴더·기록 폴더까지 삭제한 뒤 pointer를 제거한다.
+`binding_released: true`, `records_removed`와 관측 결과는 표준 출력으로 반환한다.
+이 출력을 다시 작업 폴더의 receipt로 저장하지 않는다. 필요한 검증·정리 요약은 기존
+커밋·작업 기록이나 최종 보고에 남기며 종료된 scope·result·리뷰 파일은 보존하지 않는다.
+검사 실패·관측 중 변경·미해결 예약이면 삭제를 시작하지 않고 원래 입력을 유지한다.
+삭제 중 실패하면 pointer의 같은 task/request와 현재 SHA로 `complete` 또는 `unbind`를
+재시도한다. 이미 통과한 검사를 새 완료 검사로 주장하지 않으며, 남은 정확한 파일만 정리한다.
+추가·변경된 파일, 링크, 폴더 교체는 거부한다. 기록 폴더의 부재를 확인하기 전에는 연결을
+해제하거나 완료로 보고하지 않는다. `Stop`은 이 상태를 안내하며 파일을 삭제하지 않는다.
+`record_root`를 지정하지 않은 기존 범위는 자동 삭제하지 않는다. 원래 참조·완료·복구 상태와
+현재 승인 범위를 검토한 뒤 사용이 끝난 작업 기록을 별도로 정리한다.
 보고에는 여덟 범주의 고정 검사·N/A, 기대값, 관측·실패·예외와 정확한 result·리뷰 참조가
 함께 나온다. file hash와 N/A 사유의 의미는 계속 소유자와 독립 검토자가 판단한다.
 
 기존 `finalize`, `inspect`, `unbind`는 중간 확인·복구에 계속 사용할 수 있다.
 아래 `unbind`는 `finalize`·`inspect`를 거친 연결을 해제하는 대체 경로다.
-`complete`가 성공했다면 이미 연결이 해제된 상태다.
+`unbind`도 같은 기록 삭제 절차를 수행한다. `complete`가 성공했다면 이미 연결이 해제된 상태다.
 
 ```sh
 python3 scripts/completion_hook.py unbind --session SESSION_ID --expected-sha256 POINTER_SHA --task-id TASK_ID --request-digest REQUEST_DIGEST

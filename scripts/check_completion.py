@@ -533,9 +533,74 @@ def preserved_source_bytes(published, pairs):
     return bytes(result)
 
 
+def record_directory(value):
+    """A dedicated, identity-bound directory; never a source or installed output."""
+    root = path(value)
+    if root.resolve() != root or not root.is_dir():
+        raise CompletionError("record root must be a real directory")
+    info = root.stat()
+    return {"path": str(root), "device": info.st_dev, "inode": info.st_ino}
+
+
+def record_inventory(record):
+    """Inventory task-only records without accepting filesystem links."""
+    if not os.path.lexists(record["path"]):
+        return {}
+    if record_directory(record["path"]) != record:
+        raise CompletionError("record root identity changed")
+    root = path(record["path"])
+    result = {}
+    for directory, dirs, names in os.walk(root, followlinks=False):
+        for name in sorted([*dirs, *names]):
+            entry = Path(directory) / name
+            info = entry.lstat()
+            value = {"device": info.st_dev, "inode": info.st_ino}
+            if stat.S_ISDIR(info.st_mode):
+                value["directory"] = True
+            else:
+                value["sha256"] = sha(raw_file(str(entry)))
+            result[str(entry.relative_to(root))] = value
+            if len(result) > MAX_FILES:
+                raise CompletionError("record inventory exceeds limit")
+    return result
+
+
+def reviewed_record_inventory(record, final_review, *, inventory=None):
+    inventory = record_inventory(record) if inventory is None else dict(inventory)
+    try:
+        name = str(path(final_review).relative_to(path(record["path"])))
+    except ValueError as exc:
+        raise CompletionError("final review must be inside the task record root") from exc
+    inventory.pop(name, None)  # its own bytes are bound separately by the caller's review SHA
+    return sha(canonical(inventory))
+
+
+def validate_record_root(scope):
+    record = scope["record_root"]
+    fields(record, ("path", "device", "inode"))
+    if record_directory(record["path"]) != record:
+        raise CompletionError("record root identity changed")
+    root = path(record["path"])
+    protected = [*scope["repositories"], *scope["artifact_roots"], scope["state_path"],
+                 scope["environment"]["workspace"], *(owner["path"] for owner in scope["owners"])]
+    for check in scope["checks"]:
+        if check["kind"] == "git_source":
+            protected.append(check["target"]["repository"])
+        if check["kind"] in {"file", "installed_file"}:
+            protected.append(check["target"]["path"])
+            if "source" in check["target"]:
+                protected.append(check["target"]["source"])
+    for value in protected:
+        other = path(value).resolve()
+        if root.is_relative_to(other) or other.is_relative_to(root):
+            raise CompletionError("record root overlaps a source, output, workspace or resource inventory")
+    if not path(scope["request"]["path"]).is_relative_to(root):
+        raise CompletionError("task request must be inside its record root")
+
+
 def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
-                   "repositories", "artifact_roots", "state_path", "baseline", "environment"))
+                   "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
     text(scope["task_id"]); text(scope["session_id"])
     reference(scope["request"]); digest(scope["request_digest"])
     owners = owner_refs(scope["owners"], recovery)
@@ -604,14 +669,18 @@ def validate_scope(scope, recovery=None):
     for before in scope["baseline"]["artifact_roots"].values():
         if not isinstance(before, dict):
             raise CompletionError("invalid starting artifact inventory")
+    if "record_root" in scope:
+        validate_record_root(scope)
     return checks
 
 
 def prepare(seed):
     """Capture starting observations. The caller reviews/fixes these exact bytes."""
     fields(seed, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
-                  "repositories", "artifact_roots", "state_path", "workspace"), ("owner_snapshots",))
+                  "repositories", "artifact_roots", "state_path", "workspace"), ("owner_snapshots", "record_root"))
     seed = decode(canonical(seed))
+    if "record_root" in seed:
+        seed["record_root"] = record_directory(seed["record_root"])
     refs(seed["owners"])
     snapshots = seed.pop("owner_snapshots", {})
     if not isinstance(snapshots, dict) or snapshots.keys() - {owner["path"] for owner in seed["owners"]}:
@@ -969,6 +1038,8 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     selected_final = reference(final_review_ref if final_review_ref is not None else state["final_review"])
     reviewed_final = read_reference(selected_final)
     expected_review = {"scope_sha256": scope_ref["sha256"], "result_sha256": sha(result_raw), "status": "No Findings"}
+    if "record_root" in scope:
+        expected_review["record_inventory_sha256"] = reviewed_record_inventory(scope["record_root"], selected_final["path"])
     if recovery: expected_review["owner_recovery_sha256"] = state["owner_recovery"]["evidence"]["sha256"]
     if preserved: expected_review["source_preservation_sha256"] = state["source_preservation"]["evidence"]["sha256"]
     if stopped: expected_review["disposition"] = "stopped"
@@ -1046,6 +1117,8 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
     reference(selected_final)
+    if "record_root" in scope and expected_review["record_inventory_sha256"] != reviewed_record_inventory(scope["record_root"], selected_final["path"]):
+        raise CompletionError("task records changed during inspection")
     exception_view(result)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
         raise CompletionError("observer environment changed during inspection")
