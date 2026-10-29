@@ -1087,6 +1087,35 @@ class CompletionTests(unittest.TestCase):
         self.write(self.state_path, self.state)
         self.assertIn("resource:pending", [f["id"] for f in self.inspect()["failures"]])
 
+    def test_chained_owner_recovery_retains_old_bytes_without_old_remote_freshness(self):
+        frozen = self.recovery_fixture(two_owners=True)
+        previous = copy.deepcopy(self.recovery_binding)
+        old_bytes = self.recovery_path.read_bytes()
+        self.owner.write_text("A second independently reviewed external owner change.\n")
+        self.git("add", "README.md"); self.git("commit", "-m", "test: second owner drift")
+        self.git("push", "origin", "main")
+        revision = self.git("rev-parse", "HEAD")
+        successor = copy.deepcopy(self.recovery)
+        successor["previous"] = previous
+        for owner in successor["owners"]:
+            owner["current"].update(revision=revision, sha256=self.ref(Path(owner["owner_path"]))["sha256"])
+            expected = owner["source"]["expected"]
+            expected.update(local_revision=revision, remote_revision=revision)
+            expected["files"]["README.md"] = self.ref(self.owner)["sha256"]
+        next_path = self.root / "next-recovery.json"
+        next_review = self.root / "next-recovery-review.json"
+        self.write(next_path, successor)
+        self.write(next_review, {"scope_sha256": self.scope_ref["sha256"], "recovery_sha256": self.ref(next_path)["sha256"], "status": "No Findings"})
+        binding = {"evidence": self.ref(next_path), "review": self.ref(next_review)}
+        recovered = c.owner_recovery(self.scope_ref, json.loads(frozen), binding)
+        self.assertEqual(recovered[str(self.owner)], self.ref(self.owner)["sha256"])
+        self.assertEqual(self.recovery_path.read_bytes(), old_bytes)
+        successor["owners"] = successor["owners"][:1]
+        self.write(next_path, successor)
+        self.write(next_review, {"scope_sha256": self.scope_ref["sha256"], "recovery_sha256": self.ref(next_path)["sha256"], "status": "No Findings"})
+        with self.assertRaisesRegex(c.CompletionError, "omitted earlier"):
+            c.owner_recovery(self.scope_ref, json.loads(frozen), {"evidence": self.ref(next_path), "review": self.ref(next_review)})
+
     def test_recovery_covers_multiple_exact_owners_and_rejects_duplicate_or_omitted_drift(self):
         frozen = self.recovery_fixture(two_owners=True)
         self.assertTrue(self.inspect()["complete"])

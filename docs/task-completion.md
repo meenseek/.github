@@ -44,7 +44,10 @@
 
 `recover-filesystem`은 같은 경로·inode에서 장치 번호(device)만 달라진 경우의 재확인이다.
 원래 scope, 변경 목록, 현재 요청, 이전 pointer와 독립 검토를 결합하며, 이미
-`filesystem_recovery`, `owner_recovery`, `source_preservation`이 연결된 작업에는 추가할 수 없다.
+`filesystem_recovery`, `source_preservation`이 연결된 작업에는 추가할 수 없다.
+기존 owner 재확인 연결은 보존하며 함께 사용할 수 있다. owner bytes도 추가로 바뀌었으면
+이전 evidence/review를 보존한 최신 owner 연결을 먼저 검토한다. 경로·inode나 원래 scope를
+바꾸는 우회는 허용하지 않으며 각 연결의 현재 검사도 모두 통과해야 한다.
 파일 내용을 쓰거나 복원하지 않고, 완료·삭제를 수행하지 않으며 기존 검사를 유지한다.
 입력은 `completion_hook.py recover-filesystem --help`와 현재 검사 계약을 따른다.
 
@@ -152,7 +155,11 @@ python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected
 이 명령은 기존 waiting pointer에 그 목록의 evidence/review 참조 한 쌍만 CAS로 추가한다.
 원래 scope에 있고 planned-edit `original`이 없는 owner에만 적용하며 scope를 재고정하거나
 `owner_updates` 허용 경로를 늘리지 않는다. 상태 근거와 이전 리뷰도 보존하고 재개는
-별도 `outcome working`으로 한다. 이미 연결한 recovery를 교체하지 않는다.
+별도 `outcome working`으로 한다. 추가 drift는 새 evidence의 `previous`에 현재
+`{evidence, review}`를 그대로 결속해 이어간다. 기존 근거 파일을 덮어쓰거나 이전 연결을
+생략하지 않는다. 새 목록은 이전 owner를 모두 포함하며 각 원래 bytes부터 현재 bytes까지
+대조한다. 최대 16개 연결이며 순환·동일 bytes 재연결을 거부한다. 과거 연결은 고정 Git
+bytes·identity·리뷰를 확인하고, 최신 연결만 현재 canonical source와 대조한다.
 최종 리뷰는 기존 scope/result SHA와 추가 `owner_recovery_sha256`를 묶는다.
 검사 전후에 원래 owner의 Git bytes, 현재 owner·canonical source와 변경 재확인 리뷰를 다시
 확인한다. 다른 owner 변경, 새 drift, 원래 의무 실패·살아 있는 임시 자원은 계속 거부한다.

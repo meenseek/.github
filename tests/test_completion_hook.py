@@ -521,6 +521,40 @@ class HookTests(unittest.TestCase):
         self.assertEqual(h.configuration(answer), answer)
         self.assertEqual(len(original["hooks"]["Stop"]), 1)
 
+    def test_filesystem_recovery_preserves_existing_owner_recovery(self):
+        self.f.seed["state_path"] = str(self.state)
+        self.f.recovery_fixture()
+        scope = json.loads(self.f.scope_path.read_bytes())
+        rows = {}
+        slots = [x["identity"] for x in scope["baseline"]["repositories"].values()]
+        for check in scope["checks"]:
+            remote = check["target"].get("remote_binding", {})
+            slots.extend(remote[k] for k in ("local", "destination") if k in remote)
+        for slot in slots:
+            location = slot["common_dir"]
+            after = {k: slot[k] for k in ("device", "inode")}
+            slot["device"] += 100
+            rows[location] = {"path": location, "before": {k: slot[k] for k in ("device", "inode")}, "after": after}
+        self.f.write(self.f.scope_path, scope); self.f.scope_ref = self.f.ref(self.f.scope_path)
+        self.f.recovery["scope_sha256"] = self.f.scope_ref["sha256"]
+        self.f.write(self.f.recovery_path, self.f.recovery)
+        self.f.write(self.f.recovery_review_path, {"scope_sha256": self.f.scope_ref["sha256"],
+                    "recovery_sha256": self.f.ref(self.f.recovery_path)["sha256"], "status": "No Findings"})
+        binding = {"evidence": self.f.ref(self.f.recovery_path), "review": self.f.ref(self.f.recovery_review_path)}
+        self.f.write(self.f.review_path, {"scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings"})
+        waiting = {**self.f.state, "scope": self.f.scope_ref, "review": self.f.ref(self.f.review_path),
+                   "owner_recovery": binding, "outcome": "waiting", "status_basis": self.f.ref(self.f.request)}
+        self.root.mkdir(mode=0o700); self.f.write(self.state, waiting)
+        evidence = self.f.root / "filesystem-evidence.json"; review = self.f.root / "filesystem-review.json"
+        self.f.write(evidence, {"scope_sha256": self.f.scope_ref["sha256"], "task_id": scope["task_id"], "session_id": scope["session_id"],
+             "previous_state_sha256": self.f.ref(self.state)["sha256"], "authorization": self.f.ref(self.f.request), "identities": list(rows.values())})
+        self.f.write(review, {"scope_sha256": self.f.scope_ref["sha256"], "filesystem_recovery_sha256": self.f.ref(evidence)["sha256"], "status": "No Findings"})
+        self.call("recover-filesystem", "--evidence", str(evidence), "--evidence-sha256", self.f.ref(evidence)["sha256"],
+                  "--review", str(review), "--review-sha256", self.f.ref(review)["sha256"])
+        final = json.loads(self.state.read_bytes())
+        self.assertEqual(final["owner_recovery"], binding)
+        self.assertIn("filesystem_recovery", final)
+
     def test_stale_cas_and_changed_scope_refuse_completion(self):
         self.arm_bind()
         done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root), "reserve", "--session", self.f.seed["session_id"],

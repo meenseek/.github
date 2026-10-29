@@ -339,8 +339,8 @@ def main(argv=None):
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                             found[0].update(resource, basis=basis)
                     elif args.command == "recover-filesystem":
-                        if state["outcome"] != "waiting" or state["scope"] is None or any(k in state for k in ("filesystem_recovery", "owner_recovery", "source_preservation")):
-                            raise c.CompletionError("filesystem recovery requires a waiting task without prior recovery")
+                        if state["outcome"] != "waiting" or state["scope"] is None or any(k in state for k in ("filesystem_recovery", "source_preservation")):
+                            raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem/source recovery")
                         c.reference(state.get("status_basis"))
                         binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
                                    "review": {"path": args.review, "sha256": args.review_sha256}}
@@ -353,12 +353,15 @@ def main(argv=None):
                         c.validate_scope(scope, recovery)
                         state["filesystem_recovery"] = binding
                     elif args.command == "recover-owner":
-                        if state["outcome"] != "waiting" or state["scope"] is None or "owner_recovery" in state:
-                            raise c.CompletionError("owner recovery requires the existing waiting binding and cannot replace a recovery")
+                        if state["outcome"] != "waiting" or state["scope"] is None:
+                            raise c.CompletionError("owner recovery requires the existing waiting binding")
                         c.reference(state.get("status_basis"))
                         binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
                                    "review": {"path": args.review, "sha256": args.review_sha256}}
                         scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), state)
+                        evidence = c.read_reference(binding["evidence"])
+                        if evidence.get("previous") != state.get("owner_recovery"):
+                            raise c.CompletionError("owner recovery must preserve the exact previous evidence and review")
                         if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
                             raise c.CompletionError("scope task/session/resource pointer differs")
                         recovery = c.owner_recovery(state["scope"], scope, binding)
