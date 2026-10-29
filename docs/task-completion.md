@@ -48,6 +48,11 @@
 기존 owner 재확인 연결은 보존하며 함께 사용할 수 있다. owner bytes도 추가로 바뀌었으면
 이전 evidence/review를 보존한 최신 owner 연결을 먼저 검토한다. 경로·inode나 원래 scope를
 바꾸는 우회는 허용하지 않으며 각 연결의 현재 검사도 모두 통과해야 한다.
+재확인할 identity 목록은 scope뿐 아니라 기존 owner evidence의 repository·remote binding도
+포함한다. 검토된 device 변경만 메모리에서 함께 투영하며 기존 evidence/review bytes를
+다시 쓰지 않는다. 이미 현재 identity인 항목과 과거 identity인 항목도 같은 검토로 대조한다.
+추가 owner 연결 뒤에도 `previous`의 identity 계보를 보존하고, 저장할 새 연결을 포함한
+상태로 먼저 검사한다. 업무 저장소 목록 밖 owner의 기존 device 근거도 누락하지 않는다.
 파일 내용을 쓰거나 복원하지 않고, 완료·삭제를 수행하지 않으며 기존 검사를 유지한다.
 입력은 `completion_hook.py recover-filesystem --help`와 현재 검사 계약을 따른다.
 

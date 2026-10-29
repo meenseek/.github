@@ -521,10 +521,18 @@ class HookTests(unittest.TestCase):
         self.assertEqual(h.configuration(answer), answer)
         self.assertEqual(len(original["hooks"]["Stop"]), 1)
 
-    def test_filesystem_recovery_preserves_existing_owner_recovery(self):
+    def filesystem_owner_fixture(self, external=False):
         self.f.seed["state_path"] = str(self.state)
         self.f.recovery_fixture()
         scope = json.loads(self.f.scope_path.read_bytes())
+        if external:
+            scope["repositories"] = []
+            scope["baseline"]["repositories"] = {}
+            scope["checks"] = [check for check in scope["checks"] if check["id"] != "source"]
+            scope["categories"]["source"] = {"checks": [], "not_applicable": {
+                "reason": "Synthetic app operation owns no Git changes; the contract owner is external.",
+                "basis": [{"path": o["path"], "sha256": o["sha256"]} for o in scope["owners"]]}}
+            self.f.result["checks"].pop("source")
         rows = {}
         slots = [x["identity"] for x in scope["baseline"]["repositories"].values()]
         for check in scope["checks"]:
@@ -535,9 +543,15 @@ class HookTests(unittest.TestCase):
             after = {k: slot[k] for k in ("device", "inode")}
             slot["device"] += 100
             rows[location] = {"path": location, "before": {k: slot[k] for k in ("device", "inode")}, "after": after}
+        for slot in h.c.owner_identity_slots(self.f.recovery):
+            location = slot["common_dir"]
+            after = {k: slot[k] for k in ("device", "inode")}
+            slot["device"] += 100
+            rows[location] = {"path": location, "before": {k: slot[k] for k in ("device", "inode")}, "after": after}
         self.f.write(self.f.scope_path, scope); self.f.scope_ref = self.f.ref(self.f.scope_path)
         self.f.recovery["scope_sha256"] = self.f.scope_ref["sha256"]
         self.f.write(self.f.recovery_path, self.f.recovery)
+        frozen_owner = self.f.recovery_path.read_bytes()
         self.f.write(self.f.recovery_review_path, {"scope_sha256": self.f.scope_ref["sha256"],
                     "recovery_sha256": self.f.ref(self.f.recovery_path)["sha256"], "status": "No Findings"})
         binding = {"evidence": self.f.ref(self.f.recovery_path), "review": self.f.ref(self.f.recovery_review_path)}
@@ -554,6 +568,53 @@ class HookTests(unittest.TestCase):
         final = json.loads(self.state.read_bytes())
         self.assertEqual(final["owner_recovery"], binding)
         self.assertIn("filesystem_recovery", final)
+        self.assertEqual(self.f.recovery_path.read_bytes(), frozen_owner)
+        self.f.result["scope_sha256"] = self.f.scope_ref["sha256"]
+        self.f.write(self.f.result_path, self.f.result)
+        self.f.write(self.f.final_review_path, {"scope_sha256": self.f.scope_ref["sha256"],
+            "result_sha256": self.f.ref(self.f.result_path)["sha256"], "status": "No Findings",
+            "owner_recovery_sha256": binding["evidence"]["sha256"],
+            "filesystem_recovery_sha256": final["filesystem_recovery"]["evidence"]["sha256"]})
+        self.call("outcome", "--status", "working", "--basis", str(self.f.request), "--basis-sha256", self.f.ref(self.f.request)["sha256"])
+        self.call("finalize", "--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
+                  "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"])
+        self.assertTrue(self.call("inspect")["complete"])
+        return binding, frozen_owner
+
+    def test_filesystem_recovery_preserves_existing_owner_recovery(self):
+        self.filesystem_owner_fixture()
+
+    def test_device_then_owner_change_preserves_external_owner_identity_history(self):
+        previous, frozen_owner = self.filesystem_owner_fixture(external=True)
+        self.call("outcome", "--status", "waiting", "--basis", str(self.f.request), "--basis-sha256", self.f.ref(self.f.request)["sha256"])
+        self.f.owner.write_text("Synthetic additional owner change after device review.\n")
+        self.f.git("add", "README.md"); self.f.git("commit", "-m", "test: change external owner after device review")
+        self.f.git("push", "origin", "main")
+        revision = self.f.git("rev-parse", "HEAD")
+        latest = json.loads(json.dumps(self.f.recovery))
+        latest["previous"] = previous
+        for owner in latest["owners"]:
+            owner["identity"] = h.c.repo_identity(owner["repository"])
+            owner["current"].update(revision=revision, sha256=self.f.ref(self.f.owner)["sha256"])
+            target = owner["source"]["definition"]["target"]
+            target["remote_binding"] = h.c.remote_identity(target["repository"], target["remote"])
+            owner["source"]["expected"].update(local_revision=revision, remote_revision=revision)
+            owner["source"]["expected"]["files"]["README.md"] = self.f.ref(self.f.owner)["sha256"]
+        evidence = self.f.root / "next-owner.json"; review = self.f.root / "next-owner-review.json"
+        self.f.write(evidence, latest)
+        self.f.write(review, {"scope_sha256": self.f.scope_ref["sha256"], "recovery_sha256": self.f.ref(evidence)["sha256"], "status": "No Findings"})
+        self.call("recover-owner", "--evidence", str(evidence), "--evidence-sha256", self.f.ref(evidence)["sha256"],
+                  "--review", str(review), "--review-sha256", self.f.ref(review)["sha256"])
+        state = json.loads(self.state.read_bytes())
+        self.f.write(self.f.final_review_path, {"scope_sha256": self.f.scope_ref["sha256"],
+            "result_sha256": self.f.ref(self.f.result_path)["sha256"], "status": "No Findings",
+            "owner_recovery_sha256": self.f.ref(evidence)["sha256"],
+            "filesystem_recovery_sha256": state["filesystem_recovery"]["evidence"]["sha256"]})
+        self.call("outcome", "--status", "working", "--basis", str(self.f.request), "--basis-sha256", self.f.ref(self.f.request)["sha256"])
+        self.call("finalize", "--result", str(self.f.result_path), "--review", str(self.f.final_review_path),
+                  "--review-sha256", self.f.ref(self.f.final_review_path)["sha256"])
+        self.assertTrue(self.call("inspect")["complete"])
+        self.assertEqual(self.f.recovery_path.read_bytes(), frozen_owner)
 
     def test_stale_cas_and_changed_scope_refuse_completion(self):
         self.arm_bind()

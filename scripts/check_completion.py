@@ -31,6 +31,7 @@ CATEGORIES = ("source", "usage", "deployment", "quality", "artifacts",
 MAX_BYTES = 1024 * 1024
 MAX_FILES = 4096
 TIMEOUT = 5
+MAX_OWNER_RECOVERIES = 16
 CLEANUP_KINDS = {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"}
 KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote_ref_absent",
          "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
@@ -376,13 +377,38 @@ def current_owners(owners, updates, recovery=None):
             reference({"path": ref["path"], "sha256": wanted})
 
 
-def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=()):
+def owner_identity_slots(evidence):
+    slots = []
+    for owner in evidence["owners"]:
+        if "identity" not in owner:
+            continue
+        slots.append(owner["identity"])
+        remote = owner["source"]["definition"]["target"].get("remote_binding", {})
+        slots.extend(remote[k] for k in ("local", "destination") if k in remote)
+    return slots
+
+
+def owner_history_identity_slots(binding):
+    slots, seen = [], set()
+    while binding:
+        fields(binding, ("evidence", "review"))
+        identity = binding["evidence"]["sha256"]
+        if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
+            raise CompletionError("cyclic or excessive owner recovery history")
+        seen.add(identity)
+        evidence = read_reference(binding["evidence"])
+        slots.extend(owner_identity_slots(evidence))
+        binding = evidence.get("previous")
+    return slots
+
+
+def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), state=None):
     """Reconcile exact reviewed owner drifts without replacing the frozen scope."""
     fields(binding, ("evidence", "review"))
     evidence = read_reference(binding["evidence"])
     fields(evidence, ("scope_sha256", "task_id", "session_id", "authorization", "owners"), ("previous",))
     identity = binding["evidence"]["sha256"]
-    if identity in seen or len(seen) >= 16:
+    if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
         raise CompletionError("cyclic or excessive owner recovery history")
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("owner recovery belongs to another frozen task")
@@ -392,6 +418,15 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=()):
         raise CompletionError("independent recovery review does not cover these exact bytes")
     if not isinstance(evidence["owners"], list) or not 1 <= len(evidence["owners"]) <= len(scope["owners"]):
         raise CompletionError("recovery requires a bounded list of frozen owners")
+    if not historical and state and "filesystem_recovery" in state:
+        # The explicit device review covers both frozen scope and owner-source
+        # identities. Only this in-memory view changes; evidence bytes survive.
+        filesystem_scope(scope_ref, read_reference(scope_ref), state)
+        rows = {row["path"]: row for row in read_reference(state["filesystem_recovery"]["evidence"])["identities"]}
+        for slot in owner_identity_slots(evidence):
+            row = rows.get(slot["common_dir"])
+            if row and {k: slot[k] for k in ("device", "inode")} == row["before"]:
+                slot.update(row["after"])
     previous = (owner_recovery(scope_ref, scope, evidence["previous"], historical=True, seen=(*seen, identity))
                 if "previous" in evidence else {})
     recovered = {}
@@ -577,6 +612,8 @@ def filesystem_scope(scope_ref, scope, state):
                 slots.append(remote[key])
     if "record_root" in projected:
         slots.append(projected["record_root"])
+    if "owner_recovery" in state:
+        slots.extend(owner_history_identity_slots(state["owner_recovery"]))
     identities = evidence["identities"]
     if not isinstance(identities, list) or not 1 <= len(identities) <= 64:
         raise CompletionError("filesystem recovery needs bounded exact identities")
@@ -598,7 +635,9 @@ def filesystem_scope(scope_ref, scope, state):
         location = slot.get("common_dir", slot.get("path"))
         original = {k: slot[k] for k in ("device", "inode")}
         if location in seen and seen[location] != original:
-            raise CompletionError("inconsistent frozen filesystem identities")
+            row = replacements.get(location)
+            if row is None or seen[location] not in (row["before"], row["after"]) or original not in (row["before"], row["after"]):
+                raise CompletionError("inconsistent frozen filesystem identities")
         seen[location] = original
         current = record_directory(location)
         current = {k: current[k] for k in ("device", "inode")}
@@ -844,7 +883,7 @@ def draft_result(scope_ref, expectations=None):
             raise CompletionError("current resource pointer differs from frozen task")
     scope = filesystem_scope(scope_ref, scope, state)
     if "owner_recovery" in state:
-        recovery = owner_recovery(scope_ref, scope, state["owner_recovery"])
+        recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
     checks = validate_scope(scope, recovery)
     if "source_preservation" in state:
         source_preservation(scope_ref, scope, state["source_preservation"])
@@ -898,7 +937,7 @@ def draft_result(scope_ref, expectations=None):
                if value != next(ref["sha256"] for ref in scope["owners"] if ref["path"] == name)}
     reference(scope_ref); reference(scope["request"])
     if recovery:
-        owner_recovery(scope_ref, scope, state["owner_recovery"])
+        owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
     if "source_preservation" in state:
         source_preservation(scope_ref, scope, state["source_preservation"])
     if recovery or "source_preservation" in state:
@@ -1083,7 +1122,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
     scope = filesystem_scope(scope_ref, scope, state)
-    recovery = owner_recovery(scope_ref, scope, state["owner_recovery"]) if "owner_recovery" in state else None
+    recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
     preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
     if workspace is not None and scope["environment"]["workspace"] != str(path(workspace)):
@@ -1201,7 +1240,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     # Recheck immutable inputs and accumulated handles after observations.
     filesystem_scope(scope_ref, read_reference(scope_ref), state)
     reference(scope_ref); reference(scope["request"])
-    if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"])
+    if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
     if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
     reference(selected_final)

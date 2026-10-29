@@ -349,7 +349,7 @@ def main(argv=None):
                             raise c.CompletionError("filesystem recovery is not for the exact previous pointer")
                         proposed = {**state, "filesystem_recovery": binding}
                         scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), proposed)
-                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"]) if "owner_recovery" in state else None
+                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=proposed) if "owner_recovery" in state else None
                         c.validate_scope(scope, recovery)
                         state["filesystem_recovery"] = binding
                     elif args.command == "recover-owner":
@@ -358,13 +358,14 @@ def main(argv=None):
                         c.reference(state.get("status_basis"))
                         binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
                                    "review": {"path": args.review, "sha256": args.review_sha256}}
-                        scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), state)
                         evidence = c.read_reference(binding["evidence"])
                         if evidence.get("previous") != state.get("owner_recovery"):
                             raise c.CompletionError("owner recovery must preserve the exact previous evidence and review")
+                        proposed = {**state, "owner_recovery": binding}
+                        scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), proposed)
                         if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
                             raise c.CompletionError("scope task/session/resource pointer differs")
-                        recovery = c.owner_recovery(state["scope"], scope, binding)
+                        recovery = c.owner_recovery(state["scope"], scope, binding, state=proposed)
                         c.validate_scope(scope, recovery)
                         state["owner_recovery"] = binding
                     elif args.command == "preserve-source":
@@ -378,7 +379,7 @@ def main(argv=None):
                             raise c.CompletionError("scope task/session/resource pointer differs")
                         if c.read_reference(binding["evidence"])["previous_state_sha256"] != before:
                             raise c.CompletionError("source preservation is not for the exact previous pointer")
-                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"]) if "owner_recovery" in state else None
+                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
                         c.validate_scope(scope, recovery)
                         c.source_preservation(state["scope"], scope, binding)
                         state["source_preservation"] = binding
