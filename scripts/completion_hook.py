@@ -21,7 +21,8 @@ GUIDANCE = ("Desktop 저장소 변경 작업은 별도 정리 요청이 없어�
             "completion_hook.py arm으로 이 session_id를 연결하고 "
             "docs/task-completion.md의 범위 고정·검증·리뷰·실제 적용·자원 정리를 끝까지 수행하세요. "
             "정리에는 commit/main/remote, 실제 최신 사용본, 배포 판단·상태, 산출물, 브랜치/worktree, "
-            "임시 파일/프로세스/탭/자식 작업, 중단 복구가 포함됩니다. 명시적인 정리 요청도 같은 계약을 따릅니다. "
+            "임시 파일/프로세스/탭/자식 작업, 중단 작업 재개가 포함됩니다. 명시적인 정리 요청도 같은 계약을 따릅니다. "
+            "상태 보고는 실제 남은 조치를 쓰고 파일 손상·유실은 확인된 경우에만 보고하세요. "
             "읽기 전용 조사·리뷰와 단순 질문만 하는 작업은 새 변경 작업으로 추정하지 마세요. "
             "직접 작업의 임시 완료 기록은 저장소 밖 전용 record_root에 모으고 scope에 고정하세요. "
             "complete/unbind 성공 시 그 기록 폴더까지 제거하며 완료 receipt 파일을 다시 만들지 마세요. 완료는 현재 관측으로 확인하세요.")
@@ -221,7 +222,7 @@ def hook(payload, root=ROOT):
             raise c.CompletionError("검사 통과 후 임시 기록 삭제가 미완료입니다. 현재 task/request와 pointer SHA로 complete/unbind를 재실행하세요")
         if state["outcome"] in {"waiting", "blocked", "cancelled"}:
             c.reference(state.get("status_basis"))
-            return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
+            return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 작업 종료 조건이 남은 상태입니다. 파일 손상 여부를 이 상태만으로 판단하지 마세요. 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
         if state["outcome"] != "working" or state["scope"] is None:
             raise c.CompletionError("armed task has no frozen reviewed scope")
         scope = c.read_reference(state["scope"])

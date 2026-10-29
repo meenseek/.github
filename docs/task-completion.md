@@ -12,7 +12,7 @@
 [operations](../../operations/README.md)의 모든 새 `finish --status completed` 호출은
 고정한 범위와 실제 검사 결과가 없으면 거부된다. 직접 함수 호출에도 같은 검사가 적용된다.
 `blocked`, `cancelled` 전이와 기존 완료 이력은 소급 변경하지 않는다. 고정 범위가 없는
-이전 요청은 완료 근거를 조작하거나 원래 요청을 바꿔 통과시키지 않는다. 기존 중단·복구
+이전 요청은 완료 근거를 조작하거나 원래 요청을 바꿔 통과시키지 않는다. 기존 중단 작업 재개
 절차로 남은 작업과 필요한 새 승인을 판단한다.
 
 [completion_hook.py](../scripts/completion_hook.py)는 Codex 채팅의 얇은 어댑터다.
@@ -24,6 +24,29 @@
 신뢰 검토 미통과, 다른 훅의 `continue:false`는 이 도구가 강제할 수 없다. transcript나
 모델의 마지막 문장에서 의도를 추측하지 않는다. 일반 채팅 전체의 누락 방지가 필요하면
 호스트의 최종 완료 전이를 이 검사에 연결해야 한다. 현재 Codex 훅만으로 보장하지 않는다.
+
+## 상태와 조치의 표현
+
+`waiting`은 해당 작업의 종료 조건이 남았다는 뜻이다. 이 상태나 검사 오류만으로 파일
+손상·유실을 판단하지 않는다. 사용자에게는 실제 남은 조치와 그 이유를 설명한다.
+
+| 필요한 조치 | 설명에 사용할 표현 |
+| --- | --- |
+| 중단된 실행을 이어감 | 작업 재개 |
+| 다른 작업이 바꾼 소유 계약을 검토함 (`recover-owner`) | 변경된 소유 계약 재확인 |
+| 경로의 장치 식별자가 달라져 검사 조건을 확인함 (`recover-filesystem`) | 식별자 재확인 |
+| 적용 결과가 불명확한 실행을 조회함 | 처리 결과 확인 |
+| 확인된 파일 손상·유실을 원본이나 백업으로 되돌림 | 파일 복원 |
+
+손상·유실이 확인된 경우에는 해당 파일과 확인 근거를 밝힌다. 내부 `recovery` 범주와
+`recover-*` 명령명은 중단·조건 변경 처리도 포함하므로, 그대로 '파일 복구 대기'로 옮기지 않는다.
+상태 설명을 위해 완료된 산출물의 내용 검토를 다시 시작하지 않는다.
+
+`recover-filesystem`은 같은 경로·inode에서 장치 번호(device)만 달라진 경우의 재확인이다.
+원래 scope, 변경 목록, 현재 요청, 이전 pointer와 독립 검토를 결합하며, 이미
+`filesystem_recovery`, `owner_recovery`, `source_preservation`이 연결된 작업에는 추가할 수 없다.
+파일 내용을 쓰거나 복원하지 않고, 완료·삭제를 수행하지 않으며 기존 검사를 유지한다.
+입력은 `completion_hook.py recover-filesystem --help`와 현재 검사 계약을 따른다.
 
 ## 범위를 먼저 고정하기
 
@@ -102,17 +125,17 @@ SHA여야 한다. 해당 owner는 여전히 `git_source`에 선언해야 한다.
 준비·검사는 원본을 쓰거나 Git index를 바꾸지 않는다. 범위 리뷰는 인계·수정 승인과 원본
 보존을 확인하고, 이후 `owner_updates`·최종 독립 리뷰·canonical source·baseline/index 보존
 검사는 그대로 적용한다. 사본은 매 검사 전후에 다시 확인하므로 삭제·변조하면 실패한다.
-사본은 임시 정리 대상으로 예약하지 않고, 원래 scope의 검사·복구가 의존하는 동안 해당
+사본은 임시 정리 대상으로 예약하지 않고, 원래 scope의 검사·작업 재개가 의존하는 동안 해당
 작업 소유자의 근거로 보존한다. 사본 없이 dirty owner를 수정 대상으로 묶는 것은 계속 거부한다.
 미변경 계약은 현재 SHA를 계속 대조하며, 이미 고정된 scope에 이 근거를 소급 추가하지 않는다.
 
 독립 검토자가 실제 요청·승인·소유 계약과 이 정확한 범위 파일을 확인한다. 통과 후
 `scope_sha256`와 `status: No Findings`를 담은 검토 참조를 `bind`에 전달한다. 이 참조의
 형식·hash는 대상 일치만 확인하며, 실제 독립 검토와 의미 판단은 대체하지 않는다.
-고정 범위를 바꾸어 실패를 지우지 않는다. 범위 변경·복구가 필요하면 원래 근거를 유지하고
+고정 범위를 바꾸어 실패를 지우지 않는다. 범위 변경이나 작업 재개가 필요하면 원래 근거를 유지하고
 소유자의 재검토를 받는다.
 
-## 고정 이후 외부 owner 변경의 좁은 복구
+## 고정 이후 변경된 소유 계약 재확인
 
 다른 작업이 수정한 소유 계약 때문에 기존 waiting 세션의 현재 hash 검사가 막혔으면
 원래 scope·요청·baseline·의무·예약 자원을 유지한 채 `recover-owner`를 사용한다.
@@ -131,7 +154,7 @@ python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected
 `owner_updates` 허용 경로를 늘리지 않는다. 상태 근거와 이전 리뷰도 보존하고 재개는
 별도 `outcome working`으로 한다. 이미 연결한 recovery를 교체하지 않는다.
 최종 리뷰는 기존 scope/result SHA와 추가 `owner_recovery_sha256`를 묶는다.
-검사 전후에 원래 owner의 Git bytes, 현재 owner·canonical source와 복구 리뷰를 다시
+검사 전후에 원래 owner의 Git bytes, 현재 owner·canonical source와 변경 재확인 리뷰를 다시
 확인한다. 다른 owner 변경, 새 drift, 원래 의무 실패·살아 있는 임시 자원은 계속 거부한다.
 이 hash 형식이 승인·독립 검토의 의미를 대신하지 않으며 선언 안 된 임의 작업을 허용하지 않는다.
 
@@ -268,12 +291,12 @@ python3 scripts/check_improvement.py --plan /absolute/plan.json --plan-sha256 PL
 | --- | --- |
 | source | 승인된 변경의 commit, main 반영, 허용된 원격의 현재 ref 및 정확한 변경 파일 보존 |
 | usage | 실제 사용하는 설치·링크·빌드·실행본 갱신, 실제 진입점 호출과 필요한 동작 |
-| deployment | 운영 배포 필요 여부와 근거; 필요하면 승인 범위·배포본 revision·health·마이그레이션·복구 조건 |
+| deployment | 운영 배포 필요 여부와 근거; 필요하면 승인 범위·배포본 revision·health·마이그레이션·문제 발생 시 되돌릴 조건 |
 | quality | 변경 위험에 맞는 검증, 현재 정확한 산출물의 독립 코드·문서 리뷰 |
 | artifacts | 최종 산출물의 소유 위치와 보존 확인, 임시 복사·payload·log의 정리 |
 | git_resources | task local/remote branch, worktree·점유·앱 attachment, stash·미커밋 변경 |
 | temporary_resources | 작업이 만든 파일·프로세스 및 자식·탭·서버·세션 자원의 현재 소유 상태 |
-| recovery | 취소·중단·외부 side effect·pending apply의 해소 또는 근거를 갖춘 미완료 상태 |
+| recovery | 중단 작업 재개, 취소·외부 side effect·pending apply의 처리 결과 확인 또는 근거를 갖춘 미완료 상태 |
 
 배포가 필요하지 않은 로컬 도구도 배포 범주를 빠뜨리지 않고 소유 계약에 따른 N/A 결정을
 검토받는다. main merge만으로 설치·실행·운영 반영을 완료로 인정하지 않는다. 최종 서비스를
@@ -357,12 +380,12 @@ SHA의 리뷰 참조를 전달한다. 그대로인 범위의 검증을 반복할
 재시도한다. 이미 통과한 검사를 새 완료 검사로 주장하지 않으며, 남은 정확한 파일만 정리한다.
 추가·변경된 파일, 링크, 폴더 교체는 거부한다. 기록 폴더의 부재를 확인하기 전에는 연결을
 해제하거나 완료로 보고하지 않는다. `Stop`은 이 상태를 안내하며 파일을 삭제하지 않는다.
-`record_root`를 지정하지 않은 기존 범위는 자동 삭제하지 않는다. 원래 참조·완료·복구 상태와
+`record_root`를 지정하지 않은 기존 범위는 자동 삭제하지 않는다. 원래 참조·완료·중단 상태와
 현재 승인 범위를 검토한 뒤 사용이 끝난 작업 기록을 별도로 정리한다.
 보고에는 여덟 범주의 고정 검사·N/A, 기대값, 관측·실패·예외와 정확한 result·리뷰 참조가
 함께 나온다. file hash와 N/A 사유의 의미는 계속 소유자와 독립 검토자가 판단한다.
 
-기존 `finalize`, `inspect`, `unbind`는 중간 확인·복구에 계속 사용할 수 있다.
+기존 `finalize`, `inspect`, `unbind`는 중간 확인·작업 재개에 계속 사용할 수 있다.
 아래 `unbind`는 `finalize`·`inspect`를 거친 연결을 해제하는 대체 경로다.
 `unbind`도 같은 기록 삭제 절차를 수행한다. `complete`가 성공했다면 이미 연결이 해제된 상태다.
 
