@@ -46,14 +46,28 @@ def observation(ref, case, implementation):
     return matches(value["result"], case["assertions"])
 
 
-def validate_plan(plan_ref, task_id=None):
+def validate_plan(plan_ref, task_id=None, *, owners=()):
     plan = c.read_reference(plan_ref)
     c.fields(plan, ("task_id", "problem", "criterion", "basis", "baseline_sha256", "cases"))
     for key in ("task_id", "problem", "criterion"):
         c.text(plan[key])
     if task_id is not None and plan["task_id"] != task_id:
         raise c.CompletionError("improvement plan belongs to another task")
-    c.reference(plan["basis"])
+    # A declared owner edit preserves its original criterion in Git/a snapshot.
+    # Match both frozen path and bytes; all other bases remain live references.
+    if not isinstance(owners, (list, tuple)) or len(owners) > 32:
+        raise c.CompletionError("expected bounded owner references")
+    c.fields(plan["basis"], ("path", "sha256"))
+    c.path(plan["basis"]["path"]); c.digest(plan["basis"]["sha256"])
+    preserved = [owner for owner in owners if isinstance(owner, dict)
+                 and owner.get("path") == plan["basis"]["path"]
+                 and owner.get("sha256") == plan["basis"]["sha256"] and "original" in owner]
+    if len(preserved) > 1:
+        raise c.CompletionError("duplicate preserved basis")
+    if preserved:
+        c.owner_refs(preserved)
+    else:
+        c.reference(plan["basis"])
     c.digest(plan["baseline_sha256"])
     ids, inputs, paths, phases = set(), set(), set(), set()
     baseline_passes = 0
@@ -87,8 +101,8 @@ def validate_plan(plan_ref, task_id=None):
     return plan, baseline_passes
 
 
-def inspect(plan_ref, record_ref, task_id=None):
-    plan, baseline_passes = validate_plan(plan_ref, task_id)
+def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
+    plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners)
     record = c.read_reference(record_ref)
     c.fields(record, ("plan_sha256", "candidate", "cases", "application"))
     if record["plan_sha256"] != plan_ref["sha256"]:
@@ -124,7 +138,7 @@ def inspect(plan_ref, record_ref, task_id=None):
         if c.sha(c.raw_file(location, links=True)) != source["sha256"]:
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
-    validate_plan(plan_ref, task_id)
+    validate_plan(plan_ref, task_id, owners=owners)
     c.reference(record_ref)
     c.refs(candidates)
     for ref in after_refs:

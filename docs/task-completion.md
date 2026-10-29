@@ -259,7 +259,11 @@ stage 손실이나 새 stage를 숨길 수 없다. 사본·승인·소유 근거
    관측 대기는 구분하며, 예정되지 않은 자동 확인을 약속하지 않는다.
 
 계획의 필수 필드는 `task_id`, `problem`, `criterion`, `basis`(기존 owner 근거 path/SHA),
-`baseline_sha256`, `cases`다. 각 case는 `id`, `phase` (`reproduction` 또는 `transfer`),
+`baseline_sha256`, `cases`다. basis가 처음부터 수정 대상으로 선언한 owner의 정확한
+path/SHA와 일치하면 기존 `owners[].original`의 Git 원문 또는 외부 사본을 검증한다.
+현재 owner의 검토된 `owner_updates`와 source 검사는 그대로 유지한다. 선언하지 않은
+근거의 변경은 거부한다. 완료 검사는 고정 scope의 owner 연결을 전달하며, 독립 CLI는 현재 근거를
+계속 대조한다. 계획·기준·기대값을 수정한 문서로 바꾸지 않는다. 각 case는 `id`, `phase` (`reproduction` 또는 `transfer`),
 `input`과 `baseline`(각 path/SHA), `assertions`를 가진다. assertion은 JSON object의 key
 경로 `path: ["complete"]`와 고정한 `equals: false` 같은 값 비교다. case·assertion은 각각
 최대 32개, key 경로는 최대 16개이며 입력 bytes와 path는 사례 사이에 중복하지 않는다.

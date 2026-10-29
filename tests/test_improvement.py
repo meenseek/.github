@@ -1,5 +1,6 @@
 """Synthetic observation fixtures and actual completion boundary checks."""
 
+import copy
 import hashlib
 import importlib.util
 import inspect
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/check_improvement.py"
@@ -143,6 +145,58 @@ class ImprovementTests(unittest.TestCase):
         self.record["cases"][0]["after"] = self.write("wrong.json", self.envelope(case, "f" * 64, {"complete": False}))
         self.freeze()
         with self.assertRaisesRegex(ValueError, "implementation"): self.inspect()
+
+    def preserved_owner(self):
+        repo = self.root / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True).stdout.decode().strip()
+        git("config", "user.name", "Synthetic test")
+        git("config", "user.email", "test@example.invalid")
+        basis = repo / "owner.md"; basis.write_bytes(self.basis.read_bytes())
+        git("add", "owner.md"); git("commit", "-m", "test: preserve criterion")
+        self.plan["basis"] = self.ref(basis); self.freeze()
+        owner = {**self.ref(basis), "original": {"repository": str(repo), "file": "owner.md",
+                 "identity": c.repo_identity(str(repo)), "revision": git("rev-parse", "HEAD")}}
+        basis.write_text("Reviewed updated owner; original criterion retained.\n")
+        return owner
+
+    def test_planned_basis_uses_verified_original_and_completion_observer(self):
+        owner = self.preserved_owner()
+        with self.assertRaisesRegex(ValueError, "source bytes changed"):
+            self.inspect()
+        check = {"kind": "improvement", "target": {"path": self.record_ref["path"], "plan": self.plan_ref}}
+        self.assertTrue(c.observe(check, {"sha256": self.record_ref["sha256"]}, owners=[owner])["verified"])
+        self.assertEqual(i.validate_plan(self.plan_ref, owners=[owner])[0]["basis"], self.plan["basis"])
+
+    def test_unplanned_or_forged_basis_lineage_is_refused(self):
+        owner = self.preserved_owner()
+        for change in ({"revision": "0" * 40}, {"file": "other.md"},
+                       {"identity": {**owner["original"]["identity"], "inode": 0}}):
+            forged = copy.deepcopy(owner); forged["original"].update(change)
+            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                i.inspect(self.plan_ref, self.record_ref, owners=[forged])
+        snapshot = self.root / "snapshot.md"; snapshot.write_text("forged criterion")
+        forged = copy.deepcopy(owner); forged["original"].pop("revision")
+        forged["original"]["snapshot"] = self.ref(snapshot)
+        with self.assertRaisesRegex(ValueError, "snapshot differs"):
+            i.validate_plan(self.plan_ref, owners=[forged])
+        for owners in ([], [{**owner, "sha256": "0" * 64}]):
+            with self.assertRaisesRegex(ValueError, "source bytes changed"):
+                i.validate_plan(self.plan_ref, owners=owners)
+
+    def test_preserved_basis_is_rechecked_after_observations(self):
+        owner = self.preserved_owner()
+        snapshot = self.root / "snapshot.md"; snapshot.write_bytes(self.basis.read_bytes())
+        owner["original"].pop("revision"); owner["original"]["snapshot"] = self.ref(snapshot)
+        original = i.observation
+        def mutate(*args):
+            answer = original(*args)
+            if args[2] == self.candidate_sha:
+                snapshot.write_text("changed after candidate observation")
+            return answer
+        with mock.patch.object(i, "observation", side_effect=mutate), self.assertRaisesRegex(ValueError, "source bytes changed"):
+            i.inspect(self.plan_ref, self.record_ref, owners=[owner])
 
     def test_json_bool_is_not_number(self):
         self.assertFalse(i.matches({"x": 0}, [{"path": ["x"], "equals": False}]))

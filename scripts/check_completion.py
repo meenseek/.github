@@ -744,7 +744,7 @@ def validate_scope(scope, recovery=None):
             path(check["target"]["path"])
             if check["category"] != "quality":
                 raise CompletionError("improvement observations belong to quality")
-            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"])
+            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"], owners=owners)
         checks[key] = check
     for owner in owners:
         if "original" in owner and not any(
@@ -950,11 +950,11 @@ def draft_result(scope_ref, expectations=None):
     return result
 
 
-def observe(check, expected, *, preserved=None):
+def observe(check, expected, *, preserved=None, owners=()):
     kind, target = check["kind"], check["target"]
     if kind == "improvement":
         fields(target, ("path", "plan")); fields(expected, ("sha256",))
-        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])})
+        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])}, owners=owners)
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
         fields(expected, ("sha256",))
@@ -1178,7 +1178,10 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         if stopped and definition["kind"] not in CLEANUP_KINDS:
             return key, {"unfulfilled": True, "reason": "terminal stop; original goal is not claimed complete"}, None
         try:
-            return key, (observe(definition, wanted, preserved=preserved[key]) if key in preserved else observe(definition, wanted)), None
+            options = {"owners": scope["owners"]} if definition["kind"] == "improvement" else {}
+            if key in preserved:
+                options["preserved"] = preserved[key]
+            return key, observe(definition, wanted, **options), None
         except (CompletionError, OSError, ValueError, URLError, subprocess.TimeoutExpired) as exc:
             return key, None, str(exc)
 

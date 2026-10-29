@@ -1290,6 +1290,36 @@ class CompletionTests(unittest.TestCase):
         seed["checks"][0]["target"] = {"command": "touch arbitrary-file"}
         with self.assertRaises(c.CompletionError): c.prepare(seed)
 
+    def test_improvement_reuses_declared_owner_original_through_full_completion(self):
+        fixture_spec = importlib.util.spec_from_file_location("improvement_fixture", Path(__file__).with_name("test_improvement.py"))
+        module = importlib.util.module_from_spec(fixture_spec); fixture_spec.loader.exec_module(module)
+        fixture = module.ImprovementTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        self.owner_edit_fixture()
+        fixture.plan["task_id"] = self.seed["task_id"]
+        fixture.plan["basis"] = self.seed["owners"][0]
+        fixture.freeze()
+        self.seed["checks"].append({"id": "prevention", "category": "quality", "kind": "improvement",
+                                    "target": {"path": fixture.record_ref["path"], "plan": fixture.plan_ref}})
+        # Existing prepared owner provenance is retained when adding the check;
+        # prepare again would treat the already edited owner as a new baseline.
+        scope = json.loads(self.scope_path.read_text())
+        scope["checks"].append(self.seed["checks"][-1])
+        self.reset_categories(); scope["categories"] = self.seed["categories"]
+        c.validate_scope(scope)
+        self.write(self.scope_path, scope); self.scope_ref = self.ref(self.scope_path)
+        self.write(self.review_path, {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings"})
+        self.state["scope"] = self.scope_ref; self.state["review"] = self.ref(self.review_path)
+        self.write(self.state_path, self.state)
+        self.result["scope_sha256"] = self.scope_ref["sha256"]
+        self.result["checks"]["prevention"] = {"sha256": fixture.record_ref["sha256"]}
+        self.update_owner_result()
+        answer = self.inspect()
+        self.assertTrue(answer["complete"], answer["failures"])
+        del self.result["owner_updates"]
+        self.write(self.result_path, self.result); self.final_review()
+        with self.assertRaisesRegex(ValueError, "source bytes changed"):
+            self.inspect()
+
     def test_frozen_improvement_cannot_be_omitted_or_replaced_by_a_promise(self):
         fixture_spec = importlib.util.spec_from_file_location("improvement_fixture", Path(__file__).with_name("test_improvement.py"))
         fixture_module = importlib.util.module_from_spec(fixture_spec)
