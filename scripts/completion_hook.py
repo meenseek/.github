@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import sys
 import tempfile
 
@@ -32,6 +33,54 @@ def pointer(root, session):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", session):
         raise c.CompletionError("invalid session identity")
     return c.path(str(root)) / (session + ".json")
+
+
+def measurement_store(explicit_root=None):
+    """Optional installed observer; completion authority stays in this module."""
+    operations = Path(__file__).resolve().parents[2] / "operations"
+    default = operations / ".state" / "llm-work"
+    if explicit_root is None and not (default / "enabled.json").is_file():
+        return None
+    source = operations / "llm_work.py"
+    spec = importlib.util.spec_from_file_location("operations_llm_work", source)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.path[:]
+    try:
+        sys.path.insert(0, str(operations))
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = previous
+    return module, module.WorkStore(explicit_root or default)
+
+
+def measurement_event(payload, explicit_root=None):
+    try:
+        bound = measurement_store(explicit_root)
+        if bound:
+            module, store = bound
+            store.reconcile_cleanup()
+            return module.consume_hook(payload, store)
+    except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error) as exc:
+        print(json.dumps({"measurement": "pending", "error_type": type(exc).__name__}), file=sys.stderr)
+    return {}
+
+
+def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=None):
+    """A missing observer cannot change a successful cleanup into task failure."""
+    try:
+        if Path(binding_path).parent != ROOT:
+            return
+        bound = measurement_store()
+        if bound:
+            _, store = bound
+            if preparing:
+                store.remember_cleanup(state["task_id"], {**answer,
+                    "binding_path": str(binding_path),
+                    "record_root": scope.get("record_root", {}).get("path")})
+            else:
+                return store.finish_cleanup(state["task_id"], answer)
+    except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error) as exc:
+        print(json.dumps({"measurement": "pending", "error_type": type(exc).__name__}), file=sys.stderr)
 
 
 @contextmanager
@@ -157,15 +206,22 @@ def finish_cleanup(filename, state, before):
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     filename.unlink()
-    return {**answer, "binding_released": True, "records_removed": cleanup["record_root"]["path"]}
+    result = {**answer, "binding_released": True, "records_removed": cleanup["record_root"]["path"]}
+    observed = measurement_cleanup(state, result, binding_path=filename)
+    if observed: result["work_measurement"] = observed
+    return result
 
 
 def close_checked(filename, state, before, scope, answer):
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     if "record_root" not in scope:
+        measurement_cleanup(state, answer, binding_path=filename, preparing=True, scope=scope)
         filename.unlink()
-        return {**answer, "binding_released": True}
+        result = {**answer, "binding_released": True}
+        observed = measurement_cleanup(state, result, binding_path=filename)
+        if observed: result["work_measurement"] = observed
+        return result
     scope = c.filesystem_scope(state["scope"], scope, state)
     record = scope["record_root"]
     if answer.get("stopped") and c.path(state["status_basis"]["path"]).is_relative_to(c.path(record["path"])):
@@ -180,6 +236,7 @@ def close_checked(filename, state, before, scope, answer):
         raise c.CompletionError("final review changed after inspection")
     if c.reviewed_record_inventory(record, state["final_review"]["path"], inventory=manifest) != reviewed["record_inventory_sha256"]:
         raise c.CompletionError("task records changed after final review")
+    measurement_cleanup(state, answer, binding_path=filename, preparing=True, scope=scope)
     state["cleanup"] = {"record_root": record, "manifest": manifest,
                         "request_digest": scope["request_digest"], "answer": answer}
     before = replace(filename, state, before)["sha256"]
@@ -196,16 +253,18 @@ def desktop_workspace(cwd, desktop):
         return False
 
 
-def hook(payload, root=ROOT):
+def hook(payload, root=ROOT, measurement_root=None):
+    measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
     event = payload.get("hook_event_name")
-    if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return {}
+    if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return measured
     filename = pointer(root, c.text(payload.get("session_id")))
     cwd = c.path(payload.get("cwd"))
     desktop = Path(__file__).resolve().parents[2]
     # Bound sessions and new worktrees of Desktop repositories keep the same entry.
-    if not filename.exists() and not desktop_workspace(cwd, desktop): return {}
+    if not filename.exists() and not desktop_workspace(cwd, desktop): return measured
     if event != "Stop":
         context = GUIDANCE + " 현재 session_id=" + payload["session_id"]
+        context += "\n" + measured.get("hookSpecificOutput", {}).get("additionalContext", "")
         if filename.exists():
             try:
                 state, _ = load_state(filename)
