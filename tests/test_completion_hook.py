@@ -28,7 +28,7 @@ class HookTests(unittest.TestCase):
     def call(self, command, *args, ok=True):
         argv = [sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root), command, "--session", self.f.seed["session_id"]]
         if command != "arm": argv += ["--expected-sha256", h.c.sha(h.c.raw_file(str(self.state)))]
-        if command in {"complete", "unbind"}: argv += self.goal_args()
+        if command in {"complete", "unbind", "release"}: argv += self.goal_args()
         done = subprocess.run([*argv, *args], capture_output=True, timeout=35)
         self.assertEqual(done.returncode, 0 if ok else 2, done.stdout)
         return json.loads(done.stdout)
@@ -471,6 +471,7 @@ class HookTests(unittest.TestCase):
         answer = h.hook(self.payload, self.root)
         self.assertIn("미완료", answer["systemMessage"])
         self.call("inspect", ok=False)
+        self.call("release", ok=False)
         self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
                   "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
         self.call("outcome", "--status", "working", *self.basis())
@@ -488,6 +489,202 @@ class HookTests(unittest.TestCase):
         self.assertFalse(answer["complete"]); self.assertTrue(answer["stopped"])
         self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
         self.call("arm", "--task-id", "new-synthetic-task")
+
+    def stopped_record_fixture(self):
+        self.record_fixture(nested=True)
+        self.arm_bind()
+        self.retained = self.f.root / "owner-records"
+        self.retained.mkdir()
+        for source in (self.f.scope_path, self.f.result_path):
+            (self.retained / source.name).write_bytes(source.read_bytes())
+        self.stop_basis = self.retained / "disposition.json"
+        self.f.write(self.stop_basis, {"reason": "Owner retired a superseded experiment after accepting its output",
+            "scope": self.f.ref(self.retained / self.f.scope_path.name),
+            "result": self.f.ref(self.retained / self.f.result_path.name)})
+        self.call("outcome", "--status", "cancelled", "--basis", str(self.stop_basis),
+                  "--basis-sha256", self.f.ref(self.stop_basis)["sha256"])
+        reviewed = json.loads(self.f.final_review_path.read_bytes())
+        reviewed["disposition"] = "stopped"
+        self.f.write(self.f.final_review_path, reviewed)
+        self.call("finalize", *self.completion_args())
+
+    def test_terminal_release_removes_reviewed_records_without_claiming_goal_success(self):
+        self.stopped_record_fixture()
+        scope = (self.retained / "scope.json").read_bytes()
+        result = (self.retained / "result.json").read_bytes()
+        before = self.state.read_bytes()
+        self.call("release", "--task-id", "different-goal", ok=False)
+        self.call("release", "--request-digest", "f" * 64, ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        answer = self.call("release")
+        self.assertFalse(answer["complete"]); self.assertTrue(answer["stopped"])
+        self.assertTrue(answer["binding_released"])
+        self.assertFalse(self.state.exists()); self.assertFalse(self.records.exists())
+        self.assertEqual((self.retained / "scope.json").read_bytes(), scope)
+        self.assertEqual((self.retained / "result.json").read_bytes(), result)
+        context = h.hook({**self.payload, "hook_event_name": "UserPromptSubmit"}, self.root)
+        self.assertNotIn("기존 연결 작업", str(context))
+
+    def test_terminal_release_requires_disposition_outside_disposable_records(self):
+        self.stopped_record_fixture()
+        self.call("outcome", "--status", "cancelled", "--basis", str(self.f.request),
+                  "--basis-sha256", self.f.ref(self.f.request)["sha256"])
+        before = self.state.read_bytes()
+        self.call("release", ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue(self.records.exists())
+
+    def test_partial_terminal_cleanup_preserves_outcome_and_owner_evidence(self):
+        self.stopped_record_fixture()
+        args = self.completion_args()
+        argv = ["--bindings", str(self.root), "release", "--session", self.f.seed["session_id"],
+                "--expected-sha256", self.f.ref(self.state)["sha256"], *self.goal_args()]
+        original = h.os.unlink
+        def interrupted(name, *positional, **keywords):
+            if name == "request.txt": raise PermissionError("synthetic interrupted terminal cleanup")
+            return original(name, *positional, **keywords)
+        with mock.patch.object(h.os, "unlink", side_effect=interrupted), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(argv), 2)
+        self.assertFalse(self.f.scope_path.exists()); self.assertTrue(self.records.exists())
+        notice = h.hook(self.payload, self.root)
+        self.assertIn("release를 재실행", notice["reason"])
+        self.assertNotIn("complete/unbind", notice["reason"])
+        before = self.state.read_bytes()
+        self.call("complete", *args, ok=False)
+        self.call("release", "--task-id", "different-goal", ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        basis = self.stop_basis.read_bytes()
+        self.stop_basis.write_text("changed owner disposition")
+        self.call("release", ok=False)
+        self.stop_basis.write_bytes(basis)
+        added = self.records / "unreviewed.txt"; added.write_text("late unreviewed file")
+        self.call("release", ok=False); self.assertTrue(added.exists())
+        added.unlink()
+        answer = self.call("release")
+        self.assertTrue(answer["stopped"]); self.assertFalse(answer["complete"])
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    def preserved_device_fixture(self, remote=False):
+        self.f.preserved_source_fixture()
+        self.root, self.state = self.f.root, self.f.state_path
+        scope = json.loads(self.f.scope_path.read_bytes())
+        state = json.loads(self.state.read_bytes())
+        if remote:
+            state["resources"].append({"id": "review-remote", "kind": "remote_ref_absent", "basis": self.f.ref(self.f.request),
+                "target": {"repository": str(self.f.repo), "remote": "origin", "ref": "refs/heads/retired-review",
+                           "remote_binding": h.c.remote_identity(str(self.f.repo), "origin")}})
+        slots = [o["original"]["identity"] for o in scope["owners"] if "original" in o]
+        slots += [b["identity"] for b in scope["baseline"]["repositories"].values()]
+        for check in [*scope["checks"], *state["resources"]]:
+            remote_binding = check["target"].get("remote_binding", {})
+            slots.extend(remote_binding[k] for k in ("local", "destination") if k in remote_binding)
+        rows = {}
+        for slot in slots:
+            after = {k: slot[k] for k in ("device", "inode")}
+            slot["device"] += 100
+            location = slot["common_dir"]
+            rows[location] = {"path": location, "before": {k: slot[k] for k in ("device", "inode")}, "after": after}
+        self.f.write(self.f.scope_path, scope); self.f.scope_ref = self.f.ref(self.f.scope_path)
+        self.f.preservation["scope_sha256"] = self.f.scope_ref["sha256"]; self.f.write_preservation()
+        state.update(scope=self.f.scope_ref, outcome="waiting", status_basis=self.f.ref(self.f.request),
+                     source_preservation={"evidence": self.f.ref(self.f.preservation_path), "review": self.f.ref(self.f.preservation_review)})
+        self.f.write(self.f.review_path, {"scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings"})
+        state["review"] = self.f.ref(self.f.review_path); self.f.write(self.state, state)
+        self.device_evidence = self.f.root / "device-evidence.json"
+        self.device_review = self.f.root / "device-review.json"
+        self.f.write(self.device_evidence, {"scope_sha256": self.f.scope_ref["sha256"], "task_id": scope["task_id"],
+            "session_id": scope["session_id"], "previous_state_sha256": self.f.ref(self.state)["sha256"],
+            "authorization": self.f.ref(self.f.request), "identities": list(rows.values())})
+        self.review_device_evidence()
+        return ["--evidence", str(self.device_evidence), "--evidence-sha256", self.f.ref(self.device_evidence)["sha256"],
+                "--review", str(self.device_review), "--review-sha256", self.f.ref(self.device_review)["sha256"]]
+
+    def review_device_evidence(self):
+        self.f.write(self.device_review, {"scope_sha256": self.f.scope_ref["sha256"],
+            "filesystem_recovery_sha256": self.f.ref(self.device_evidence)["sha256"], "status": "No Findings"})
+
+    def assert_preserved_device_recovery(self, remote):
+        args = self.preserved_device_fixture(remote)
+        scope = self.f.scope_path.read_bytes()
+        before = json.loads(self.state.read_bytes())
+        self.call("recover-filesystem", *args)
+        state = json.loads(self.state.read_bytes())
+        self.assertEqual(state["source_preservation"], before["source_preservation"])
+        self.assertEqual(state["resources"], before["resources"])
+        self.assertEqual(self.f.scope_path.read_bytes(), scope)
+        self.call("recover-filesystem", *args, ok=False)
+        self.f.result["scope_sha256"] = self.f.scope_ref["sha256"]
+        self.f.write(self.f.result_path, self.f.result)
+        self.f.write(self.f.final_review_path, {"scope_sha256": self.f.scope_ref["sha256"],
+            "result_sha256": self.f.ref(self.f.result_path)["sha256"], "status": "No Findings",
+            "source_preservation_sha256": state["source_preservation"]["evidence"]["sha256"],
+            "filesystem_recovery_sha256": state["filesystem_recovery"]["evidence"]["sha256"]})
+        self.call("outcome", "--status", "working", *self.basis())
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"]); self.assertFalse(self.state.exists())
+        self.assertEqual(self.f.scope_path.read_bytes(), scope)
+
+    def test_device_recovery_composes_preserved_source(self):
+        self.assert_preserved_device_recovery(False)
+
+    def test_device_recovery_projects_accumulated_remote_resources(self):
+        self.assert_preserved_device_recovery(True)
+
+    def test_device_recovery_still_rejects_replaced_inode(self):
+        self.preserved_device_fixture(remote=True)
+        value = json.loads(self.device_evidence.read_bytes())
+        value["identities"][0]["after"]["inode"] += 1
+        self.f.write(self.device_evidence, value); self.review_device_evidence()
+        args = ["--evidence", str(self.device_evidence), "--evidence-sha256", self.f.ref(self.device_evidence)["sha256"],
+                "--review", str(self.device_review), "--review-sha256", self.f.ref(self.device_review)["sha256"]]
+        before = self.state.read_bytes()
+        self.call("recover-filesystem", *args, ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_device_and_owner_recovery_are_atomic_and_keep_original_obligations(self):
+        self.preserved_device_fixture(remote=True)
+        owner = self.f.root / "concurrent-owner.md"
+        original = self.f.root / "owner-original.md"; current = self.f.root / "owner-current.md"
+        original.write_text("Original concurrent owner contract\n")
+        current.write_text("Reviewed changed concurrent owner contract\n")
+        owner.write_bytes(current.read_bytes())
+        scope = json.loads(self.f.scope_path.read_bytes())
+        scope["owners"].append({"path": str(owner), "sha256": self.f.ref(original)["sha256"]})
+        self.f.write(self.f.scope_path, scope); self.f.scope_ref = self.f.ref(self.f.scope_path)
+        self.f.preservation["scope_sha256"] = self.f.scope_ref["sha256"]; self.f.write_preservation()
+        self.f.write(self.f.review_path, {"scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings"})
+        state = json.loads(self.state.read_bytes())
+        state.update(scope=self.f.scope_ref, review=self.f.ref(self.f.review_path),
+                     source_preservation={"evidence": self.f.ref(self.f.preservation_path), "review": self.f.ref(self.f.preservation_review)})
+        self.f.write(self.state, state)
+        device = json.loads(self.device_evidence.read_bytes())
+        device.update(scope_sha256=self.f.scope_ref["sha256"], previous_state_sha256=self.f.ref(self.state)["sha256"])
+        self.f.write(self.device_evidence, device); self.review_device_evidence()
+        recovery = self.f.root / "owner-recovery.json"; review = self.f.root / "owner-review.json"; companion = self.f.root / "companion.json"
+        self.f.write(recovery, {"scope_sha256": self.f.scope_ref["sha256"], "task_id": scope["task_id"], "session_id": scope["session_id"],
+            "authorization": self.f.ref(self.f.request), "owners": [{"owner_path": str(owner),
+                "snapshots": {"original": self.f.ref(original), "current": self.f.ref(current)}}]})
+        self.f.write(review, {"scope_sha256": self.f.scope_ref["sha256"], "recovery_sha256": self.f.ref(recovery)["sha256"], "status": "No Findings"})
+        self.f.write(companion, {"evidence": self.f.ref(recovery), "review": self.f.ref(review)})
+        args = ["--evidence", str(self.device_evidence), "--evidence-sha256", self.f.ref(self.device_evidence)["sha256"],
+                "--review", str(self.device_review), "--review-sha256", self.f.ref(self.device_review)["sha256"]]
+        before = self.state.read_bytes(); frozen = self.f.scope_path.read_bytes()
+        for extra in ([], ["--owner-recovery", str(companion)],
+                      ["--owner-recovery", str(companion), "--owner-recovery-sha256", "0" * 64]):
+            self.call("recover-filesystem", *args, *extra, ok=False)
+            self.assertEqual(self.state.read_bytes(), before)
+        owner.write_text("Unreviewed concurrent drift")
+        extra = ["--owner-recovery", str(companion), "--owner-recovery-sha256", self.f.ref(companion)["sha256"]]
+        self.call("recover-filesystem", *args, *extra, ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        owner.write_bytes(current.read_bytes())
+        self.call("recover-filesystem", *args, *extra)
+        after = json.loads(self.state.read_bytes())
+        self.assertEqual(after["owner_recovery"], json.loads(companion.read_bytes()))
+        self.assertEqual(after["resources"], state["resources"])
+        self.assertEqual(self.f.scope_path.read_bytes(), frozen)
+        self.assertEqual(after["source_preservation"], state["source_preservation"])
+        self.call("inspect", ok=False)  # Old final review cannot cover newly combined bindings.
 
     def test_exact_owner_recovery_actual_cli_preserves_binding_and_unbinds(self):
         self.f.seed["state_path"] = str(self.state)

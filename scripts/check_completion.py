@@ -584,9 +584,14 @@ def preserved_source_bytes(published, pairs):
 
 
 def filesystem_scope(scope_ref, scope, state):
+    return filesystem_view(scope_ref, scope, state)[0]
+
+
+def filesystem_view(scope_ref, scope, state):
     """Project reviewed device-only changes; never rewrite the frozen scope."""
+    resources = decode(canonical(state.get("resources", [])))
     if "filesystem_recovery" not in state:
-        return scope
+        return scope, resources
     binding = state["filesystem_recovery"]
     fields(binding, ("evidence", "review"))
     evidence = read_reference(binding["evidence"])
@@ -605,7 +610,7 @@ def filesystem_scope(scope_ref, scope, state):
         if "original" in owner:
             slots.append(owner["original"]["identity"])
     slots.extend(item["identity"] for item in projected["baseline"]["repositories"].values())
-    for check in projected["checks"]:
+    for check in [*projected["checks"], *resources]:
         remote = check["target"].get("remote_binding", {})
         for key in ("local", "destination"):
             if key in remote:
@@ -652,7 +657,7 @@ def filesystem_scope(scope_ref, scope, state):
     reference(scope_ref)
     reference(binding["evidence"]); reference(binding["review"])
     reference(evidence["authorization"])
-    return projected
+    return projected, resources
 
 
 def record_directory(value):
@@ -1121,7 +1126,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery"))
     if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
-    scope = filesystem_scope(scope_ref, scope, state)
+    scope, resources = filesystem_view(scope_ref, scope, state)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
     preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
@@ -1191,11 +1196,11 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
                 failures.append({"id": key, "reason": failure})
             else:
                 observed[key] = observation
-    if not isinstance(state["resources"], list) or len(state["resources"]) > 128:
+    if not isinstance(resources, list) or len(resources) > 128:
         raise CompletionError("expected bounded accumulated resource list")
-    if len({resource.get("id") for resource in state["resources"] if isinstance(resource, dict)}) != len(state["resources"]):
+    if len({resource.get("id") for resource in resources if isinstance(resource, dict)}) != len(resources):
         raise CompletionError("duplicate accumulated resource identity")
-    for resource in state["resources"]:
+    for resource in resources:
         fields(resource, ("id", "kind", "target", "basis"))
         try:
             reference(resource["basis"])

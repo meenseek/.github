@@ -25,7 +25,7 @@ GUIDANCE = ("Desktop 저장소 변경 작업은 별도 정리 요청이 없어�
             "상태 보고는 실제 남은 조치를 쓰고 파일 손상·유실은 확인된 경우에만 보고하세요. "
             "읽기 전용 조사·리뷰와 단순 질문만 하는 작업은 새 변경 작업으로 추정하지 마세요. "
             "직접 작업의 임시 완료 기록은 저장소 밖 전용 record_root에 모으고 scope에 고정하세요. "
-            "complete/unbind 성공 시 그 기록 폴더까지 제거하며 완료 receipt 파일을 다시 만들지 마세요. 완료는 현재 관측으로 확인하세요.")
+            "complete/unbind/release 성공 시 검토된 임시 기록 폴더까지 제거하며 완료 receipt 파일을 다시 만들지 마세요. 완료는 현재 관측으로 확인하세요.")
 
 
 def pointer(root, session):
@@ -146,8 +146,11 @@ def finish_cleanup(filename, state, before):
     cleanup = state["cleanup"]
     c.fields(cleanup, ("record_root", "manifest", "request_digest", "answer"))
     answer = cleanup["answer"]
-    if answer.get("complete") is not True or (answer.get("task_id"), answer.get("scope_sha256")) != (state["task_id"], state["scope"]["sha256"]):
+    if ((answer.get("complete") is True) == (answer.get("stopped") is True)
+            or (answer.get("task_id"), answer.get("scope_sha256")) != (state["task_id"], state["scope"]["sha256"])):
         raise c.CompletionError("cleanup has no successful bound observation")
+    if answer.get("stopped"):
+        c.reference(state.get("status_basis"))
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     remove_records(cleanup["record_root"], cleanup["manifest"])
@@ -157,7 +160,7 @@ def finish_cleanup(filename, state, before):
     return {**answer, "binding_released": True, "records_removed": cleanup["record_root"]["path"]}
 
 
-def close_completed(filename, state, before, scope, answer):
+def close_checked(filename, state, before, scope, answer):
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     if "record_root" not in scope:
@@ -165,6 +168,8 @@ def close_completed(filename, state, before, scope, answer):
         return {**answer, "binding_released": True}
     scope = c.filesystem_scope(state["scope"], scope, state)
     record = scope["record_root"]
+    if answer.get("stopped") and c.path(state["status_basis"]["path"]).is_relative_to(c.path(record["path"])):
+        raise c.CompletionError("stopped disposition must remain in the owner records outside task records")
     for value in (state["scope"]["path"], state["review"]["path"], state["result_path"], state["final_review"]["path"]):
         if not c.path(value).is_relative_to(c.path(record["path"])):
             raise c.CompletionError("completion inputs must be inside the task record root")
@@ -219,7 +224,8 @@ def hook(payload, root=ROOT):
         if state["session_id"] != payload["session_id"]:
             raise c.CompletionError("session binding changed")
         if "cleanup" in state:
-            raise c.CompletionError("검사 통과 후 임시 기록 삭제가 미완료입니다. 현재 task/request와 pointer SHA로 complete/unbind를 재실행하세요")
+            command = "release" if state["cleanup"].get("answer", {}).get("stopped") else "complete/unbind"
+            raise c.CompletionError("검사 통과 후 임시 기록 삭제가 미완료입니다. 현재 task/request와 pointer SHA로 " + command + "를 재실행하세요")
         if state["outcome"] in {"waiting", "blocked", "cancelled"}:
             c.reference(state.get("status_basis"))
             return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 작업 종료 조건이 남은 상태입니다. 파일 손상 여부를 이 상태만으로 판단하지 마세요. 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
@@ -265,7 +271,7 @@ def main(argv=None):
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
-        if name in {"complete", "unbind"}:
+        if name in {"complete", "unbind", "release"}:
             item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
             item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
         if name == "bind":
@@ -279,6 +285,9 @@ def main(argv=None):
         if name in {"recover-owner", "preserve-source", "recover-filesystem"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
+        if name == "recover-filesystem":
+            item.add_argument("--owner-recovery", help="Exact reviewed companion {evidence,review} binding when owner bytes also changed")
+            item.add_argument("--owner-recovery-sha256")
         if name == "outcome":
             item.add_argument("--status", required=True, choices=("working", "waiting", "blocked", "cancelled"))
             item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
@@ -301,13 +310,15 @@ def main(argv=None):
                     if before != c.digest(args.expected_sha256) or state["session_id"] != args.session:
                         raise c.CompletionError("stale pointer or wrong session")
                     if "cleanup" in state:
-                        if args.command not in {"complete", "unbind"}:
-                            raise c.CompletionError("only complete/unbind can resume pending record cleanup")
+                        if args.command not in {"complete", "unbind", "release"}:
+                            raise c.CompletionError("only complete/unbind/release can resume pending record cleanup")
                         if (args.task_id, args.request_digest) != (state["task_id"], state["cleanup"]["request_digest"]):
                             raise c.CompletionError("current task/request differs from pending record cleanup")
+                        if (args.command == "release") != (state["cleanup"]["answer"].get("stopped") is True):
+                            raise c.CompletionError("cleanup disposition differs from the checked outcome")
                         answer = finish_cleanup(filename, state, before)
                         print(c.canonical(answer).decode()); return 0
-                    if args.command in {"complete", "unbind"}:
+                    if args.command in {"complete", "unbind", "release"}:
                         goal = task_context(state, filename, args.session)
                         if (c.text(args.task_id), c.digest(args.request_digest)) != (goal["task_id"], goal.get("request_digest")):
                             raise c.CompletionError("current task/request differs from the frozen binding; preserve it and review the current goal")
@@ -339,8 +350,8 @@ def main(argv=None):
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                             found[0].update(resource, basis=basis)
                     elif args.command == "recover-filesystem":
-                        if state["outcome"] != "waiting" or state["scope"] is None or any(k in state for k in ("filesystem_recovery", "source_preservation")):
-                            raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem/source recovery")
+                        if state["outcome"] != "waiting" or state["scope"] is None or "filesystem_recovery" in state:
+                            raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem recovery")
                         c.reference(state.get("status_basis"))
                         binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
                                    "review": {"path": args.review, "sha256": args.review_sha256}}
@@ -348,10 +359,20 @@ def main(argv=None):
                         if evidence["previous_state_sha256"] != before:
                             raise c.CompletionError("filesystem recovery is not for the exact previous pointer")
                         proposed = {**state, "filesystem_recovery": binding}
+                        if bool(args.owner_recovery) != bool(args.owner_recovery_sha256):
+                            raise c.CompletionError("companion owner recovery requires both path and SHA")
+                        if args.owner_recovery:
+                            companion = c.read_reference({"path": args.owner_recovery, "sha256": args.owner_recovery_sha256})
+                            c.fields(companion, ("evidence", "review"))
+                            if c.read_reference(companion["evidence"]).get("previous") != state.get("owner_recovery"):
+                                raise c.CompletionError("companion recovery must preserve the exact previous owner binding")
+                            proposed["owner_recovery"] = companion
                         scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), proposed)
-                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=proposed) if "owner_recovery" in state else None
+                        recovery = c.owner_recovery(state["scope"], scope, proposed["owner_recovery"], state=proposed) if "owner_recovery" in proposed else None
                         c.validate_scope(scope, recovery)
                         state["filesystem_recovery"] = binding
+                        if args.owner_recovery:
+                            state["owner_recovery"] = companion
                     elif args.command == "recover-owner":
                         if state["outcome"] != "waiting" or state["scope"] is None:
                             raise c.CompletionError("owner recovery requires the existing waiting binding")
@@ -393,7 +414,7 @@ def main(argv=None):
                             answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
                                                    request_digest=args.request_digest, workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
                             if answer["complete"]:
-                                answer = close_completed(filename, state, before, scope, answer)
+                                answer = close_checked(filename, state, before, scope, answer)
                             answer["binding_released"] = answer["complete"]
                             print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
                     elif args.command == "outcome":
@@ -403,11 +424,7 @@ def main(argv=None):
                         answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=scope["environment"]["workspace"], review_ref=state["review"], stopped=args.command == "release")
                         if args.command in {"unbind", "release"}:
                             if not (answer["stopped"] if args.command == "release" else answer["complete"]): raise c.CompletionError("unfinished task remains bound")
-                            if args.command == "unbind":
-                                answer = close_completed(filename, state, before, scope, answer)
-                            else:
-                                if c.sha(c.raw_file(str(filename))) != before: raise c.CompletionError("pointer changed")
-                                filename.unlink()
+                            answer = close_checked(filename, state, before, scope, answer)
                         print(c.canonical(answer).decode()); return 0 if answer["complete"] or answer["stopped"] else 2
                     answer = replace(filename, state, before)
         print(c.canonical(answer).decode()); return 0

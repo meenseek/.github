@@ -44,17 +44,22 @@
 
 `recover-filesystem`은 같은 경로·inode에서 장치 번호(device)만 달라진 경우의 재확인이다.
 원래 scope, 변경 목록, 현재 요청, 이전 pointer와 독립 검토를 결합하며, 이미
-`filesystem_recovery`, `source_preservation`이 연결된 작업에는 추가할 수 없다.
-기존 owner 재확인 연결은 보존하며 함께 사용할 수 있다. owner bytes도 추가로 바뀌었으면
+`filesystem_recovery`가 연결된 작업에는 다시 추가할 수 없다.
+기존 owner 재확인과 `source_preservation`은 원래 근거·검사를 보존한 채 함께 사용할 수 있다. owner bytes도 추가로 바뀌었으면
 이전 evidence/review를 보존한 최신 owner 연결을 먼저 검토한다. 경로·inode나 원래 scope를
 바꾸는 우회는 허용하지 않으며 각 연결의 현재 검사도 모두 통과해야 한다.
 재확인할 identity 목록은 scope뿐 아니라 기존 owner evidence의 repository·remote binding도
-포함한다. 검토된 device 변경만 메모리에서 함께 투영하며 기존 evidence/review bytes를
+포함하며 누적 자원의 remote binding도 같은 목록으로 대조한다. 검토된 device 변경만 scope와 자원 관측의 메모리에 함께 투영하며 기존 evidence/review bytes를
 다시 쓰지 않는다. 이미 현재 identity인 항목과 과거 identity인 항목도 같은 검토로 대조한다.
 추가 owner 연결 뒤에도 `previous`의 identity 계보를 보존하고, 저장할 새 연결을 포함한
 상태로 먼저 검사한다. 업무 저장소 목록 밖 owner의 기존 device 근거도 누락하지 않는다.
 파일 내용을 쓰거나 복원하지 않고, 완료·삭제를 수행하지 않으며 기존 검사를 유지한다.
 입력은 `completion_hook.py recover-filesystem --help`와 현재 검사 계약을 따른다.
+owner bytes도 동시에 바뀌어 두 재확인이 서로 먼저 필요하면, `--owner-recovery`와
+`--owner-recovery-sha256`으로 기존 형식의 독립 검토된 `{evidence,review}` binding을
+함께 전달한다. 원 pointer SHA와 이전 owner binding을 유지하고 두 근거·현재 owner·
+filesystem 검증을 같은 proposed state에서 모두 통과한 뒤 한 CAS로만 반영한다.
+한쪽 실패는 기존 pointer를 바꾸지 않으며 완료·품질 의무를 줄이지 않는다.
 
 ## 범위를 먼저 고정하기
 
@@ -369,7 +374,7 @@ python3 scripts/check_completion.py draft --scope /absolute/scope.json --sha256 
 python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha256 POINTER_SHA --task-id TASK_ID --request-digest REQUEST_DIGEST --result /absolute/result.json --review /absolute/final-review.json --review-sha256 REVIEW_SHA
 ```
 
-`complete`와 `unbind`에는 현재 마무리할 요청의 `task_id`와 범위 고정 때 묶은
+`complete`, `unbind`, `release`에는 현재 마무리할 요청의 `task_id`와 범위 고정 때 묶은
 `request_digest`를 명시한다. 세션의 과거 연결만으로 현재 목표를 추정하지 않는다.
 전달한 값이 고정 범위와 다르면 pointer 변경 전에 거절하며 원래 연결은 보존한다.
 이는 식별값의 일치 검사다. 현재 대화의 의도, 산출물의 의미나 승인 근거의 관련성을
@@ -435,9 +440,17 @@ owner 근거로 포함한다. HTTP GET은 redirect, 누락 revision/health, 오�
 제거한다. 취소·blocked 작업의 세션 재사용은 `release`를 사용한다. 원래 scope·result·상태
 근거를 기존 소유 기록에 보존하고, 최종 리뷰에 `disposition: stopped`를 명시한다. release는
 목표 달성을 주장하지 않고 모든 임시 자원의 부재와 기존 자원 보존·현재 예외를 다시 검사한다.
+`record_root`가 있으면 상태 근거는 그 폴더 밖의 기존 소유 기록에 남겨야 한다. 최종 리뷰는
+원래 목표·종료 판단의 보존과 임시 기록의 폐기 가능성을 확인한다. 검사 통과 뒤 complete와
+같은 정확한 inventory·bytes·identity 검사로 임시 기록과 pointer를 제거한다. 부분 삭제는
+같은 task/request와 종료 유형으로만 재시도하며 중단을 완료로 승격하지 않는다.
 검증 불가·미해결 예약이면 해제하지 않는다. main 변화도 stop 예외의 검토 대상이다. waiting은
 재개할 연결을 유지하고 release하지 않는다. scope 전 취소도 원래 요청·변경 없음·자원을
 정확히 검토한 scope를 bind한 뒤 같은 경계로 해제한다. 최종 보고는 main·실제 사용본·배포 결정·잔여 자원·예외를 짧게 제시한다.
+
+소유자가 기존 목표를 종료·대체한 경우에는 현재 결과의 수용과 원래 목표의 종료 판단을
+구분해 소유 기록에 결속하고, cancelled와 release까지 마친다. 게시·배포만으로 검수나
+실험의 통과를 추정하지 않으며, 더 이상 적용하지 않는 목표를 waiting으로 넘기지 않는다.
 
 ## Codex 설치와 실제 연결 확인
 
