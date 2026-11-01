@@ -686,6 +686,69 @@ class HookTests(unittest.TestCase):
         self.assertEqual(after["source_preservation"], state["source_preservation"])
         self.call("inspect", ok=False)  # Old final review cannot cover newly combined bindings.
 
+    def retained_checkout_fixture(self):
+        self.arm_bind()
+        self.f.git("switch", "-c", "feature-foreign-owner")
+        self.foreign_basis = self.f.root / "foreign-checkout.json"
+        self.foreign_basis.write_text("Independent owner uses this shared checkout; task main source is retained.\n")
+        self.retained = {"name": "feature-foreign-owner", "owner": "independent task",
+                         "basis": self.f.ref(self.foreign_basis)}
+        self.f.result["checks"]["source"]["retained_branch"] = self.retained
+        key = "git:" + str(self.f.repo) + ":ref:refs/heads/feature-foreign-owner"
+        self.f.result["exceptions"][key] = {"owner": "independent task", "reason": "Preserve its shared checkout",
+            "scope": key, "removal_condition": "That owner ends its task", "basis": [self.f.ref(self.foreign_basis)]}
+        self.review_retained_result()
+
+    def review_retained_result(self):
+        self.f.write(self.f.result_path, self.f.result); self.f.final_review()
+
+    def test_retained_foreign_checkout_completes_without_switching_or_deleting_it(self):
+        self.retained_checkout_fixture()
+        before = self.f.git("rev-parse", "HEAD")
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"])
+        self.assertEqual(answer["observed"]["source"]["retained_branch"], self.retained["name"])
+        self.assertEqual(self.f.git("branch", "--show-current"), self.retained["name"])
+        self.assertEqual(self.f.git("rev-parse", "HEAD"), before)
+
+    def test_retained_foreign_checkout_requires_exact_reviewed_owner_and_name(self):
+        self.retained_checkout_fixture()
+        original = json.loads(json.dumps(self.f.result))
+        for value in (None, {}, {**self.retained, "owner": ""}, {**self.retained, "basis": None},
+                      {**self.retained, "name": "main"}, {**self.retained, "name": "another-branch"}):
+            with self.subTest(value=value):
+                self.f.result = json.loads(json.dumps(original))
+                self.f.result["checks"]["source"]["retained_branch"] = value
+                self.review_retained_result(); self.call("complete", *self.completion_args(), ok=False)
+                self.assertTrue(self.state.exists())
+        self.f.result = original; del self.f.result["checks"]["source"]["retained_branch"]
+        self.review_retained_result(); self.call("complete", *self.completion_args(), ok=False)
+        self.assertEqual(self.f.git("branch", "--show-current"), self.retained["name"])
+
+    def test_retained_foreign_checkout_rejects_changed_basis(self):
+        self.retained_checkout_fixture(); self.foreign_basis.write_text("Unreviewed owner change")
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.state.exists())
+
+    def test_retained_foreign_checkout_rejects_divergent_head(self):
+        self.retained_checkout_fixture()
+        (self.f.repo / "foreign.txt").write_text("Other owner's new commit")
+        self.f.git("add", "foreign.txt"); self.f.git("commit", "-m", "test: unrelated branch advance")
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.state.exists())
+
+    def test_retained_foreign_checkout_still_checks_working_source_and_owned_resources(self):
+        self.retained_checkout_fixture()
+        source = self.f.repo / "tool.py"; original = source.read_bytes(); source.write_text("Unreviewed working source")
+        self.call("complete", *self.completion_args(), ok=False); source.write_bytes(original)
+        self.call("reserve", "--id", "still-owned-branch", *self.basis())
+        resource = self.f.root / "branch-resource.json"
+        self.f.write(resource, {"kind": "ref_absent", "target": {"repository": str(self.f.repo),
+            "ref": "refs/heads/" + self.retained["name"]}})
+        self.call("attach", "--id", "still-owned-branch", *self.basis(), "--resource", str(resource))
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertTrue(self.state.exists())
+
     def test_exact_owner_recovery_actual_cli_preserves_binding_and_unbinds(self):
         self.f.seed["state_path"] = str(self.state)
         frozen = self.f.recovery_fixture(two_owners=True)

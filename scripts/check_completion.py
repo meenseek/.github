@@ -1039,14 +1039,29 @@ def observe(check, expected, *, preserved=None, owners=()):
         return actual
     if kind == "git_source":
         fields(target, ("repository", "remote", "main", "files", "remote_binding"))
-        fields(expected, ("local_revision", "remote_revision", "files"))
+        fields(expected, ("local_revision", "remote_revision", "files"), ("retained_branch",))
         main, remote = text(target["main"]), text(target["remote"])
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", main) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
             raise CompletionError("invalid named Git main or remote")
         repo = target["repository"]
-        if git(repo, "symbolic-ref", "--short", "HEAD").decode().strip() != main:
-            raise CompletionError("working path has not returned to main")
         local = git(repo, "rev-parse", "refs/heads/" + main).decode().strip()
+        retained = expected.get("retained_branch")
+        if "retained_branch" in expected:
+            fields(retained, ("name", "owner", "basis"))
+
+        def checkout():
+            branch = git(repo, "symbolic-ref", "--short", "HEAD").decode().strip()
+            if retained is None:
+                if branch != main:
+                    raise CompletionError("working path has not returned to main")
+            else:
+                fields(retained, ("name", "owner", "basis"))
+                name = text(retained["name"]); text(retained["owner"]); reference(retained["basis"])
+                validate_ref_observer("ref_absent", "refs/heads/" + name)
+                if name == main or branch != name or git(repo, "rev-parse", "HEAD").decode().strip() != local:
+                    raise CompletionError("retained foreign checkout must name the current non-main branch at reviewed main")
+
+        checkout()
         remote_oid = remote_ref(repo, remote, "refs/heads/" + main, target["remote_binding"])
         if remote_oid is None:
             raise CompletionError("remote main could not be observed")
@@ -1082,7 +1097,8 @@ def observe(check, expected, *, preserved=None, owners=()):
                     raise CompletionError("preserved source index differs from publication and retained staging")
             if working_source_sha(path(repo) / filename) != working:
                 raise CompletionError("working source bytes differ from integrated source")
-        return {"local_revision": local, "remote_revision": remote_oid}
+        checkout()
+        return {"local_revision": local, "remote_revision": remote_oid, **({"retained_branch": retained["name"]} if retained else {})}
     raise CompletionError("unsupported observer")
 
 
@@ -1146,7 +1162,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     for key, definition in checks.items():
         if definition["kind"] == "git_source":
             expected = result["checks"][key]
-            fields(expected, ("local_revision", "remote_revision", "files"))
+            fields(expected, ("local_revision", "remote_revision", "files"), ("retained_branch",))
             if not isinstance(expected["files"], dict):
                 raise CompletionError("source files must be exact path expectations")
             if any(wanted is None and (definition["target"]["repository"], filename) not in planned

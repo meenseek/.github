@@ -387,6 +387,14 @@ python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha2
 비어 있고, 선언된 owner 변경의 현재 SHA만 `owner_updates`에 담는다. 범위·N/A·승인·리뷰
 통과를 만들거나 이미 있는 결과 파일을 덮어쓰지 않는다. 후보 생성은 완료 검사가 아니다.
 
+공유 checkout을 다른 작업이 사용 중이면 그 branch를 임의로 main으로 바꾸지 않는다.
+해당 `git_source` 기대값에만 `retained_branch: {name, owner, basis}`를 명시해 독립 최종
+리뷰를 받을 수 있다. `basis`는 정확한 경로/SHA의 소유·현재 점유 근거다. `draft`는 이 값을
+자동 추정하지 않는다. 현재 branch가 선언한 비-main 이름이고 HEAD가 검토한 local main과
+같아야 하며, local/remote main·전체 소스·보존 index 검사는 그대로다. 근거와 checkout은
+소스 관측 전후에 다시 확인한다. 별도 등록된 소유 branch의 부재 검사는 여전히 통과해야 한다.
+이 예외는 다른 HEAD·소스 변경이나 미완료 품질 검증을 허용하지 않는다.
+
 독립 최종 리뷰는 scope SHA와 **result 파일 SHA**까지 묶어 기대값·예외·owner 변경을
 검토한다. 수정 뒤에는 영향받은 부분과 연결 계약을 재검증·재리뷰하며, 정확한 최신 result
 SHA의 리뷰 참조를 전달한다. 그대로인 범위의 검증을 반복할 필요는 없다.
