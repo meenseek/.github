@@ -75,6 +75,7 @@ def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=N
             _, store = bound
             if preparing:
                 store.remember_cleanup(state["task_id"], {**answer,
+                    'session_id':state['session_id'],
                     "binding_path": str(binding_path),
                     "record_root": scope.get("record_root", {}).get("path")})
             else:
@@ -212,7 +213,8 @@ def finish_cleanup(filename, state, before):
     return result
 
 
-def close_checked(filename, state, before, scope, answer):
+def close_checked(filename, state, before, scope, answer, measurement_turns=None):
+    if measurement_turns:answer={**answer,'measurement_turns':list(dict.fromkeys(c.text(t) for t in measurement_turns))}
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     if "record_root" not in scope:
@@ -331,6 +333,7 @@ def main(argv=None):
         if name == "arm": item.add_argument("--task-id", required=True)
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
         if name in {"complete", "unbind", "release"}:
+            item.add_argument('--work-turn',action='append',help='Current explicit goal turn(s) to attach to automatic cleanup measurement; never infer them from an old binding')
             item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
             item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
         if name == "bind":
@@ -473,7 +476,7 @@ def main(argv=None):
                             answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
                                                    request_digest=args.request_digest, workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
                             if answer["complete"]:
-                                answer = close_checked(filename, state, before, scope, answer)
+                                answer = close_checked(filename, state, before, scope, answer, args.work_turn)
                             answer["binding_released"] = answer["complete"]
                             print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
                     elif args.command == "outcome":
@@ -483,7 +486,7 @@ def main(argv=None):
                         answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=scope["environment"]["workspace"], review_ref=state["review"], stopped=args.command == "release")
                         if args.command in {"unbind", "release"}:
                             if not (answer["stopped"] if args.command == "release" else answer["complete"]): raise c.CompletionError("unfinished task remains bound")
-                            answer = close_checked(filename, state, before, scope, answer)
+                            answer = close_checked(filename, state, before, scope, answer, args.work_turn)
                         print(c.canonical(answer).decode()); return 0 if answer["complete"] or answer["stopped"] else 2
                     answer = replace(filename, state, before)
         print(c.canonical(answer).decode()); return 0

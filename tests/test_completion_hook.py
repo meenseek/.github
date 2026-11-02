@@ -29,12 +29,15 @@ class HookTests(unittest.TestCase):
             'owner_ref': 'synthetic-owner', 'harness': digest})
         argv = ['--bindings', str(self.root), 'complete', '--session', self.f.seed['session_id'],
                 '--expected-sha256', h.c.sha(self.state.read_bytes()),
+                '--work-turn','closing-turn',
                 *self.goal_args(), *self.completion_args()]
         with mock.patch.object(h, 'ROOT', self.root), mock.patch.object(h, 'measurement_store', return_value=(module, store)), redirect_stdout(io.StringIO()):
             self.assertEqual(h.main(argv), 0)
         self.assertFalse(self.records.exists())
         self.assertFalse(self.state.exists())
         self.assertEqual(store.report()['tasks'][0]['state'], 'completed')
+        self.assertEqual(store.report()['tasks'][0]['turn_count'],2)
+        self.assertTrue(store.report()['tasks'][0]['outcome']['verification']['completion']['complete'])
         self.assertTrue(store.database.is_file())
         with store.connection() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
