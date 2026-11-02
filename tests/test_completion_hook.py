@@ -11,11 +11,66 @@ from unittest import mock
 import test_check_completion as fixture_module
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/completion_hook.py"
+HAS_COLLECTOR = (SCRIPT.parents[2] / "operations" / "llm_work.py").is_file()
 spec = importlib.util.spec_from_file_location("hook", SCRIPT)
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 
 
 class HookTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_COLLECTOR, "Requires the separately installed operations collector")
+    def test_measurement_survives_actual_reviewed_record_cleanup(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        module, store = h.measurement_store(self.f.root / 'observations')
+        digest = store.manifest({'components': [{'name': 'synthetic', 'sha256': '1'*64}]})
+        store.bind(self.f.seed['task_id'], self.f.seed['session_id'], 'measured-turn', {
+            'objective': 'Synthetic completion integration', 'category': 'implementation',
+            'scope': 'personal', 'criterion': 'Actual records removed after verified closure',
+            'owner_ref': 'synthetic-owner', 'harness': digest})
+        argv = ['--bindings', str(self.root), 'complete', '--session', self.f.seed['session_id'],
+                '--expected-sha256', h.c.sha(self.state.read_bytes()),
+                '--work-turn','closing-turn',
+                *self.goal_args(), *self.completion_args()]
+        with mock.patch.object(h, 'ROOT', self.root), mock.patch.object(h, 'measurement_store', return_value=(module, store)), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(argv), 0)
+        self.assertFalse(self.records.exists())
+        self.assertFalse(self.state.exists())
+        self.assertEqual(store.report()['tasks'][0]['state'], 'completed')
+        self.assertEqual(store.report()['tasks'][0]['turn_count'],2)
+        self.assertTrue(store.report()['tasks'][0]['outcome']['verification']['completion']['complete'])
+        self.assertTrue(store.database.is_file())
+        with store.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
+
+    def test_measurement_callback_failure_does_not_replace_completion_result(self):
+        with mock.patch.object(h, 'measurement_store', side_effect=h.sqlite3.OperationalError('synthetic unavailable')):
+            result = h.hook(self.payload, root=self.root, measurement_root=self.f.root/'observations')
+        self.assertIn('systemMessage', result)
+        self.assertNotIn('decision', result)
+
+    def test_missing_optional_companion_keeps_observation_nonblocking(self):
+        with mock.patch.object(h,'__file__',str(self.f.root/'.github/scripts/completion_hook.py')):
+            self.assertIsNone(h.measurement_store())
+            self.assertEqual(h.measurement_event(self.payload,self.f.root/'observations'),{})
+
+    @unittest.skipUnless(HAS_COLLECTOR, "Requires the separately installed operations collector")
+    def test_measurement_without_record_root_recovers_after_post_cleanup_callback_fails(self):
+        self.arm_bind(finalize=False)
+        module,store=h.measurement_store(self.f.root/'observations')
+        digest=store.manifest({'components':[{'name':'synthetic','sha256':'1'*64}]})
+        store.bind(self.f.seed['task_id'],self.f.seed['session_id'],'turn',{
+            'objective':'Synthetic no-record-root cleanup','category':'implementation','scope':'personal',
+            'criterion':'Recover retained observation after pointer removal','owner_ref':'synthetic-owner','harness':digest})
+        argv=['--bindings',str(self.root),'complete','--session',self.f.seed['session_id'],
+              '--expected-sha256',h.c.sha(self.state.read_bytes()),*self.goal_args(),*self.completion_args()]
+        with mock.patch.object(h,'ROOT',self.root),mock.patch.object(h,'measurement_store',return_value=(module,store)),\
+                mock.patch.object(store,'finish_cleanup',side_effect=OSError('synthetic interrupted observer')),redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(argv),0)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(store.report()['tasks'][0]['state'],'working')
+        store.reconcile_cleanup()
+        self.assertEqual(store.report()['tasks'][0]['state'],'completed')
+
     def setUp(self):
         self.fixture = fixture_module.CompletionTests()
         self.fixture.setUp()
