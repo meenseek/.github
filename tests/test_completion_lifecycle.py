@@ -11,6 +11,76 @@ from unittest import mock
 
 import test_completion_hook as fixture
 import test_filesystem_recovery as recovery_fixture
+import test_improvement as improvement_fixture
+
+
+class HistoricalDraftTests(unittest.TestCase):
+    def draft_after_removal(self, kind):
+        f = fixture.HookTests()
+        f.setUp()
+        improvement = None
+        try:
+            f.record_fixture()
+            if kind == 'improvement':
+                improvement = improvement_fixture.ImprovementTests()
+                improvement.setUp()
+                improvement.plan['task_id'] = f.f.seed['task_id']
+                improvement.freeze()
+                proof = improvement.record_path
+                check = {'id': 'historical', 'category': 'quality', 'kind': kind,
+                         'target': {'path': str(proof), 'plan': improvement.plan_ref}}
+                f.f.seed['owners'].append(improvement.ref(improvement.basis))
+            else:
+                proof = (f.f.root if kind in ('file', 'installed_file') else f.records) / 'evidence.json'
+                proof.write_text('{"verified":true}\n')
+                check = {'id': 'historical', 'category': 'quality', 'kind': 'evidence',
+                         'target': {'path': str(proof)}}
+                if kind in ('file', 'installed_file'):
+                    source = f.f.root / 'current-source.json'
+                    source.write_bytes(proof.read_bytes())
+                    f.f.seed['checks'].append({'id': 'live-target', 'category': 'artifacts', 'kind': kind,
+                        'target': {'path': str(proof), **({'source': str(source)} if kind == 'installed_file' else {})}})
+            f.f.seed['checks'].append(check)
+            f.f.reset_categories()
+            f.arm_bind(finalize=False)
+            expected = {'sha256': f.f.ref(proof)['sha256']}
+            f.f.result['checks']['historical'] = expected
+            if kind in ('file', 'installed_file'):
+                f.f.result['checks']['live-target'] = expected
+            f.f.write(f.f.result_path, f.f.result)
+            f.f.final_review()
+            f.call('finalize', *f.completion_args())
+            self.assertTrue(f.call('inspect')['complete'])
+            if kind in ('file', 'installed_file', 'improvement'):
+                proof.unlink()
+            if kind in ('evidence', 'improvement'):
+                shutil.rmtree(f.records)
+            before = f.state.read_bytes()
+            output = f.f.root / 'fresh-draft.json'
+            run = subprocess.run([sys.executable, '-I', str(fixture.SCRIPT.with_name('check_completion.py')),
+                'draft', '--state', str(f.state), '--output', str(output)], capture_output=True, text=True, timeout=35)
+            self.assertEqual(f.state.read_bytes(), before)
+            if kind in ('evidence', 'improvement'):
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual(json.loads(output.read_bytes())['checks']['historical'], expected)
+                self.assertFalse(f.records.exists())
+            else:
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertFalse(output.exists())
+        finally:
+            f.doCleanups()
+            if improvement:
+                improvement.doCleanups()
+
+    def test_fresh_draft_reuses_saved_observations_after_staging_removed(self):
+        for kind in ('evidence', 'improvement'):
+            with self.subTest(kind=kind):
+                self.draft_after_removal(kind)
+
+    def test_fresh_draft_does_not_freeze_current_files_also_saved_as_evidence(self):
+        for kind in ('file', 'installed_file'):
+            with self.subTest(kind=kind):
+                self.draft_after_removal(kind)
 
 
 class ContainedLifecycleTests(unittest.TestCase):
