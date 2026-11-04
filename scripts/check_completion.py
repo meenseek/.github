@@ -1137,8 +1137,10 @@ def _draft_result(scope_ref, expectations=None):
         if kind in {"file", "evidence", "installed_file", "improvement"}:
             if kind == "improvement":
                 fields(target, ("path", "plan"))
-                return key, {"sha256": sha(raw_file(target["path"]))}
+                return key, {"sha256": sha(control_bytes(target["path"]))}
             fields(target, ("path",), ("source",))
+            if kind == "evidence":
+                return key, {"sha256": sha(control_bytes(target["path"]))}
             return key, {"sha256": sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
                                                links=kind == "installed_file"))}
         if kind == "git_source":
