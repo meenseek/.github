@@ -37,7 +37,7 @@ def matches(result, assertions):
 
 
 def observation(ref, case, implementation):
-    value = c.read_reference(ref)
+    value = c.read_control(ref)
     c.fields(value, ("case_id", "input_sha256", "implementation_sha256", "result"))
     if (value["case_id"], value["input_sha256"], value["implementation_sha256"]) != (
         case["id"], case["input"]["sha256"], implementation
@@ -47,7 +47,7 @@ def observation(ref, case, implementation):
 
 
 def validate_plan(plan_ref, task_id=None, *, owners=()):
-    plan = c.read_reference(plan_ref)
+    plan = c.read_control(plan_ref)
     c.fields(plan, ("task_id", "problem", "criterion", "basis", "baseline_sha256", "cases"))
     for key in ("task_id", "problem", "criterion"):
         c.text(plan[key])
@@ -79,7 +79,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
             raise c.CompletionError("duplicate case or unsupported phase")
         ids.add(key)
         phases.add(case["phase"])
-        c.reference(case["input"])
+        c.control_reference(case["input"])
         identity = str(c.path(case["input"]["path"]))
         if case["input"]["sha256"] in inputs or identity in paths:
             raise c.CompletionError("reproduction and transfer cases need distinct input bytes and paths")
@@ -103,7 +103,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
 
 def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
     plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners)
-    record = c.read_reference(record_ref)
+    record = c.read_control(record_ref)
     c.fields(record, ("plan_sha256", "candidate", "cases", "application"))
     if record["plan_sha256"] != plan_ref["sha256"]:
         raise c.CompletionError("record differs from the frozen improvement plan")
@@ -139,10 +139,10 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
     validate_plan(plan_ref, task_id, owners=owners)
-    c.reference(record_ref)
+    c.control_reference(record_ref)
     c.refs(candidates)
     for ref in after_refs:
-        c.reference(ref)
+        c.control_reference(ref)
     for source, row in zip(candidates, applied):
         if c.sha(c.raw_file(row["installed_path"], links=True)) != source["sha256"]:
             raise c.CompletionError("actual usage changed during inspection")

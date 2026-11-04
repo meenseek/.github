@@ -1030,12 +1030,19 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.call("inspect")["complete"])
         self.assertEqual(self.f.recovery_path.read_bytes(), frozen_owner)
 
-    def test_stale_cas_and_changed_scope_refuse_completion(self):
+    def test_stale_cas_and_changed_accepted_scope_refuse_completion(self):
         self.arm_bind()
         done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--bindings", str(self.root), "reserve", "--session", self.f.seed["session_id"],
                                "--expected-sha256", "1"*64, "--id", "bad", *self.basis()], capture_output=True)
         self.assertEqual(done.returncode, 2)
-        self.f.scope_path.write_text("{}"); self.assertEqual(h.hook(self.payload, self.root)["decision"], "block")
+        self.f.scope_path.write_text("{}")
+        self.assertNotIn("decision", h.hook(self.payload, self.root))
+        state = json.loads(self.state.read_bytes())
+        for row in state['control_records']:
+            if row['path'] == str(self.f.scope_path):
+                row['data'] = 'corrupt'
+        self.state.write_text(json.dumps(state))
+        self.assertEqual(h.hook(self.payload, self.root)["decision"], "block")
 
 
 if __name__ == "__main__": unittest.main()
