@@ -914,7 +914,9 @@ class CompletionTests(unittest.TestCase):
             c.observe(json.loads(scope)["checks"][0], self.result["checks"]["source"])
         self.preservation_call()
         after = json.loads(self.state_path.read_bytes())
-        self.assertEqual({k: v for k, v in after.items() if k != "source_preservation"}, before)
+        self.assertEqual({k: v for k, v in after.items() if k not in {"source_preservation", "control_records"}}, before)
+        self.assertTrue(any(row["path"] == str(self.scope_path) and row["sha256"] == self.scope_ref["sha256"]
+                            for row in after["control_records"]))
         self.assertEqual((self.repo / ".git/index").read_bytes(), index)
         self.assertEqual(self.scope_path.read_bytes(), scope)
         self.state = after

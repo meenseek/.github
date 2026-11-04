@@ -7,6 +7,10 @@ No command from an input document is executed. Unsupported observations fail.
 """
 
 import argparse
+import base64
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
@@ -35,6 +39,10 @@ MAX_OWNER_RECOVERIES = 16
 CLEANUP_KINDS = {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"}
 KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote_ref_absent",
          "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
+STATE_FIELDS = ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome")
+STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup",
+                  "control_records", "record_manifest", "origin", "handoff", "execution_owner")
+_CONTROL = ContextVar("completion_control", default=None)
 
 
 class CompletionError(ValueError):
@@ -45,6 +53,7 @@ def improvement_observer():
     spec = importlib.util.spec_from_file_location("completion_improvement", Path(__file__).with_name("check_improvement.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module.c = SimpleNamespace(**globals())
     return module
 
 
@@ -139,11 +148,187 @@ def read_reference(ref):
     return decode(raw)
 
 
+@contextmanager
+def stored_controls(state, location=None):
+    """Only historical control readers use this task-local snapshot context."""
+    rows = state.get("control_records", [])
+    if not isinstance(rows, list) or len(rows) > 256:
+        raise CompletionError("expected bounded control records")
+    seen = set()
+    for row in rows:
+        fields(row, ("path", "sha256", "data"))
+        key = (str(path(row["path"])), digest(row["sha256"]))
+        if key in seen or not isinstance(row["data"], str):
+            raise CompletionError("duplicate or malformed control record")
+        seen.add(key)
+        try:
+            raw = base64.b64decode(row["data"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise CompletionError("invalid control record bytes") from exc
+        if len(raw) > MAX_BYTES or sha(raw) != row["sha256"]:
+            raise CompletionError("control record digest differs")
+    token = _CONTROL.set((state, str(location) if location else None))
+    try:
+        yield state
+    finally:
+        _CONTROL.reset(token)
+
+
+def control_bytes(filename, expected=None):
+    filename = str(path(str(filename)))
+    current = _CONTROL.get()
+    if current:
+        for row in reversed(current[0].get("control_records", [])):
+            if row["path"] == filename and (expected is None or row["sha256"] == expected):
+                raw = base64.b64decode(row["data"], validate=True)
+                if sha(raw) != row["sha256"]:
+                    raise CompletionError("control record digest differs")
+                return raw
+    return raw_file(filename)
+
+
+def control_reference(ref):
+    fields(ref, ("path", "sha256"))
+    if sha(control_bytes(ref["path"], digest(ref["sha256"]))) != ref["sha256"]:
+        raise CompletionError("source bytes changed: " + ref["path"])
+    return ref
+
+
+def read_control(ref):
+    fields(ref, ("path", "sha256"))
+    raw = control_bytes(ref["path"], digest(ref["sha256"]))
+    if sha(raw) != ref["sha256"]:
+        raise CompletionError("source bytes changed: " + ref["path"])
+    return decode(raw)
+
+
+def remember_control(state, ref, raw=None):
+    """Called only for the explicitly selected control roles, never source files."""
+    fields(ref, ("path", "sha256"))
+    rows = state.setdefault("control_records", [])
+    if any((r["path"], r["sha256"]) == (ref["path"], ref["sha256"]) for r in rows):
+        return
+    raw = raw_file(ref["path"]) if raw is None else raw
+    if sha(raw) != digest(ref["sha256"]):
+        raise CompletionError("control bytes changed before publication")
+    rows.append({**ref, "data": base64.b64encode(raw).decode("ascii")})
+    if len(rows) > 256:
+        raise CompletionError("excessive control records")
+
+
+def capture_controls(state, *, final=False, result_raw=None, location=None):
+    """Save the exact accepted inputs in the same CAS as their references."""
+    if not state.get("scope"):
+        return
+    with stored_controls(state, location):
+        def keep(ref):
+            if ref:
+                remember_control(state, ref, control_bytes(ref["path"], ref["sha256"]))
+        keep(state["scope"]); keep(state["review"])
+        scope = read_control(state["scope"])
+        scope = filesystem_scope(state["scope"], scope, state)
+        keep(scope["request"])
+        for owner in scope["owners"]:
+            keep(owner.get("original", {}).get("snapshot"))
+        for resource in state["resources"]:
+            keep(resource["basis"])
+        keep(state.get("status_basis"))
+        keep(state.get("handoff", {}).get("basis"))
+        for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
+            binding = state.get(name)
+            for _ in range(MAX_OWNER_RECOVERIES):
+                if not binding:
+                    break
+                keep(binding["evidence"]); keep(binding["review"])
+                evidence = read_control(binding["evidence"])
+                keep(evidence.get("authorization"))
+                for owner in evidence.get("owners", []):
+                    for ref in owner.get("snapshots", {}).values():
+                        keep(ref)
+                for item in evidence.get("files", []):
+                    for ref in item.get("basis", []):
+                        keep(ref)
+                binding = evidence.get("previous")
+        for check in scope["checks"]:
+            if check["kind"] == "improvement":
+                keep(check["target"]["plan"])
+                for case in read_control(check["target"]["plan"])["cases"]:
+                    keep(case["input"]); keep(case["baseline"])
+        if state.get("final_review"):
+            keep(state["final_review"])
+            filename = state["result_path"]
+            raw = result_raw if result_raw is not None else raw_file(filename) if final else control_bytes(filename)
+            remember_control(state, {"path": filename, "sha256": sha(raw)}, raw)
+            result = decode(raw)
+            fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates", "exception_groups"))
+            if not isinstance(result["checks"], dict) or not isinstance(result["exceptions"], dict):
+                raise CompletionError("result checks and exceptions must be objects")
+            exception_view(result)
+            for classification in [*result["exceptions"].values(),
+                                   *(g["classification"] for g in result.get("exception_groups", []))]:
+                for ref in classification["basis"]:
+                    keep(ref)
+            for check in scope["checks"]:
+                retained = result["checks"][check["id"]].get("retained_branch")
+                if retained:
+                    keep(retained["basis"])
+                if check["kind"] in {"evidence", "improvement"}:
+                    ref = {"path": check["target"]["path"], "sha256": result["checks"][check["id"]]["sha256"]}
+                    keep(ref)
+                    if check["kind"] == "improvement":
+                        for case in read_control(ref)["cases"]:
+                            keep(case["after"])
+            if final and "record_root" in scope:
+                state["record_manifest"] = record_inventory(scope["record_root"])
+
+
+def state_location(scope):
+    current = _CONTROL.get()
+    return current[1] if current and current[1] else scope["state_path"]
+
+
+def validate_state_identity(scope, state, location):
+    original = state.get("origin", {"session_id": state["session_id"], "state_path": str(location)})
+    fields(original, ("session_id", "state_path"))
+    if (original["session_id"], original["state_path"]) != (scope["session_id"], scope["state_path"]):
+        raise CompletionError("original task identity changed")
+    if (scope["task_id"] != state["task_id"]
+            or ("origin" in state and path(str(location)) != path(original["state_path"]).parent / (state["session_id"] + ".json"))
+            or path(str(location)).parent != path(original["state_path"]).parent):
+        raise CompletionError("current session identity changed")
+
+
+@contextmanager
+def bound_state(location):
+    raw = raw_file(location)
+    state = decode(raw)
+    fields(state, STATE_FIELDS, STATE_OPTIONAL)
+    with stored_controls(state, location):
+        if state["intent"] != "closure":
+            raise CompletionError("invalid closure intent")
+        if state["scope"] is not None:
+            validate_state_identity(read_control(state["scope"]), state, location)
+        yield state
+
+
+def contextual_map(pool, function, values):
+    return pool.map(lambda pair: pair[0].run(function, pair[1]),
+                    [(copy_context(), value) for value in values])
+
+
 def refs(values):
     if not isinstance(values, list) or not 1 <= len(values) <= 32:
         raise CompletionError("expected 1..32 source references")
     for ref in values:
         reference(ref)
+    return values
+
+
+def control_refs(values):
+    if not isinstance(values, list) or not 1 <= len(values) <= 32:
+        raise CompletionError("expected 1..32 control references")
+    for ref in values:
+        control_reference(ref)
     return values
 
 
@@ -346,7 +531,7 @@ def owner_refs(values, recovery=None):
         if repo_identity(original["repository"]) != original["identity"]:
             raise CompletionError("owner repository identity changed")
         if "snapshot" in original:
-            snapshot = reference(original["snapshot"])
+            snapshot = control_reference(original["snapshot"])
             if path(snapshot["path"]).is_relative_to(path(original["repository"])):
                 raise CompletionError("owner snapshot must be preserved outside its source repository")
             if snapshot["sha256"] != digest(ref["sha256"]):
@@ -396,7 +581,7 @@ def owner_history_identity_slots(binding):
         if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
             raise CompletionError("cyclic or excessive owner recovery history")
         seen.add(identity)
-        evidence = read_reference(binding["evidence"])
+        evidence = read_control(binding["evidence"])
         slots.extend(owner_identity_slots(evidence))
         binding = evidence.get("previous")
     return slots
@@ -405,15 +590,15 @@ def owner_history_identity_slots(binding):
 def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), state=None):
     """Reconcile exact reviewed owner drifts without replacing the frozen scope."""
     fields(binding, ("evidence", "review"))
-    evidence = read_reference(binding["evidence"])
+    evidence = read_control(binding["evidence"])
     fields(evidence, ("scope_sha256", "task_id", "session_id", "authorization", "owners"), ("previous",))
     identity = binding["evidence"]["sha256"]
     if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
         raise CompletionError("cyclic or excessive owner recovery history")
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("owner recovery belongs to another frozen task")
-    reference(evidence["authorization"])
-    reviewed = read_reference(binding["review"])
+    control_reference(evidence["authorization"])
+    reviewed = read_control(binding["review"])
     if reviewed != {"scope_sha256": scope_ref["sha256"], "recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("independent recovery review does not cover these exact bytes")
     if not isinstance(evidence["owners"], list) or not 1 <= len(evidence["owners"]) <= len(scope["owners"]):
@@ -421,8 +606,8 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
     if not historical and state and "filesystem_recovery" in state:
         # The explicit device review covers both frozen scope and owner-source
         # identities. Only this in-memory view changes; evidence bytes survive.
-        filesystem_scope(scope_ref, read_reference(scope_ref), state)
-        rows = {row["path"]: row for row in read_reference(state["filesystem_recovery"]["evidence"])["identities"]}
+        filesystem_scope(scope_ref, read_control(scope_ref), state)
+        rows = {row["path"]: row for row in read_control(state["filesystem_recovery"]["evidence"])["identities"]}
         for slot in owner_identity_slots(evidence):
             row = rows.get(slot["common_dir"])
             if row and {k: slot[k] for k in ("device", "inode")} == row["before"]:
@@ -440,7 +625,7 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
             snapshots = owner["snapshots"]
             fields(snapshots, ("original", "current"))
             for snapshot in snapshots.values():
-                reference(snapshot)
+                control_reference(snapshot)
                 if path(snapshot["path"]) == path(owner["owner_path"]):
                     raise CompletionError("owner recovery snapshots must retain separate source files")
             if snapshots["original"]["sha256"] != selected[0]["sha256"]:
@@ -487,12 +672,12 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
 def source_preservation(scope_ref, scope, binding):
     """Bind exact pre-existing foreign regions without replacing source obligations."""
     fields(binding, ("evidence", "review"))
-    evidence = read_reference(binding["evidence"])
+    evidence = read_control(binding["evidence"])
     fields(evidence, ("scope_sha256", "task_id", "session_id", "previous_state_sha256", "authorization", "reason", "files"))
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("source preservation differs from the frozen scope/task/session")
-    digest(evidence["previous_state_sha256"]); reference(evidence["authorization"]); text(evidence["reason"])
-    if read_reference(binding["review"]) != {"scope_sha256": scope_ref["sha256"],
+    digest(evidence["previous_state_sha256"]); control_reference(evidence["authorization"]); text(evidence["reason"])
+    if read_control(binding["review"]) != {"scope_sha256": scope_ref["sha256"],
             "source_preservation_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("source preservation requires review of the exact scope and evidence")
     files = evidence["files"]
@@ -501,7 +686,7 @@ def source_preservation(scope_ref, scope, binding):
     preserved = {}
     for entry in files:
         fields(entry, ("check_id", "file", "owner", "basis", "ranges"))
-        text(entry["owner"]); refs(entry["basis"])
+        text(entry["owner"]); control_refs(entry["basis"])
         selected = [check for check in scope["checks"] if check["id"] == entry["check_id"] and check["kind"] == "git_source"]
         if len(selected) != 1 or selected[0]["category"] != "source":
             raise CompletionError("preservation requires an existing source obligation")
@@ -523,7 +708,7 @@ def source_preservation(scope_ref, scope, binding):
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
             raise CompletionError("preservation requires the captured main revision")
         base = git(repo, "show", "--no-ext-diff", "--no-textconv", revision + ":" + filename)
-        original = raw_file(owner["original"]["snapshot"]["path"])
+        original = control_bytes(owner["original"]["snapshot"]["path"], owner["original"]["snapshot"]["sha256"])
         if sha(original) != owner["sha256"]:
             raise CompletionError("preserved original owner bytes changed")
         ranges = entry["ranges"]
@@ -594,15 +779,16 @@ def filesystem_view(scope_ref, scope, state):
         return scope, resources
     binding = state["filesystem_recovery"]
     fields(binding, ("evidence", "review"))
-    evidence = read_reference(binding["evidence"])
+    evidence = read_control(binding["evidence"])
     fields(evidence, ("scope_sha256", "task_id", "session_id", "previous_state_sha256", "authorization", "identities"))
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("filesystem recovery belongs to another task")
-    if (state.get("task_id"), state.get("session_id"), state.get("scope")) != (scope["task_id"], scope["session_id"], scope_ref):
+    if (state.get("task_id"), state.get("scope")) != (scope["task_id"], scope_ref):
         raise CompletionError("filesystem recovery binding differs")
+    validate_state_identity(scope, state, state_location(scope))
     digest(evidence["previous_state_sha256"])
-    reference(evidence["authorization"])
-    if read_reference(binding["review"]) != {"scope_sha256": scope_ref["sha256"], "filesystem_recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
+    control_reference(evidence["authorization"])
+    if read_control(binding["review"]) != {"scope_sha256": scope_ref["sha256"], "filesystem_recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("filesystem recovery needs exact independent review")
     projected = decode(canonical(scope))
     slots = []
@@ -644,8 +830,13 @@ def filesystem_view(scope_ref, scope, state):
             if row is None or seen[location] not in (row["before"], row["after"]) or original not in (row["before"], row["after"]):
                 raise CompletionError("inconsistent frozen filesystem identities")
         seen[location] = original
-        current = record_directory(location)
-        current = {k: current[k] for k in ("device", "inode")}
+        missing_records = (_CONTROL.get() and location == projected.get("record_root", {}).get("path")
+                           and not os.path.lexists(location))
+        if missing_records:
+            current = replacements.get(location, {}).get("after", original)
+        else:
+            current = record_directory(location)
+            current = {k: current[k] for k in ("device", "inode")}
         if current != original:
             row = replacements.get(location)
             if row is None or row["before"] != original or row["after"] != current:
@@ -654,9 +845,9 @@ def filesystem_view(scope_ref, scope, state):
             slot.update(current)
     if changed != set(replacements):
         raise CompletionError("filesystem recovery omitted changes or added unrelated paths")
-    reference(scope_ref)
-    reference(binding["evidence"]); reference(binding["review"])
-    reference(evidence["authorization"])
+    control_reference(scope_ref)
+    control_reference(binding["evidence"]); control_reference(binding["review"])
+    control_reference(evidence["authorization"])
     return projected, resources
 
 
@@ -702,6 +893,19 @@ def reviewed_record_inventory(record, final_review, *, inventory=None):
     return sha(canonical(inventory))
 
 
+def checked_record_inventory(scope, state, final_review):
+    """Validate surviving staging files separately from accepted control bytes."""
+    record = scope["record_root"]
+    current = record_inventory(record)
+    reviewed = state.get("record_manifest")
+    if reviewed is None:
+        return reviewed_record_inventory(record, final_review, inventory=current)
+    if not isinstance(reviewed, dict) or any(name not in reviewed or reviewed[name] != value
+                                            for name, value in current.items()):
+        raise CompletionError("task records changed or gained unreviewed files")
+    return reviewed_record_inventory(record, final_review, inventory=reviewed)
+
+
 def protect_completion_records(check, protected):
     """Absence checks must not require removal of their own verification inputs."""
     if check["kind"] not in {"absent", "worktree_absent"}:
@@ -716,8 +920,9 @@ def protect_completion_records(check, protected):
 def validate_record_root(scope):
     record = scope["record_root"]
     fields(record, ("path", "device", "inode"))
-    if record_directory(record["path"]) != record:
-        raise CompletionError("record root identity changed")
+    if not (_CONTROL.get() and not os.path.lexists(record["path"])):
+        if record_directory(record["path"]) != record:
+            raise CompletionError("record root identity changed")
     root = path(record["path"])
     protected = [*scope["repositories"], *scope["artifact_roots"], scope["state_path"],
                  scope["environment"]["workspace"], *(owner["path"] for owner in scope["owners"])]
@@ -742,7 +947,7 @@ def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
     text(scope["task_id"]); text(scope["session_id"])
-    reference(scope["request"]); digest(scope["request_digest"])
+    control_reference(scope["request"]); digest(scope["request_digest"])
     owners = owner_refs(scope["owners"], recovery)
     fields(scope["categories"], CATEGORIES)
     if not isinstance(scope["checks"], list) or len(scope["checks"]) > 128:
@@ -887,19 +1092,26 @@ def http_expectation(expected):
     return expected
 
 
-def draft_result(scope_ref, expectations=None):
+def draft_result(scope_ref, expectations=None, *, state_path=None):
+    if state_path is not None:
+        with bound_state(state_path):
+            return _draft_result(scope_ref, expectations)
+    return _draft_result(scope_ref, expectations)
+
+
+def _draft_result(scope_ref, expectations=None):
     """Collect a candidate, never acceptance or an independently reviewed result.
 
     HTTP expectations must come from the owner, not the running endpoint. Source
     file digests come from committed main, so dirty working bytes cannot silently
     become the intended source. Exceptions remain empty for explicit review.
     """
-    scope = read_reference(scope_ref)
+    scope = read_control(scope_ref)
     recovery = None
-    state_raw = raw_file(scope["state_path"]) if path(scope["state_path"]).is_file() else None
+    state_raw = raw_file(state_location(scope)) if path(state_location(scope)).is_file() else None
     state = decode(state_raw) if state_raw is not None else {}
     if "owner_recovery" in state or "source_preservation" in state:
-        if (state.get("task_id"), state.get("session_id"), state.get("intent"), state.get("scope")) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
+        if (state.get("task_id"), state.get("intent"), state.get("scope")) != (scope["task_id"], "closure", scope_ref):
             raise CompletionError("current resource pointer differs from frozen task")
     scope = filesystem_scope(scope_ref, scope, state)
     if "owner_recovery" in state:
@@ -950,18 +1162,18 @@ def draft_result(scope_ref, expectations=None):
         raise CompletionError("unsupported candidate observation")
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        values = dict(pool.map(collect, checks.items()))
+        values = dict(contextual_map(pool, collect, checks.items()))
     updates = {ref["path"]: (sha(raw_file(ref["path"])) if os.path.lexists(path(ref["path"])) else None)
                for ref in scope["owners"] if "original" in ref}
     updates = {name: value for name, value in updates.items()
                if value != next(ref["sha256"] for ref in scope["owners"] if ref["path"] == name)}
-    reference(scope_ref); reference(scope["request"])
+    control_reference(scope_ref); control_reference(scope["request"])
     if recovery:
         owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
     if "source_preservation" in state:
         source_preservation(scope_ref, scope, state["source_preservation"])
     if recovery or "source_preservation" in state:
-        if raw_file(scope["state_path"]) != state_raw:
+        if raw_file(state_location(scope)) != state_raw:
             raise CompletionError("recovery binding changed during candidate collection")
     current_owners(scope["owners"], updates, recovery)
     result = {"scope_sha256": scope_ref["sha256"], "checks": values, "exceptions": {}}
@@ -978,8 +1190,9 @@ def observe(check, expected, *, preserved=None, owners=()):
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
         fields(expected, ("sha256",))
-        actual = sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
-                              links=kind == "installed_file"))
+        actual = (sha(control_bytes(target["path"], expected["sha256"])) if kind == "evidence" else
+                  sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
+                               links=kind == "installed_file")))
         if actual != digest(expected["sha256"]):
             raise CompletionError("file differs from reviewed bytes")
         if kind == "installed_file":
@@ -1071,7 +1284,7 @@ def observe(check, expected, *, preserved=None, owners=()):
                     raise CompletionError("working path has not returned to main")
             else:
                 fields(retained, ("name", "owner", "basis"))
-                name = text(retained["name"]); text(retained["owner"]); reference(retained["basis"])
+                name = text(retained["name"]); text(retained["owner"]); control_reference(retained["basis"])
                 validate_ref_observer("ref_absent", "refs/heads/" + name)
                 if name == main or branch != name or git(repo, "rev-parse", "HEAD").decode().strip() != local:
                     raise CompletionError("retained foreign checkout must name the current non-main branch at reviewed main")
@@ -1127,7 +1340,7 @@ def exception_view(result):
         fields(value, ("owner", "reason", "scope", "removal_condition", "basis"))
         for key in ("owner", "reason", "scope", "removal_condition"):
             text(value[key])
-        refs(value["basis"])
+        control_refs(value["basis"])
 
     for value in inline.values():
         classification(value)
@@ -1149,13 +1362,35 @@ def exception_view(result):
     return merged
 
 
-def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
+def final_review_fields(scope_ref, scope, state, result_sha, review_path, *, fresh_inventory=False, stopped=False):
+    expected = {"scope_sha256": scope_ref["sha256"], "result_sha256": result_sha, "status": "No Findings"}
+    for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
+        if name in state:
+            expected[name + "_sha256"] = state[name]["evidence"]["sha256"]
+    if "record_root" in scope:
+        expected["record_inventory_sha256"] = (reviewed_record_inventory(scope["record_root"], review_path)
+            if fresh_inventory else checked_record_inventory(scope, state, review_path))
+    if stopped:
+        expected["disposition"] = "stopped"
+    return expected
+
+
+def check_scope(scope_ref, result_path, *, state_path=None, **options):
+    if state_path is not None:
+        with bound_state(state_path):
+            return _check_scope(scope_ref, result_path, **options)
+    return _check_scope(scope_ref, result_path, **options)
+
+
+def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
     started = time.monotonic()
-    scope = read_reference(scope_ref)
-    state_raw = raw_file(scope["state_path"])
+    scope = read_control(scope_ref)
+    location = state_location(scope)
+    state_raw = raw_file(location)
     state = decode(state_raw)
-    fields(state, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery"))
-    if (state["task_id"], state["session_id"], state["intent"], state["scope"]) != (scope["task_id"], scope["session_id"], "closure", scope_ref):
+    fields(state, STATE_FIELDS, STATE_OPTIONAL)
+    validate_state_identity(scope, state, location)
+    if (state["task_id"], state["intent"], state["scope"]) != (scope["task_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
     scope, resources = filesystem_view(scope_ref, scope, state)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
@@ -1167,7 +1402,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         raise CompletionError("task identity differs from host")
     if request_digest is not None and scope["request_digest"] != request_digest:
         raise CompletionError("original request differs from host")
-    result_raw = raw_file(result_path)
+    result_raw = control_bytes(result_path)
     result = decode(result_raw)
     fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates", "exception_groups"))
     if not isinstance(result["checks"], dict) or result["scope_sha256"] != scope_ref["sha256"] or set(result["checks"]) != set(checks):
@@ -1190,21 +1425,14 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         reference(state.get("status_basis"))
     elif state["outcome"] != "working":
         raise CompletionError("task is waiting or stopped, not completed")
-    selected_review = reference(review_ref if review_ref is not None else state["review"])
-    reviewed = read_reference(selected_review)
+    selected_review = control_reference(review_ref if review_ref is not None else state["review"])
+    reviewed = read_control(selected_review)
     fields(reviewed, ("scope_sha256", "status"))
     if reviewed != {"scope_sha256": scope_ref["sha256"], "status": "No Findings"}:
         raise CompletionError("scope review does not cover these exact scope bytes")
-    selected_final = reference(final_review_ref if final_review_ref is not None else state["final_review"])
-    reviewed_final = read_reference(selected_final)
-    expected_review = {"scope_sha256": scope_ref["sha256"], "result_sha256": sha(result_raw), "status": "No Findings"}
-    if "filesystem_recovery" in state:
-        expected_review["filesystem_recovery_sha256"] = state["filesystem_recovery"]["evidence"]["sha256"]
-    if "record_root" in scope:
-        expected_review["record_inventory_sha256"] = reviewed_record_inventory(scope["record_root"], selected_final["path"])
-    if recovery: expected_review["owner_recovery_sha256"] = state["owner_recovery"]["evidence"]["sha256"]
-    if preserved: expected_review["source_preservation_sha256"] = state["source_preservation"]["evidence"]["sha256"]
-    if stopped: expected_review["disposition"] = "stopped"
+    selected_final = control_reference(final_review_ref if final_review_ref is not None else state["final_review"])
+    reviewed_final = read_control(selected_final)
+    expected_review = final_review_fields(scope_ref, scope, state, sha(result_raw), selected_final["path"], stopped=stopped)
     if reviewed_final != expected_review:
         raise CompletionError("final review does not cover these exact expectations and exceptions")
     failures, observed = [], {}
@@ -1222,7 +1450,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
             return key, None, str(exc)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for key, observation, failure in pool.map(inspect, [(key, value, result["checks"][key]) for key, value in checks.items()]):
+        for key, observation, failure in contextual_map(pool, inspect, [(key, value, result["checks"][key]) for key, value in checks.items()]):
             if failure:
                 failures.append({"id": key, "reason": failure})
             else:
@@ -1234,7 +1462,7 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
     for resource in resources:
         fields(resource, ("id", "kind", "target", "basis"))
         try:
-            reference(resource["basis"])
+            control_reference(resource["basis"])
             if resource["kind"] not in CLEANUP_KINDS:
                 raise CompletionError("unresolved reservation or unsupported host resource observation")
             observe(resource, {})
@@ -1277,24 +1505,24 @@ def check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, re
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
     # Recheck immutable inputs and accumulated handles after observations.
-    filesystem_scope(scope_ref, read_reference(scope_ref), state)
-    reference(scope_ref); reference(scope["request"])
+    filesystem_scope(scope_ref, read_control(scope_ref), state)
+    control_reference(scope_ref); control_reference(scope["request"])
     if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
     if preserved: source_preservation(scope_ref, scope, state["source_preservation"])
-    current_owners(scope["owners"], result.get("owner_updates", {}), recovery); reference(selected_review)
-    reference(selected_final)
-    if "record_root" in scope and expected_review["record_inventory_sha256"] != reviewed_record_inventory(scope["record_root"], selected_final["path"]):
+    current_owners(scope["owners"], result.get("owner_updates", {}), recovery); control_reference(selected_review)
+    control_reference(selected_final)
+    if "record_root" in scope and expected_review["record_inventory_sha256"] != checked_record_inventory(scope, state, selected_final["path"]):
         raise CompletionError("task records changed during inspection")
     exception_view(result)
     if scope["environment"] != environment(scope["environment"]["workspace"]):
         raise CompletionError("observer environment changed during inspection")
-    if raw_file(result_path) != result_raw or raw_file(scope["state_path"]) != state_raw:
+    if control_bytes(result_path) != result_raw or raw_file(location) != state_raw:
         raise CompletionError("completion input or accumulated resources changed during inspection")
     if stopped: reference(state["status_basis"])
     answer = {"complete": not failures and not stopped, "stopped": stopped and not failures, "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
             "checked_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
             "observed": observed, "failures": failures, "exceptions": result["exceptions"],
-            "resource_state": {"path": scope["state_path"], "sha256": sha(state_raw)},
+            "resource_state": {"path": location, "sha256": sha(state_raw)},
             "owner_paths": [ref["path"] for ref in scope["owners"]],
             "assurance": "mechanical observations; scope, consent, quality and reviewer independence remain owner judgments"}
     if "exception_groups" in result:
@@ -1321,11 +1549,11 @@ def main(argv=None):
     begin = sub.add_parser("prepare", help="capture beginning observations before implementation; independent review freezes the output")
     begin.add_argument("--seed", required=True); begin.add_argument("--output", required=True)
     draft = sub.add_parser("draft", help="collect candidate expectations; independent final review is still required")
-    draft.add_argument("--scope", required=True); draft.add_argument("--sha256", required=True)
+    draft.add_argument("--scope"); draft.add_argument("--sha256"); draft.add_argument("--state")
     draft.add_argument("--output", required=True)
     draft.add_argument("--expectations", help="JSON with exactly the owner-selected HTTP check IDs and revision/health expectations")
     check = sub.add_parser("check", help="observe exact fixed obligations without executing input commands")
-    check.add_argument("--scope", required=True); check.add_argument("--sha256", required=True)
+    check.add_argument("--scope"); check.add_argument("--sha256"); check.add_argument("--state")
     check.add_argument("--result", required=True)
     check.add_argument("--stopped", action="store_true", help="verify terminal resource release; never marks the goal complete")
     check.add_argument("--task-id"); check.add_argument("--request-digest"); check.add_argument("--workspace")
@@ -1333,15 +1561,23 @@ def main(argv=None):
     check.add_argument("--final-review"); check.add_argument("--final-review-sha256")
     args = parser.parse_args(argv)
     try:
+        if args.command != "prepare":
+            if args.state:
+                with bound_state(args.state) as state:
+                    if args.scope and {"path": args.scope, "sha256": args.sha256} != state["scope"]:
+                        raise CompletionError("explicit scope differs from the bound task")
+                    args.scope, args.sha256 = state["scope"]["path"], state["scope"]["sha256"]
+            elif not args.scope or not args.sha256:
+                raise CompletionError("provide --state or exact --scope/--sha256")
         if args.command == "prepare":
             answer = write_new(args.output, prepare(decode(raw_file(args.seed))))
         elif args.command == "draft":
             value = draft_result({"path": args.scope, "sha256": args.sha256},
-                                 decode(raw_file(args.expectations)) if args.expectations else None)
+                                 decode(raw_file(args.expectations)) if args.expectations else None, state_path=args.state)
             answer = {**write_new(args.output, value), "review_required": True}
         else:
             answer = check_scope({"path": args.scope, "sha256": args.sha256}, args.result,
-                                 task_id=args.task_id, request_digest=args.request_digest, workspace=args.workspace, stopped=args.stopped,
+                                 state_path=args.state, task_id=args.task_id, request_digest=args.request_digest, workspace=args.workspace, stopped=args.stopped,
                                  review_ref={"path": args.review, "sha256": args.review_sha256} if args.review else None,
                                  final_review_ref={"path": args.final_review, "sha256": args.final_review_sha256} if args.final_review else None)
         print(canonical(answer).decode())

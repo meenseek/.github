@@ -44,7 +44,7 @@ def protect_records(state, filename, resources):
         protected.append(state["result_path"])
     checks = []
     if state.get("scope"):
-        scope = c.read_reference(state["scope"])
+        scope = c.read_control(state["scope"])
         protected.append(scope["request"]["path"])
         if scope.get("record_root"):
             protected.append(scope["record_root"]["path"])
@@ -137,12 +137,17 @@ def replace(filename, value, expected):
 def load_state(filename):
     raw = c.raw_file(str(filename))
     value = c.decode(raw)
-    c.fields(value, ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome"), ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup"))
+    c.fields(value, c.STATE_FIELDS, c.STATE_OPTIONAL)
     if value["intent"] != "closure": raise c.CompletionError("invalid closure intent")
     return value, c.sha(raw)
 
 
 def task_context(state, filename, session):
+    with c.stored_controls(state, filename):
+        return _task_context(state, filename, session)
+
+
+def _task_context(state, filename, session):
     """Read the bound goal, without executing its observations or inferring a new one."""
     if state["session_id"] != session:
         raise c.CompletionError("session binding changed")
@@ -151,13 +156,14 @@ def task_context(state, filename, session):
         context.update(request_digest=state["cleanup"]["request_digest"], record_cleanup_pending=True)
         return context
     if state["scope"] is not None:
-        scope = c.read_reference(state["scope"])
-        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], session, str(filename)):
-            raise c.CompletionError("goal differs from the frozen session binding")
-        context.update(request=c.reference(scope["request"]), request_digest=c.digest(scope["request_digest"]),
+        scope = c.read_control(state["scope"])
+        c.validate_state_identity(scope, state, filename)
+        context.update(request=c.control_reference(scope["request"]), request_digest=c.digest(scope["request_digest"]),
                        obligations=[check["id"] for check in scope["checks"]])
+        preview = c.control_bytes(scope["request"]["path"], scope["request"]["sha256"]).decode("utf-8", errors="replace")
+        context.update(state_path=str(filename), request_preview=preview[:4096], request_preview_truncated=len(preview) > 4096)
     if state["outcome"] in {"waiting", "blocked", "cancelled"}:
-        context["status_basis"] = c.reference(state["status_basis"])
+        context["status_basis"] = c.control_reference(state["status_basis"])
     return context
 
 
@@ -232,6 +238,11 @@ def finish_cleanup(filename, state, before):
 
 
 def close_checked(filename, state, before, scope, answer, measurement_turns=None):
+    with c.stored_controls(state, filename):
+        return _close_checked(filename, state, before, scope, answer, measurement_turns)
+
+
+def _close_checked(filename, state, before, scope, answer, measurement_turns=None):
     if measurement_turns:answer={**answer,'measurement_turns':list(dict.fromkeys(c.text(t) for t in measurement_turns))}
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
@@ -250,11 +261,11 @@ def close_checked(filename, state, before, scope, answer, measurement_turns=None
         if not c.path(value).is_relative_to(c.path(record["path"])):
             raise c.CompletionError("completion inputs must be inside the task record root")
     manifest = c.record_inventory(record)
-    reviewed = c.read_reference(state["final_review"])
+    reviewed = c.read_control(state["final_review"])
     review_name = str(c.path(state["final_review"]["path"]).relative_to(c.path(record["path"])))
-    if manifest[review_name]["sha256"] != state["final_review"]["sha256"]:
+    if review_name in manifest and manifest[review_name]["sha256"] != state["final_review"]["sha256"]:
         raise c.CompletionError("final review changed after inspection")
-    if c.reviewed_record_inventory(record, state["final_review"]["path"], inventory=manifest) != reviewed["record_inventory_sha256"]:
+    if c.checked_record_inventory(scope, state, state["final_review"]["path"]) != reviewed["record_inventory_sha256"]:
         raise c.CompletionError("task records changed after final review")
     measurement_cleanup(state, answer, binding_path=filename, preparing=True, scope=scope)
     state["cleanup"] = {"record_root": record, "manifest": manifest,
@@ -274,6 +285,19 @@ def desktop_workspace(cwd, desktop):
 
 
 def hook(payload, root=ROOT, measurement_root=None):
+    filename = pointer(root, c.text(payload.get("session_id")))
+    if filename.exists():
+        try:
+            state, _ = load_state(filename)
+            with c.stored_controls(state, filename):
+                return _hook(payload, root, measurement_root)
+        except (c.CompletionError, OSError, ValueError, TypeError, KeyError):
+            # The normal handler emits scoped guidance or the bounded Stop error.
+            return _hook(payload, root, measurement_root)
+    return _hook(payload, root, measurement_root)
+
+
+def _hook(payload, root=ROOT, measurement_root=None):
     measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
     event = payload.get("hook_event_name")
     if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return measured
@@ -306,13 +330,13 @@ def hook(payload, root=ROOT, measurement_root=None):
             command = "release" if state["cleanup"].get("answer", {}).get("stopped") else "complete/unbind"
             raise c.CompletionError("검사 통과 후 임시 기록 삭제가 미완료입니다. 현재 task/request와 pointer SHA로 " + command + "를 재실행하세요")
         if state["outcome"] in {"waiting", "blocked", "cancelled"}:
-            c.reference(state.get("status_basis"))
+            c.control_reference(state.get("status_basis"))
             return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 작업 종료 조건이 남은 상태입니다. 파일 손상 여부를 이 상태만으로 판단하지 마세요. 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
         if state["outcome"] != "working" or state["scope"] is None:
             raise c.CompletionError("armed task has no frozen reviewed scope")
-        scope = c.read_reference(state["scope"])
-        if scope["state_path"] != str(filename): raise c.CompletionError("resource pointer is not bound to this session")
-        answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=str(cwd), review_ref=state["review"])
+        scope = c.read_control(state["scope"])
+        c.validate_state_identity(scope, state, filename)
+        answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=str(cwd), review_ref=state["review"], state_path=str(filename))
         if answer["complete"]: return {"systemMessage": "정리 검사 통과: 고정한 범위의 현재 관측 완료. 사용자 최종 보고에 적용·배포·잔여 자원·예외를 포함하세요."}
         reason = "정리 미완료: " + json.dumps(answer["failures"], ensure_ascii=False)[:3000]
     except (c.CompletionError, OSError, ValueError, TypeError, KeyError) as exc:
@@ -338,6 +362,49 @@ def configuration(original):
     return result
 
 
+def adopt_session(filename, state, before, args):
+    """Explicitly transfer a direct task; never infer work from another session."""
+    if args.from_session == args.session or state.get("execution_owner") != "direct":
+        raise c.CompletionError("use a distinct session and the registered execution owner's handoff")
+    scope = c.read_control(state["scope"])
+    if (args.task_id, args.request_digest) != (scope["task_id"], scope["request_digest"]):
+        raise c.CompletionError("handoff task/request differs")
+    target = pointer(filename.parent, args.session)
+    if os.path.lexists(target):
+        raise c.CompletionError("target session already has a task")
+    basis = c.control_reference({"path": args.basis, "sha256": args.basis_sha256})
+    pending = (state.get("handoff", {}).get("from_session") == args.from_session
+               and state["session_id"] == args.session)
+    if not pending and state["session_id"] != args.from_session:
+        raise c.CompletionError("handoff source session differs")
+    c.validate_state_identity(scope, {**state, "session_id": args.from_session}, filename)
+    proposed = {**state, "session_id": args.session,
+                "origin": state.get("origin", {"session_id": scope["session_id"], "state_path": scope["state_path"]}),
+                "handoff": {"from_session": args.from_session, "to_session": args.session, "basis": basis}}
+    c.capture_controls(proposed, location=target)
+    with c.stored_controls(proposed, target):
+        protect_records(proposed, target, proposed["resources"])
+    # Persist the intent first. An interrupted rename leaves the exact source
+    # retryable, without reconstructing its scope or resource inventory.
+    replace(filename, proposed, before)
+    os.rename(filename, target)
+    fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return {"path": str(target), "sha256": c.sha(c.raw_file(str(target))),
+            "task_id": state["task_id"], "origin_preserved": True}
+
+
+def publish(filename, state, before, *, final=False):
+    """Shared publication boundary for direct and registered Workspace callers."""
+    c.capture_controls(state, final=final, location=filename)
+    with c.stored_controls(state, filename):
+        protect_records(state, filename, state["resources"])
+    return replace(filename, state, before)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bindings", default=str(ROOT), help="private per-session pointer directory; host installation uses the default")
@@ -345,23 +412,26 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem"):
+    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
-        if name in {"complete", "unbind", "release"}:
+        if name in {"complete", "unbind", "release", "adopt"}:
             item.add_argument('--work-turn',action='append',help='Current explicit goal turn(s) to attach to automatic cleanup measurement; never infer them from an old binding')
             item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
             item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
+        if name == "adopt": item.add_argument("--from-session", required=True)
         if name == "bind":
             item.add_argument("--scope", required=True); item.add_argument("--scope-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
-        if name in {"reserve", "attach"}:
-            item.add_argument("--id", required=True); item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
+        if name in {"reserve", "attach", "adopt"}:
+            if name != "adopt": item.add_argument("--id", required=True)
+            item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
         if name == "attach": item.add_argument("--resource", required=True, help="JSON with fixed kind,target; actual tool handle and owner record")
         if name in {"finalize", "complete"}:
-            item.add_argument("--result", required=True); item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
+            item.add_argument("--result"); item.add_argument("--review"); item.add_argument("--review-sha256")
+            item.add_argument("--inputs", choices=("-",), help="read {result,review} JSON from stdin without staging files")
         if name in {"recover-owner", "preserve-source", "recover-filesystem"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
@@ -378,149 +448,185 @@ def main(argv=None):
         elif args.command == "configure":
             answer = c.write_new(args.output, configuration(c.decode(c.raw_file(args.existing))))
         else:
-            filename = pointer(Path(args.bindings), args.session)
+            filename = pointer(Path(args.bindings), args.from_session if args.command == "adopt" else args.session)
             with locked(filename.parent):
                 if args.command == "arm":
                     if os.path.lexists(filename): raise c.CompletionError("session already armed; reuse its current pointer")
                     state = {"task_id": c.text(args.task_id), "session_id": args.session, "intent": "closure",
-                             "scope": None, "review": None, "final_review": None, "result_path": None, "resources": [], "outcome": "working"}
+                             "scope": None, "review": None, "final_review": None, "result_path": None,
+                             "resources": [], "outcome": "working", "execution_owner": "direct"}
                     answer = replace(filename, state, None)
                 else:
                     state, before = load_state(filename)
-                    if before != c.digest(args.expected_sha256) or state["session_id"] != args.session:
+                    if before != c.digest(args.expected_sha256) or (args.command != "adopt" and state["session_id"] != args.session):
                         raise c.CompletionError("stale pointer or wrong session")
-                    if "cleanup" in state:
-                        if args.command not in {"complete", "unbind", "release"}:
-                            raise c.CompletionError("only complete/unbind/release can resume pending record cleanup")
-                        if (args.task_id, args.request_digest) != (state["task_id"], state["cleanup"]["request_digest"]):
-                            raise c.CompletionError("current task/request differs from pending record cleanup")
-                        if (args.command == "release") != (state["cleanup"]["answer"].get("stopped") is True):
-                            raise c.CompletionError("cleanup disposition differs from the checked outcome")
-                        answer = finish_cleanup(filename, state, before)
-                        print(c.canonical(answer).decode()); return 0
-                    if args.command in {"complete", "unbind", "release"}:
-                        goal = task_context(state, filename, args.session)
-                        if (c.text(args.task_id), c.digest(args.request_digest)) != (goal["task_id"], goal.get("request_digest")):
-                            raise c.CompletionError("current task/request differs from the frozen binding; preserve it and review the current goal")
-                    if args.command == "bind":
-                        if state["scope"] is not None: raise c.CompletionError("scope already frozen; recovery must not replace original obligations")
-                        scope_ref = c.reference({"path": args.scope, "sha256": args.scope_sha256})
-                        review_ref = c.reference({"path": args.review, "sha256": args.review_sha256})
-                        scope = c.read_reference(scope_ref); c.validate_scope(scope)
-                        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
-                            raise c.CompletionError("scope task/session/resource pointer differs")
-                        if c.read_reference(review_ref) != {"scope_sha256": args.scope_sha256, "status": "No Findings"}:
-                            raise c.CompletionError("review is not for this exact scope")
-                        proposed = {**state, "scope": scope_ref, "review": review_ref}
-                        protect_records(proposed, filename, state["resources"])
-                        state = proposed
-                    elif args.command in {"reserve", "attach"}:
-                        basis = c.reference({"path": args.basis, "sha256": args.basis_sha256})
-                        found = [r for r in state["resources"] if r["id"] == args.id]
-                        if args.command == "reserve":
-                            if found or len(state["resources"]) >= 128: raise c.CompletionError("duplicate or excessive resource reservation")
-                            state["resources"].append({"id": c.text(args.id), "kind": "reserved", "target": {}, "basis": basis})
+                    with c.stored_controls(state, filename):
+                        if args.command == "adopt":
+                            answer = adopt_session(filename, state, before, args)
+                            print(c.canonical(answer).decode()); return 0
+                        if "cleanup" in state:
+                            if args.command not in {"complete", "unbind", "release"}:
+                                raise c.CompletionError("only complete/unbind/release can resume pending record cleanup")
+                            if (args.task_id, args.request_digest) != (state["task_id"], state["cleanup"]["request_digest"]):
+                                raise c.CompletionError("current task/request differs from pending record cleanup")
+                            if (args.command == "release") != (state["cleanup"]["answer"].get("stopped") is True):
+                                raise c.CompletionError("cleanup disposition differs from the checked outcome")
+                            answer = finish_cleanup(filename, state, before)
+                            print(c.canonical(answer).decode()); return 0
+                        if args.command in {"complete", "unbind", "release"}:
+                            goal = task_context(state, filename, args.session)
+                            if (c.text(args.task_id), c.digest(args.request_digest)) != (goal["task_id"], goal.get("request_digest")):
+                                raise c.CompletionError("current task/request differs from the frozen binding; preserve it and review the current goal")
+                        if args.command == "bind":
+                            if state["scope"] is not None: raise c.CompletionError("scope already frozen; recovery must not replace original obligations")
+                            scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
+                            review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
+                            scope = c.read_control(scope_ref); c.validate_scope(scope)
+                            c.validate_state_identity(scope, state, filename)
+                            if c.read_control(review_ref) != {"scope_sha256": args.scope_sha256, "status": "No Findings"}:
+                                raise c.CompletionError("review is not for this exact scope")
+                            proposed = {**state, "scope": scope_ref, "review": review_ref}
+                            protect_records(proposed, filename, state["resources"])
+                            state.update(proposed)
+                        elif args.command in {"reserve", "attach"}:
+                            basis = c.control_reference({"path": args.basis, "sha256": args.basis_sha256})
+                            found = [r for r in state["resources"] if r["id"] == args.id]
+                            if args.command == "reserve":
+                                if found or len(state["resources"]) >= 128: raise c.CompletionError("duplicate or excessive resource reservation")
+                                state["resources"].append({"id": c.text(args.id), "kind": "reserved", "target": {}, "basis": basis})
+                            else:
+                                if len(found) != 1 or found[0]["kind"] != "reserved": raise c.CompletionError("resource must be reserved before creation")
+                                resource = c.decode(sys.stdin.buffer.read(c.MAX_BYTES + 1) if args.resource == "-"
+                                                    else c.raw_file(args.resource))
+                                c.fields(resource, ("kind", "target"))
+                                if resource["kind"] not in {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"} or not isinstance(resource["target"], dict):
+                                    raise c.CompletionError("pointer covers temporary resources only; retained outputs/runtime need fixed owner scope checks")
+                                if resource["kind"] in {"ref_absent", "remote_ref_absent"}:
+                                    c.validate_ref_observer(resource["kind"], resource["target"].get("ref"))
+                                if resource["kind"] == "remote_ref_absent":
+                                    target = resource["target"]
+                                    target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
+                                protect_records(state, filename, [resource])
+                                found[0].update(resource, basis=basis)
+                        elif args.command == "recover-filesystem":
+                            if state["outcome"] != "waiting" or state["scope"] is None or "filesystem_recovery" in state:
+                                raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem recovery")
+                            c.control_reference(state.get("status_basis"))
+                            binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                       "review": {"path": args.review, "sha256": args.review_sha256}}
+                            evidence = c.read_control(binding["evidence"])
+                            if evidence["previous_state_sha256"] != before:
+                                raise c.CompletionError("filesystem recovery is not for the exact previous pointer")
+                            proposed = {**state, "filesystem_recovery": binding}
+                            if bool(args.owner_recovery) != bool(args.owner_recovery_sha256):
+                                raise c.CompletionError("companion owner recovery requires both path and SHA")
+                            if args.owner_recovery:
+                                companion = c.read_control({"path": args.owner_recovery, "sha256": args.owner_recovery_sha256})
+                                c.fields(companion, ("evidence", "review"))
+                                if c.read_control(companion["evidence"]).get("previous") != state.get("owner_recovery"):
+                                    raise c.CompletionError("companion recovery must preserve the exact previous owner binding")
+                                proposed["owner_recovery"] = companion
+                            scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), proposed)
+                            recovery = c.owner_recovery(state["scope"], scope, proposed["owner_recovery"], state=proposed) if "owner_recovery" in proposed else None
+                            c.validate_scope(scope, recovery)
+                            state["filesystem_recovery"] = binding
+                            if args.owner_recovery:
+                                state["owner_recovery"] = companion
+                        elif args.command == "recover-owner":
+                            if state["outcome"] != "waiting" or state["scope"] is None:
+                                raise c.CompletionError("owner recovery requires the existing waiting binding")
+                            c.control_reference(state.get("status_basis"))
+                            binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                       "review": {"path": args.review, "sha256": args.review_sha256}}
+                            evidence = c.read_control(binding["evidence"])
+                            if evidence.get("previous") != state.get("owner_recovery"):
+                                raise c.CompletionError("owner recovery must preserve the exact previous evidence and review")
+                            proposed = {**state, "owner_recovery": binding}
+                            scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), proposed)
+                            c.validate_state_identity(scope, state, filename)
+                            recovery = c.owner_recovery(state["scope"], scope, binding, state=proposed)
+                            c.validate_scope(scope, recovery)
+                            state["owner_recovery"] = binding
+                        elif args.command == "preserve-source":
+                            if state["outcome"] != "waiting" or state["scope"] is None or "source_preservation" in state:
+                                raise c.CompletionError("source preservation requires the existing waiting binding and cannot replace a preservation")
+                            c.control_reference(state.get("status_basis"))
+                            binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                       "review": {"path": args.review, "sha256": args.review_sha256}}
+                            scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), state)
+                            c.validate_state_identity(scope, state, filename)
+                            if c.read_control(binding["evidence"])["previous_state_sha256"] != before:
+                                raise c.CompletionError("source preservation is not for the exact previous pointer")
+                            recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
+                            c.validate_scope(scope, recovery)
+                            c.source_preservation(state["scope"], scope, binding)
+                            state["source_preservation"] = binding
+                        elif args.command in {"finalize", "complete"}:
+                            if args.inputs:
+                                if any((args.result, args.review, args.review_sha256)):
+                                    raise c.CompletionError("use stdin inputs or file inputs, not both")
+                                payload = c.decode(sys.stdin.buffer.read(c.MAX_BYTES + 1))
+                                c.fields(payload, ("result", "review"))
+                                scope = c.read_control(state["scope"])
+                                root = c.path(scope["record_root"]["path"])
+                                result_raw, review_raw = c.canonical(payload["result"]), c.canonical(payload["review"])
+                                result_origin, review_origin = root / ".state-result.json", root / ".state-final-review.json"
+                                if os.path.lexists(result_origin) or os.path.lexists(review_origin):
+                                    raise c.CompletionError("stdin control origins must not shadow staging files")
+                                state.update(result_path=str(result_origin), final_review={
+                                    "path": str(review_origin), "sha256": c.sha(review_raw)})
+                                c.remember_control(state, {"path": state["result_path"], "sha256": c.sha(result_raw)}, result_raw)
+                                c.remember_control(state, state["final_review"], review_raw)
+                                c.capture_controls(state, final=True, result_raw=result_raw, location=filename)
+                            elif any((args.result, args.review, args.review_sha256)):
+                                if not all((args.result, args.review, args.review_sha256)):
+                                    raise c.CompletionError("provide all result/review references together")
+                                final = {"path": args.review, "sha256": args.review_sha256}
+                                changed = (state.get("final_review") != final or state.get("result_path") != args.result
+                                           or not any((r["path"], r["sha256"]) == (final["path"], final["sha256"])
+                                                      for r in state.get("control_records", [])))
+                                state.update(result_path=str(c.path(args.result)), final_review=c.control_reference(final))
+                                c.capture_controls(state, final=changed, location=filename)
+                            elif not state.get("final_review") or not state.get("result_path"):
+                                raise c.CompletionError("publish reviewed final inputs before completing")
+                            protect_records(state, filename, state["resources"])
+                            if args.command == "complete":
+                                # Preserve reviewed inputs for recovery before observing. A failed
+                                # inspection leaves this CAS-updated pointer bound for retry.
+                                c.capture_controls(state, location=filename)
+                                before = replace(filename, state, before)["sha256"]
+                                scope = c.read_control(state["scope"])
+                                answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
+                                                       request_digest=args.request_digest, workspace=scope["environment"]["workspace"], review_ref=state["review"], state_path=str(filename), report=True)
+                                if answer["complete"]:
+                                    answer = close_checked(filename, state, before, scope, answer, args.work_turn)
+                                answer["binding_released"] = answer["complete"]
+                                print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
+                        elif args.command == "outcome":
+                            state.update(outcome=args.status, status_basis=c.control_reference({"path": args.basis, "sha256": args.basis_sha256}))
+                            # Status evidence can record why the original scope is unavailable.
+                            # Do not require that scope just to preserve this metadata.
+                            checks = []
+                            if state["scope"]:
+                                try:
+                                    checks = c.read_control(state["scope"])["checks"]
+                                except (c.CompletionError, OSError, ValueError, TypeError):
+                                    pass
+                            for resource in [*checks, *state["resources"]]:
+                                c.protect_completion_records(resource, [state["status_basis"]["path"]])
                         else:
-                            if len(found) != 1 or found[0]["kind"] != "reserved": raise c.CompletionError("resource must be reserved before creation")
-                            resource = c.decode(c.raw_file(args.resource)); c.fields(resource, ("kind", "target"))
-                            if resource["kind"] not in {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"} or not isinstance(resource["target"], dict):
-                                raise c.CompletionError("pointer covers temporary resources only; retained outputs/runtime need fixed owner scope checks")
-                            if resource["kind"] in {"ref_absent", "remote_ref_absent"}:
-                                c.validate_ref_observer(resource["kind"], resource["target"].get("ref"))
-                            if resource["kind"] == "remote_ref_absent":
-                                target = resource["target"]
-                                target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
-                            protect_records(state, filename, [resource])
-                            found[0].update(resource, basis=basis)
-                    elif args.command == "recover-filesystem":
-                        if state["outcome"] != "waiting" or state["scope"] is None or "filesystem_recovery" in state:
-                            raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem recovery")
-                        c.reference(state.get("status_basis"))
-                        binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
-                                   "review": {"path": args.review, "sha256": args.review_sha256}}
-                        evidence = c.read_reference(binding["evidence"])
-                        if evidence["previous_state_sha256"] != before:
-                            raise c.CompletionError("filesystem recovery is not for the exact previous pointer")
-                        proposed = {**state, "filesystem_recovery": binding}
-                        if bool(args.owner_recovery) != bool(args.owner_recovery_sha256):
-                            raise c.CompletionError("companion owner recovery requires both path and SHA")
-                        if args.owner_recovery:
-                            companion = c.read_reference({"path": args.owner_recovery, "sha256": args.owner_recovery_sha256})
-                            c.fields(companion, ("evidence", "review"))
-                            if c.read_reference(companion["evidence"]).get("previous") != state.get("owner_recovery"):
-                                raise c.CompletionError("companion recovery must preserve the exact previous owner binding")
-                            proposed["owner_recovery"] = companion
-                        scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), proposed)
-                        recovery = c.owner_recovery(state["scope"], scope, proposed["owner_recovery"], state=proposed) if "owner_recovery" in proposed else None
-                        c.validate_scope(scope, recovery)
-                        state["filesystem_recovery"] = binding
-                        if args.owner_recovery:
-                            state["owner_recovery"] = companion
-                    elif args.command == "recover-owner":
-                        if state["outcome"] != "waiting" or state["scope"] is None:
-                            raise c.CompletionError("owner recovery requires the existing waiting binding")
-                        c.reference(state.get("status_basis"))
-                        binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
-                                   "review": {"path": args.review, "sha256": args.review_sha256}}
-                        evidence = c.read_reference(binding["evidence"])
-                        if evidence.get("previous") != state.get("owner_recovery"):
-                            raise c.CompletionError("owner recovery must preserve the exact previous evidence and review")
-                        proposed = {**state, "owner_recovery": binding}
-                        scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), proposed)
-                        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
-                            raise c.CompletionError("scope task/session/resource pointer differs")
-                        recovery = c.owner_recovery(state["scope"], scope, binding, state=proposed)
-                        c.validate_scope(scope, recovery)
-                        state["owner_recovery"] = binding
-                    elif args.command == "preserve-source":
-                        if state["outcome"] != "waiting" or state["scope"] is None or "source_preservation" in state:
-                            raise c.CompletionError("source preservation requires the existing waiting binding and cannot replace a preservation")
-                        c.reference(state.get("status_basis"))
-                        binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
-                                   "review": {"path": args.review, "sha256": args.review_sha256}}
-                        scope = c.filesystem_scope(state["scope"], c.read_reference(state["scope"]), state)
-                        if (scope["task_id"], scope["session_id"], scope["state_path"]) != (state["task_id"], args.session, str(filename)):
-                            raise c.CompletionError("scope task/session/resource pointer differs")
-                        if c.read_reference(binding["evidence"])["previous_state_sha256"] != before:
-                            raise c.CompletionError("source preservation is not for the exact previous pointer")
-                        recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
-                        c.validate_scope(scope, recovery)
-                        c.source_preservation(state["scope"], scope, binding)
-                        state["source_preservation"] = binding
-                    elif args.command in {"finalize", "complete"}:
-                        state.update(result_path=str(c.path(args.result)), final_review=c.reference({"path": args.review, "sha256": args.review_sha256}))
-                        protect_records(state, filename, state["resources"])
-                        if args.command == "complete":
-                            # Preserve reviewed inputs for recovery before observing. A failed
-                            # inspection leaves this CAS-updated pointer bound for retry.
-                            before = replace(filename, state, before)["sha256"]
-                            scope = c.read_reference(state["scope"])
-                            answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
-                                                   request_digest=args.request_digest, workspace=scope["environment"]["workspace"], review_ref=state["review"], report=True)
-                            if answer["complete"]:
+                            scope = c.read_control(state["scope"])
+                            answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=scope["environment"]["workspace"], review_ref=state["review"], stopped=args.command == "release", state_path=str(filename))
+                            if args.command in {"unbind", "release"}:
+                                if not (answer["stopped"] if args.command == "release" else answer["complete"]): raise c.CompletionError("unfinished task remains bound")
                                 answer = close_checked(filename, state, before, scope, answer, args.work_turn)
-                            answer["binding_released"] = answer["complete"]
-                            print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
-                    elif args.command == "outcome":
-                        state.update(outcome=args.status, status_basis=c.reference({"path": args.basis, "sha256": args.basis_sha256}))
-                        # Status evidence can record why the original scope is unavailable.
-                        # Do not require that scope just to preserve this metadata.
-                        checks = []
-                        if state["scope"]:
-                            try:
-                                checks = c.read_reference(state["scope"])["checks"]
-                            except (c.CompletionError, OSError, ValueError, TypeError):
-                                pass
-                        for resource in [*checks, *state["resources"]]:
-                            c.protect_completion_records(resource, [state["status_basis"]["path"]])
-                    else:
-                        scope = c.read_reference(state["scope"])
-                        answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=scope["environment"]["workspace"], review_ref=state["review"], stopped=args.command == "release")
-                        if args.command in {"unbind", "release"}:
-                            if not (answer["stopped"] if args.command == "release" else answer["complete"]): raise c.CompletionError("unfinished task remains bound")
-                            answer = close_checked(filename, state, before, scope, answer, args.work_turn)
-                        print(c.canonical(answer).decode()); return 0 if answer["complete"] or answer["stopped"] else 2
-                    answer = replace(filename, state, before)
+                            print(c.canonical(answer).decode()); return 0 if answer["complete"] or answer["stopped"] else 2
+                        if args.command == "outcome":
+                            c.remember_control(state, state["status_basis"], c.control_bytes(
+                                state["status_basis"]["path"], state["status_basis"]["sha256"]))
+                        else:
+                            c.capture_controls(state, location=filename)
+                        answer = replace(filename, state, before)
         print(c.canonical(answer).decode()); return 0
     except (c.CompletionError, OSError, ValueError, TypeError, KeyError) as exc:
         print(c.canonical({"complete": False, "error": str(exc)}).decode()); return 2

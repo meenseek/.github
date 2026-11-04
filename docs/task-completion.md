@@ -106,6 +106,15 @@ python3 scripts/check_completion.py prepare --seed /absolute/seed.json --output 
 직접 작업의 요청·seed·scope·관측·result·리뷰는 저장소 밖의 전용 임시 폴더에 모으고
 seed의 `record_root`에 그 절대경로를 지정한다. `prepare`는 폴더의 device/inode를 고정한다.
 이 폴더는 제품 산출물이나 영구 기록이 아니며 Git ignore 여부로 보존하지 않는다.
+`bind`는 선택한 요청·범위·리뷰와 재발 방지 계획·사례의 정확한 바이트를 기존 private
+작업 상태에 함께 저장한다. 참조의 path/SHA는 출처와 원문 식별이며, 게시된 통제 입력을
+다시 읽기 위해 임시 파일이 계속 남아 있을 필요는 없다. 이후 자원·상태 근거, 최종 기대값·
+리뷰와 선택한 과거 관측도 같은 lock/CAS에 결합한다. 현재 소스·owner·산출물·설치본은
+계속 실제 파일과 원격 상태에서 검사한다. 원래 owner의 명시된 시작 사본은 과거 입력이다.
+무관한 로그·seed·wheel을 통째로 저장하지 않는다. 통제 원문은 최대 256개이며 파일별 및
+상태 전체의 기존 1 MiB 상한을 유지한다. 초과·손상은 기존 상태를 보존하고 거절한다.
+실제 장기 작업의 state는 기본 `.completion/`에 두며 `--bindings`를 휘발성 폴더로 옮기지 않는다.
+
 소스·사용본·소유 계약·workspace·자원 목록과 겹치는 경로는 거부한다. 최종 리뷰는
 scope/result SHA와 함께 `record_inventory_sha256`을 묶는다. 값은
 `check_completion.reviewed_record_inventory(scope["record_root"], final_review_path)`로 구한다.
@@ -345,7 +354,8 @@ PID와 시작 identity, host handle의 근거를 연결한다. 각 변경 명령
 `reserve`/`attach`는 실행·삭제를 하지 않는다. 미해결 예약은 완료를 막는다. 프로세스의
 argv가 바뀌어도 같은 시작 시각이면 살아 있는 프로세스로 판단한다. PID 번호만 보고
 다른 프로세스를 종료하지 않는다. pointer는 기존 작업 기록에 대한 참조와 현재 handles만
-담고 원문·로그·자격증명을 복제하지 않는다. private `.completion/`은 Git에서 제외한다.
+담는다. 선택한 과거 통제 원문 외의 소스·미디어·무관한 로그·자격증명은 복제하지 않는다.
+private `.completion/`은 Git에서 제외하며 기존 private 권한을 유지한다.
 
 기록 폴더는 `complete`의 검토된 삭제 절차가 소유한다. `absent`·`worktree_absent`에
 그 폴더·하위 경로나 이를 포함하는 상위 폴더를 등록하지 않는다. `prepare`는 고정 검사,
@@ -477,6 +487,38 @@ owner 근거로 포함한다. HTTP GET은 redirect, 누락 revision/health, 오�
 소유자가 기존 목표를 종료·대체한 경우에는 현재 결과의 수용과 원래 목표의 종료 판단을
 구분해 소유 기록에 결속하고, cancelled와 release까지 마친다. 게시·배포만으로 검수나
 실험의 통과를 추정하지 않으며, 더 이상 적용하지 않는 목표를 waiting으로 넘기지 않는다.
+
+## 새 프로세스와 세션에서 이어가기
+
+`check_completion.py check --state /absolute/session.json --result /original/result.json`과
+`draft --state /absolute/session.json --output /absolute/result.json`은 state를 먼저 연다.
+전역 파일 검색으로 작업을 추정하지 않는다. 기존 scope/ref 입력은 전송 형식으로 사용할 수 있다.
+`finalize`·`complete --inputs -`는 stdin의 `{result: {...}, review: {...}}`를 받아 별도 파일 없이
+게시한다. 리뷰는 canonical JSON의 result SHA와 실제 남은 기록 inventory를 결속한다.
+stdin 리뷰는 실제 파일이 아니므로 전체 inventory를 결속하며 제외할 자기 파일이 없다.
+이미 `finalize`한 상태의 `complete`는 result/review 파일 인자를 생략해 저장된 입력으로 재검사한다.
+`attach --resource -`도 stdin의 `{kind, target}`를 받는다.
+
+같은 UUID의 재시작은 같은 상태를 읽는다. 새 UUID의 독립 작업은 자기 pointer만 선택하며
+과거 작업을 자동 인수하거나 차단하지 않는다. 같은 직접 작업을 새 UUID로 잇는 경우에는
+새 호스트의 실제 UUID와 정확한 기존 task/request·pointer SHA·인수 근거를 지정한다.
+
+```sh
+python3 scripts/completion_hook.py adopt --session NEW_SESSION --from-session OLD_SESSION --expected-sha256 POINTER_SHA --task-id TASK_ID --request-digest REQUEST_SHA --basis /absolute/authorization.json --basis-sha256 BASIS_SHA
+```
+
+원래 scope/session/state_path 바이트는 불변이고, 현재 소유 session은 별도로 바뀐다.
+예약·자원·상태·검토 입력을 그대로 승계한다. 기존 목표의 근거를 추정해 만들지 않는다.
+다른 작업이 있는 대상 session은 거절한다. 같은 private 폴더의 잠금 안에서 인수 의도를
+먼저 CAS하고 pointer를 원자적으로 이동한다. 이동 전 중단은 남아 있는 원래 pointer의
+최신 SHA로 같은 인수를 재시도한다. 이동 뒤에는 새 session만 상태를 바꿀 수 있다.
+등록된 queue 실행은 해당 실행 소유자의 claim·복구 경계를 따르며 직접 adopt로 우회하지 않는다.
+
+임시 기록 폴더가 없어도 저장된 과거 입력은 검증할 수 있다. 남은 폴더가 있으면 기존
+경로·device/inode와 검토된 manifest를 대조한다. 최종 입력 게시 뒤 사라진 파일은 없어도 되지만,
+새 파일·변조·교체된 폴더는 삭제하지 않는다. 저장된 기대값과 실제 남은 파일을 나눠 검사하고
+완료·중단 시 기존 삭제 재개 절차로 관리 상태까지 제거한다. 이미 원문을 보관하지 못한 과거
+binding은 원래 파일이 필요하며, 없는 바이트를 발명하거나 자동 완료하지 않는다.
 
 ## Codex 설치와 실제 연결 확인
 
