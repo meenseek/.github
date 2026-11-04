@@ -347,6 +347,13 @@ argv가 바뀌어도 같은 시작 시각이면 살아 있는 프로세스로 �
 다른 프로세스를 종료하지 않는다. pointer는 기존 작업 기록에 대한 참조와 현재 handles만
 담고 원문·로그·자격증명을 복제하지 않는다. private `.completion/`은 Git에서 제외한다.
 
+기록 폴더는 `complete`의 검토된 삭제 절차가 소유한다. `absent`·`worktree_absent`에
+그 폴더·하위 경로나 이를 포함하는 상위 폴더를 등록하지 않는다. `prepare`는 고정 검사,
+`attach`와 `bind`는 누적 자원까지 대조하며, 기록 폴더 없는 기존 범위의 요청·scope·리뷰·
+pointer도 보호한다. 나중에 result·최종 리뷰·상태 근거를 연결할 때도 저장 전 다시 대조한다.
+등록 거절은 현재 pointer를 바꾸지 않는다. 임의의 외부 삭제를 막거나
+이미 없어진 원본을 복원하는 기능은 아니다.
+
 pointer는 임시 파일, exact branch ref, 로컬 `refs/stash`, worktree 경로, PID 시작 identity의 부재만 지원한다.
 stash는 현재 Git ref를 확인하므로 packed ref와 reflog 없는 ref도 남아 있으면 거부한다.
 그 밖의 ref는 범위 준비와 자원 연결 단계에서 거부하며 원격 stash 검사는 지원하지 않는다.

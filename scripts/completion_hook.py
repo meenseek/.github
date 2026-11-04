@@ -35,6 +35,24 @@ def pointer(root, session):
     return c.path(str(root)) / (session + ".json")
 
 
+def protect_records(state, filename, resources):
+    protected = [str(filename)]
+    for name in ("scope", "review", "final_review", "status_basis"):
+        if state.get(name):
+            protected.append(state[name]["path"])
+    if state.get("result_path"):
+        protected.append(state["result_path"])
+    checks = []
+    if state.get("scope"):
+        scope = c.read_reference(state["scope"])
+        protected.append(scope["request"]["path"])
+        if scope.get("record_root"):
+            protected.append(scope["record_root"]["path"])
+        checks = scope["checks"]
+    for resource in [*checks, *resources]:
+        c.protect_completion_records(resource, protected)
+
+
 def measurement_store(explicit_root=None):
     """Optional installed observer; completion authority stays in this module."""
     operations = Path(__file__).resolve().parents[2] / "operations"
@@ -393,7 +411,9 @@ def main(argv=None):
                             raise c.CompletionError("scope task/session/resource pointer differs")
                         if c.read_reference(review_ref) != {"scope_sha256": args.scope_sha256, "status": "No Findings"}:
                             raise c.CompletionError("review is not for this exact scope")
-                        state.update(scope=scope_ref, review=review_ref)
+                        proposed = {**state, "scope": scope_ref, "review": review_ref}
+                        protect_records(proposed, filename, state["resources"])
+                        state = proposed
                     elif args.command in {"reserve", "attach"}:
                         basis = c.reference({"path": args.basis, "sha256": args.basis_sha256})
                         found = [r for r in state["resources"] if r["id"] == args.id]
@@ -410,6 +430,7 @@ def main(argv=None):
                             if resource["kind"] == "remote_ref_absent":
                                 target = resource["target"]
                                 target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
+                            protect_records(state, filename, [resource])
                             found[0].update(resource, basis=basis)
                     elif args.command == "recover-filesystem":
                         if state["outcome"] != "waiting" or state["scope"] is None or "filesystem_recovery" in state:
@@ -468,6 +489,7 @@ def main(argv=None):
                         state["source_preservation"] = binding
                     elif args.command in {"finalize", "complete"}:
                         state.update(result_path=str(c.path(args.result)), final_review=c.reference({"path": args.review, "sha256": args.review_sha256}))
+                        protect_records(state, filename, state["resources"])
                         if args.command == "complete":
                             # Preserve reviewed inputs for recovery before observing. A failed
                             # inspection leaves this CAS-updated pointer bound for retry.
@@ -481,6 +503,16 @@ def main(argv=None):
                             print(c.canonical(answer).decode()); return 0 if answer["complete"] else 2
                     elif args.command == "outcome":
                         state.update(outcome=args.status, status_basis=c.reference({"path": args.basis, "sha256": args.basis_sha256}))
+                        # Status evidence can record why the original scope is unavailable.
+                        # Do not require that scope just to preserve this metadata.
+                        checks = []
+                        if state["scope"]:
+                            try:
+                                checks = c.read_reference(state["scope"])["checks"]
+                            except (c.CompletionError, OSError, ValueError, TypeError):
+                                pass
+                        for resource in [*checks, *state["resources"]]:
+                            c.protect_completion_records(resource, [state["status_basis"]["path"]])
                     else:
                         scope = c.read_reference(state["scope"])
                         answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=scope["environment"]["workspace"], review_ref=state["review"], stopped=args.command == "release")

@@ -440,6 +440,105 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.state.exists())
         self.assertEqual(json.loads(self.state.read_bytes())["resources"][0]["id"], "late")
 
+    def test_cleanup_registration_protects_record_root_and_its_relatives(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        for number, target in enumerate((self.records, self.records.parent, self.records / "nested")):
+            self.call("reserve", "--id", f"protected-{number}", *self.basis())
+            resource = self.f.root / "resource.json"
+            self.f.write(resource, {"kind": "absent", "target": {"path": str(target)}})
+            before = self.state.read_bytes()
+            result = self.call("attach", "--id", f"protected-{number}", "--resource", str(resource),
+                               *self.basis(), ok=False)
+            self.assertIn("overlaps active completion records", result["error"])
+            self.assertEqual(self.state.read_bytes(), before)
+
+    def test_worktree_absence_cannot_hide_record_cleanup(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "protected", *self.basis())
+        resource = self.f.root / "resource.json"
+        self.f.write(resource, {"kind": "worktree_absent", "target": {
+            "repository": str(self.f.repo), "path": str(self.records)}})
+        before = self.state.read_bytes()
+        self.call("attach", "--id", "protected", "--resource", str(resource), *self.basis(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_bind_rejects_previously_attached_legacy_scope_cleanup(self):
+        self.call("arm", "--task-id", self.f.seed["task_id"])
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        self.call("reserve", "--id", "early", *self.basis())
+        resource = self.f.root / "resource.json"
+        self.f.write(resource, {"kind": "absent", "target": {"path": str(self.f.scope_path)}})
+        self.call("attach", "--id", "early", "--resource", str(resource), *self.basis())
+        before = self.state.read_bytes()
+        self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
+                  "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_legacy_request_review_and_pointer_are_protected_but_sibling_scratch_is_valid(self):
+        self.arm_bind(finalize=False)
+        for number, target in enumerate((self.f.request, self.f.scope_path, self.f.review_path, self.state)):
+            self.call("reserve", "--id", f"protected-{number}", *self.basis())
+            resource = self.f.root / "resource.json"
+            self.f.write(resource, {"kind": "absent", "target": {"path": str(target)}})
+            before = self.state.read_bytes()
+            self.call("attach", "--id", f"protected-{number}", "--resource", str(resource), *self.basis(), ok=False)
+            self.assertEqual(self.state.read_bytes(), before)
+        self.call("reserve", "--id", "ordinary", *self.basis())
+        self.f.write(resource, {"kind": "absent", "target": {"path": str(self.f.root / "ordinary-scratch")}})
+        self.call("attach", "--id", "ordinary", "--resource", str(resource), *self.basis())
+
+    def test_later_activation_of_cleanup_target_as_input_is_rejected_before_cas(self):
+        self.arm_bind(finalize=False)
+        cases = [("finalize", self.f.result_path), ("complete", self.f.final_review_path),
+                 ("outcome", self.f.root / "later-status.json")]
+        for number, (command, target) in enumerate(cases):
+            if command == "outcome":
+                target.write_text("Exact stop evidence")
+            self.call("reserve", "--id", f"later-{number}", *self.basis())
+            resource = self.f.root / "later-resource.json"
+            self.f.write(resource, {"kind": "absent", "target": {"path": str(target)}})
+            self.call("attach", "--id", f"later-{number}", "--resource", str(resource), *self.basis())
+            before = self.state.read_bytes()
+            args = (["--status", "waiting", "--basis", str(target), "--basis-sha256", self.f.ref(target)["sha256"]]
+                    if command == "outcome" else self.completion_args())
+            self.call(command, *args, ok=False)
+            self.assertEqual(self.state.read_bytes(), before)
+
+    def test_fixed_cleanup_cannot_cover_record_children(self):
+        self.record_fixture()
+        self.f.seed["checks"].append({"id": "unsafe", "category": "temporary_resources", "kind": "absent",
+                                     "target": {"path": str(self.records / "scratch")}})
+        self.f.reset_categories()
+        with self.assertRaisesRegex(h.c.CompletionError, "active completion records"):
+            h.c.prepare(self.f.seed)
+
+    def test_outcome_can_preserve_status_when_original_scope_is_unavailable(self):
+        self.arm_bind(finalize=False)
+        status = self.f.root / "status.json"
+        status.write_text("Original scope is unavailable; preserve pending work")
+        self.f.scope_path.unlink()
+        self.call("outcome", "--status", "waiting", "--basis", str(status),
+                  "--basis-sha256", self.f.ref(status)["sha256"])
+        state = json.loads(self.state.read_bytes())
+        self.assertEqual(state["outcome"], "waiting")
+        self.assertEqual(state["scope"], self.f.scope_ref)
+        self.assertEqual(state["status_basis"], self.f.ref(status))
+
+    def test_outcome_rejects_activation_of_a_fixed_legacy_cleanup_target(self):
+        status = self.f.root / "later-status.json"
+        status.write_text("Status evidence must remain available")
+        self.f.seed["checks"].append({"id": "later-status", "category": "temporary_resources", "kind": "absent",
+                                     "target": {"path": str(status)}})
+        self.f.reset_categories()
+        self.arm_bind(finalize=False)
+        before = self.state.read_bytes()
+        self.call("outcome", "--status", "waiting", "--basis", str(status),
+                  "--basis-sha256", self.f.ref(status)["sha256"], ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def basis(self):
         return ["--basis", str(self.f.owner), "--basis-sha256", self.f.ref(self.f.owner)["sha256"]]
 

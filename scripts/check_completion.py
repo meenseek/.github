@@ -702,6 +702,17 @@ def reviewed_record_inventory(record, final_review, *, inventory=None):
     return sha(canonical(inventory))
 
 
+def protect_completion_records(check, protected):
+    """Absence checks must not require removal of their own verification inputs."""
+    if check["kind"] not in {"absent", "worktree_absent"}:
+        return
+    target = path(check["target"]["path"]).resolve()
+    for value in protected:
+        record = path(value).resolve()
+        if target.is_relative_to(record) or record.is_relative_to(target):
+            raise CompletionError("cleanup target overlaps active completion records")
+
+
 def validate_record_root(scope):
     record = scope["record_root"]
     fields(record, ("path", "device", "inode"))
@@ -723,6 +734,8 @@ def validate_record_root(scope):
             raise CompletionError("record root overlaps a source, output, workspace or resource inventory")
     if not path(scope["request"]["path"]).is_relative_to(root):
         raise CompletionError("task request must be inside its record root")
+    for check in scope["checks"]:
+        protect_completion_records(check, [str(root)])
 
 
 def validate_scope(scope, recovery=None):
@@ -798,6 +811,8 @@ def validate_scope(scope, recovery=None):
             raise CompletionError("invalid starting artifact inventory")
     if "record_root" in scope:
         validate_record_root(scope)
+    for check in scope["checks"]:
+        protect_completion_records(check, [scope["request"]["path"], scope["state_path"]])
     return checks
 
 
