@@ -62,6 +62,15 @@ class CompletionTests(unittest.TestCase):
         self.reset_categories()
         self.freeze()
 
+    def test_scope_rejects_cleanup_checks_covering_its_request_or_pointer(self):
+        for target in (self.request, self.state_path, self.root):
+            seed = copy.deepcopy(self.seed)
+            seed["checks"].append({"id": "unsafe", "category": "temporary_resources", "kind": "absent",
+                                   "target": {"path": str(target)}})
+            seed["categories"]["temporary_resources"] = {"checks": ["unsafe"], "not_applicable": None}
+            with self.subTest(target=target), self.assertRaisesRegex(c.CompletionError, "active completion records"):
+                c.prepare(seed)
+
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True).stdout.decode().strip()
 
