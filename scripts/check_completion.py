@@ -69,6 +69,35 @@ def fields(value, required, optional=()):
         raise CompletionError("unexpected or missing fields")
 
 
+def validate_assertions(assertions):
+    if not isinstance(assertions, list) or not assertions:
+        raise CompletionError("expected nonempty frozen assertions")
+    seen = set()
+    for assertion in assertions:
+        fields(assertion, ("path", "equals"))
+        steps = assertion["path"]
+        if not isinstance(steps, list) or not steps:
+            raise CompletionError("expected nonempty assertion path")
+        key = tuple(text(part) for part in steps)
+        if key in seen:
+            raise CompletionError("duplicate assertion path")
+        seen.add(key)
+        canonical(assertion["equals"])
+
+
+def matches(result, assertions):
+    validate_assertions(assertions)
+    for assertion in assertions:
+        current = result
+        for key in assertion["path"]:
+            if not isinstance(current, dict) or key not in current:
+                return False
+            current = current[key]
+        if canonical(current) != canonical(assertion["equals"]):
+            return False
+    return True
+
+
 def text(value):
     if not isinstance(value, str) or not value.strip() or "\0" in value:
         raise CompletionError("expected nonempty text without NUL")
@@ -1020,6 +1049,11 @@ def validate_scope(scope, recovery=None):
         if check["kind"] == "installed_file":
             fields(check["target"], ("path", "source"))
             path(check["target"]["path"]); path(check["target"]["source"])
+        if check["kind"] == "evidence":
+            fields(check["target"], ("path",), ("assertions",))
+            path(check["target"]["path"])
+            if "assertions" in check["target"]:
+                validate_assertions(check["target"]["assertions"])
         if check["kind"] in {"ref_absent", "remote_ref_absent"}:
             validate_ref_observer(check["kind"], check["target"].get("ref"))
         if check["kind"] == "improvement":
@@ -1202,7 +1236,7 @@ def _draft_result(scope_ref, expectations=None):
             if kind == "improvement":
                 fields(target, ("path", "plan"))
                 return key, {"sha256": sha(control_bytes(target["path"]))}
-            fields(target, ("path",), ("source",))
+            fields(target, ("path",), ("assertions",) if kind == "evidence" else ("source",))
             if kind == "file":
                 return key, {"sha256": artifact_sha(target["path"])}
             if kind == "evidence":
@@ -1255,13 +1289,18 @@ def observe(check, expected, *, preserved=None, owners=()):
         fields(target, ("path", "plan")); fields(expected, ("sha256",))
         return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])}, owners=owners)
     if kind in ("file", "evidence", "installed_file"):
-        fields(target, ("path",), ("source",))
+        fields(target, ("path",), ("assertions",) if kind == "evidence" else ("source",))
         fields(expected, ("sha256",))
         actual = (artifact_sha(target["path"]) if kind == "file" else
                   sha(control_bytes(target["path"], expected["sha256"])) if kind == "evidence" else
                   working_source_sha(target["path"]))
         if actual != digest(expected["sha256"]):
             raise CompletionError("file differs from reviewed bytes")
+        if kind == "evidence" and "assertions" in target:
+            if not matches(decode(control_bytes(target["path"], expected["sha256"])), target["assertions"]):
+                raise CompletionError("owner evidence failed a frozen work assertion")
+            return {"sha256": actual, "assertions_checked": len(target["assertions"]),
+                    "observation": "frozen predicates; actual execution and semantic quality remain owner checks"}
         if kind == "installed_file":
             if "source" not in target or working_source_sha(target["source"]) != actual:
                 raise CompletionError("installed and owner source bytes differ")
@@ -1564,10 +1603,11 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     # Re-observe source after all other checks: main/remote changes seen inside
     # this inspection are never hidden by the expected main inventory exception.
     for key, definition in checks.items():
-        if definition["kind"] in {"git_source", "improvement"} and not stopped:
+        if (definition["kind"] in {"git_source", "improvement"}
+                or definition["kind"] == "evidence" and "assertions" in definition["target"]) and not stopped:
             _, _, failure = inspect((key, definition, result["checks"][key]))
             if failure:
-                label = "source" if definition["kind"] == "git_source" else "improvement"
+                label = "source" if definition["kind"] == "git_source" else definition["kind"]
                 failures.append({"id": key, "reason": "final " + label + " observation: " + failure})
     for item in unclassified:
         if item not in exceptions:

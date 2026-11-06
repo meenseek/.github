@@ -17,6 +17,21 @@ h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 
 
 class HookTests(unittest.TestCase):
+    def test_actual_stop_contract_names_missing_work_observations_before_paths(self):
+        self.arm_bind(finalize=False)
+        answer=h.hook(self.payload,root=self.root,measurement_root=self.f.root/'observations')
+        self.assertEqual(answer['decision'],'block')
+        self.assertIn('work observations',answer['reason'])
+        continued=h.hook({**self.payload,'stop_hook_active':True},root=self.root,measurement_root=self.f.root/'observations')
+        self.assertNotIn('decision',continued)
+    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations owner repair guard')
+    def test_known_unfinished_repair_is_not_swallowed_as_optional_measurement(self):
+        module,store=h.measurement_store(self.f.root/'observations')
+        state={'task_id':'original','session_id':'session'}
+        with mock.patch.object(h,'ROOT',self.root),mock.patch.object(h,'measurement_store',return_value=(module,store)),\
+             mock.patch.object(store,'remember_cleanup',side_effect=module.RepairIncomplete('Original repair remains unverified')):
+            with self.assertRaisesRegex(h.c.CompletionError,'unverified'):
+                h.measurement_cleanup(state,{'complete':True},binding_path=self.root/'session.json',preparing=True,scope={})
     @unittest.skipUnless(HAS_COLLECTOR, "Requires the separately installed operations collector")
     def test_measurement_survives_actual_reviewed_record_cleanup(self):
         self.record_fixture()

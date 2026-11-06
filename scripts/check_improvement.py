@@ -25,15 +25,7 @@ def nonempty_list(value):
 
 def matches(result, assertions):
     """Compare JSON values without Python's True == 1 coercion."""
-    for assertion in assertions:
-        current = result
-        for key in assertion["path"]:
-            if not isinstance(current, dict) or key not in current:
-                return False
-            current = current[key]
-        if c.canonical(current) != c.canonical(assertion["equals"]):
-            return False
-    return True
+    return c.matches(result, assertions)
 
 
 def observation(ref, case, implementation):
@@ -85,14 +77,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
             raise c.CompletionError("reproduction and transfer cases need distinct input bytes and paths")
         inputs.add(case["input"]["sha256"])
         paths.add(identity)
-        assertion_paths = set()
-        for assertion in nonempty_list(case["assertions"]):
-            c.fields(assertion, ("path", "equals"))
-            steps = tuple(c.text(part) for part in nonempty_list(assertion["path"]))
-            if steps in assertion_paths:
-                raise c.CompletionError("duplicate assertion path")
-            assertion_paths.add(steps)
-            c.canonical(assertion["equals"])
+        c.validate_assertions(case["assertions"])
         passed = observation(case["baseline"], case, plan["baseline_sha256"])
         baseline_passes += passed
         reproduced += case["phase"] == "reproduction" and not passed
@@ -101,7 +86,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
     return plan, baseline_passes
 
 
-def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
+def inspect(plan_ref, record_ref, task_id=None, *, owners=(), check_application=True):
     plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners)
     record = c.read_control(record_ref)
     c.fields(record, ("plan_sha256", "candidate", "cases", "application"))
@@ -135,7 +120,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
         if row["source"] != source or location in installed:
             raise c.CompletionError("installed source coverage differs or is duplicated")
         installed.add(location)
-        if c.working_source_sha(location) != source["sha256"]:
+        if check_application and c.working_source_sha(location) != source["sha256"]:
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
     validate_plan(plan_ref, task_id, owners=owners)
@@ -144,9 +129,9 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
     for ref in after_refs:
         c.control_reference(ref)
     for source, row in zip(candidates, applied):
-        if c.working_source_sha(row["installed_path"]) != source["sha256"]:
+        if check_application and c.working_source_sha(row["installed_path"]) != source["sha256"]:
             raise c.CompletionError("actual usage changed during inspection")
-    return {"verified": True, "cases": len(results), "baseline_passes": baseline_passes,
+    return {"verified": True, "application_checked": check_application, "cases": len(results), "baseline_passes": baseline_passes,
             "candidate_passes": len(results), "candidate_minus_baseline_passes": len(results) - baseline_passes,
             "transfer_cases": sum(case["phase"] == "transfer" for case in plan["cases"]),
             "claim": "supplied frozen cases only; execution provenance and semantic quality require owner review; real outcome effect unverified"}

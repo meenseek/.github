@@ -10,8 +10,8 @@ class CaseCapacityTests(unittest.TestCase):
         result = {}; value = result
         path = [f"key-{index}" for index in range(20)]
         for key in path[:-1]: value[key] = {}; value = value[key]
-        value[path[-1]] = True
-        assertions = [{"path":path, "equals":True} for _ in range(40)]
+        value[path[-1]] = {f"check-{index}":True for index in range(40)}
+        assertions = [{"path":[*path,f"check-{index}"], "equals":True} for index in range(40)]
         self.assertTrue(i.matches(result, i.nonempty_list(assertions)))
         assertions[-1]["equals"] = False
         self.assertFalse(i.matches(result, assertions))
