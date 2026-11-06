@@ -415,6 +415,13 @@ python3 scripts/completion_hook.py complete --session SESSION_ID --expected-sha2
 비어 있고, 선언된 owner 변경의 현재 SHA만 `owner_updates`에 담는다. 범위·N/A·승인·리뷰
 통과를 만들거나 이미 있는 결과 파일을 덮어쓰지 않는다. 후보 생성은 완료 검사가 아니다.
 
+시작 repository inventory는 기존 `for-each-ref` 조회에서 symbolic target도 관측한다.
+declared canonical remote의 `HEAD`가 시작과 현재 모두 정확히 그 remote의 main을 가리키고,
+각 시점의 OID도 해당 main과 같을 때만 canonical main 이동에 함께 결합한다. 시작의 symbolic
+관측이 없는 고정 scope에는 이를 소급 추정하지 않으며 명시적 자원 분류를 유지한다. 새 참조,
+직접 ref에서 symbolic으로의 전환, 다른 target과 같은 OID의 재지정도 계속 검토한다.
+blocked/cancelled 종료에는 이 main 이동 예외를 적용하지 않는다.
+
 공유 checkout을 다른 작업이 사용 중이면 그 branch를 임의로 main으로 바꾸지 않는다.
 해당 `git_source` 기대값에만 `retained_branch: {name, owner, basis}`를 명시해 독립 최종
 리뷰를 받을 수 있다. `basis`는 정확한 경로/SHA의 소유·현재 점유 근거다. `draft`는 이 값을

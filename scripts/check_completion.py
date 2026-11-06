@@ -484,14 +484,44 @@ def inventory(repo):
         entry = path(repo) / filename
         dirty_bytes[filename] = {"worktree": file_identity(entry) if os.path.lexists(entry) else None,
                                  "index": index.get(filename, [])}
+    references, symbolic = {}, {}
+    for line in git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
+                    "refs/heads", "refs/remotes").decode().splitlines():
+        name, _, value = line.partition(" ")
+        oid, _, target = value.partition(" ")
+        references[name] = oid
+        if target:
+            symbolic[name] = target
     return {
         "identity": repo_identity(repo),
-        "refs": dict(line.split(" ", 1) for line in git(repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes").decode().splitlines()),
+        "refs": references,
+        "symbolic_refs": symbolic,
         "worktrees": git(repo, "worktree", "list", "--porcelain").decode().split("\n\n"),
         "dirty": git(repo, "status", "--ignore-submodules=all", "--porcelain=v1", "-z", "--untracked-files=all").decode().split("\0"),
         "dirty_bytes": dirty_bytes,
         "stash": git(repo, "stash", "list", "--format=%H").decode().splitlines(),
     }
+
+
+def canonical_main_refs(repo, before, after, checks):
+    """Only proven, pre-existing canonical aliases accompany main publication."""
+    mains = set()
+    for check in checks:
+        target = check["target"]
+        if check["kind"] != "git_source" or target["repository"] != repo:
+            continue
+        local = "refs/heads/" + target["main"]
+        remote = "refs/remotes/" + target["remote"] + "/" + target["main"]
+        mains.update((local, remote))
+        alias = "refs/remotes/" + target["remote"] + "/HEAD"
+        if (before.get("symbolic_refs", {}).get(alias) == remote
+                and after.get("symbolic_refs", {}).get(alias) == remote
+                and before["refs"].get(remote) is not None
+                and after["refs"].get(remote) is not None
+                and before["refs"].get(alias) == before["refs"][remote]
+                and after["refs"].get(alias) == after["refs"][remote]):
+            mains.add(alias)
+    return mains
 
 
 def file_identity(entry):
@@ -1035,9 +1065,13 @@ def validate_scope(scope, recovery=None):
     if set(scope["baseline"]["repositories"]) != set(scope["repositories"]) or set(scope["baseline"]["artifact_roots"]) != set(scope["artifact_roots"]):
         raise CompletionError("starting inventory coverage differs")
     for before in scope["baseline"]["repositories"].values():
-        fields(before, ("identity", "refs", "worktrees", "dirty", "dirty_bytes", "stash"))
+        fields(before, ("identity", "refs", "worktrees", "dirty", "dirty_bytes", "stash"), ("symbolic_refs",))
         if not isinstance(before["refs"], dict):
             raise CompletionError("invalid starting refs")
+        if (not isinstance(before.get("symbolic_refs", {}), dict)
+                or any(name not in before["refs"] or not text(target).startswith("refs/")
+                       for name, target in before.get("symbolic_refs", {}).items())):
+            raise CompletionError("invalid starting symbolic refs")
         for name in ("worktrees", "dirty", "stash"):
             if not isinstance(before[name], list) or not all(isinstance(value, str) for value in before[name]):
                 raise CompletionError("invalid starting Git inventory")
@@ -1505,13 +1539,14 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     unclassified = []
     for repo, before in scope["baseline"]["repositories"].items():
         after = inventory(repo)
-        mains = {"refs/heads/" + c["target"]["main"] for c in checks.values() if c["kind"] == "git_source" and c["target"]["repository"] == repo}
-        mains.update("refs/remotes/" + c["target"]["remote"] + "/" + c["target"]["main"] for c in checks.values() if c["kind"] == "git_source" and c["target"]["repository"] == repo)
+        mains = canonical_main_refs(repo, before, after, checks.values())
         if after["identity"] != before["identity"]:
             raise CompletionError("repository identity changed during task")
         if stopped: mains = set()
         for name in before["refs"].keys() | after["refs"].keys():
-            if name not in mains and before["refs"].get(name) != after["refs"].get(name):
+            symbolic_changed = ("symbolic_refs" in before
+                                and before["symbolic_refs"].get(name) != after["symbolic_refs"].get(name))
+            if name not in mains and (before["refs"].get(name) != after["refs"].get(name) or symbolic_changed):
                 unclassified.append("git:" + repo + ":ref:" + name)
         for name in ("worktrees", "dirty", "stash"):
             values = (lambda v: {line.splitlines()[0] for line in v if line.startswith("worktree ")}) if name == "worktrees" else set

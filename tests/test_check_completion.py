@@ -21,6 +21,68 @@ spec.loader.exec_module(c)
 
 
 class CompletionTests(unittest.TestCase):
+    def advance_scoped_main(self):
+        (self.repo / "tool.py").write_text("print('updated synthetic tool')\n")
+        self.git("commit", "-am", "test: advance main")
+        self.git("push", "origin", "main")
+        self.result = c.draft_result(self.scope_ref)
+        self.write(self.result_path, self.result); self.final_review()
+
+    def test_existing_canonical_symbolic_head_follows_reviewed_main_without_exception(self):
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.freeze()
+        before = json.loads(self.scope_path.read_bytes())["baseline"]["repositories"][str(self.repo)]
+        self.assertEqual(before["symbolic_refs"]["refs/remotes/origin/HEAD"], "refs/remotes/origin/main")
+        self.advance_scoped_main()
+        self.assertTrue(self.inspect()["complete"])
+        self.assertEqual(self.result["exceptions"], {})
+        self.state.update(outcome="blocked", status_basis=self.ref(self.owner))
+        reviewed = {"scope_sha256": self.scope_ref["sha256"], "status": "No Findings",
+                    "result_sha256": self.ref(self.result_path)["sha256"], "disposition": "stopped"}
+        self.write(self.final_review_path, reviewed)
+        self.state["final_review"] = self.ref(self.final_review_path)
+        self.write(self.state_path, self.state)
+        stopped = c.check_scope(self.scope_ref, str(self.result_path), stopped=True)
+        self.assertFalse(stopped["complete"])
+        self.assertTrue(any(row["id"].endswith("refs/remotes/origin/HEAD") for row in stopped["failures"]))
+
+    def test_new_canonical_head_is_still_an_unclassified_resource(self):
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        result = self.inspect()
+        self.assertFalse(result["complete"])
+        self.assertTrue(any(row["id"].endswith("refs/remotes/origin/HEAD") for row in result["failures"]))
+
+    def test_same_oid_direct_or_foreign_head_cannot_gain_alias_exemption(self):
+        alias = "refs/remotes/origin/HEAD"
+        oid = self.git("rev-parse", "refs/remotes/origin/main")
+        self.git("update-ref", "--no-deref", alias, oid)
+        self.freeze()
+        self.git("symbolic-ref", alias, "refs/remotes/origin/main")
+        self.assertFalse(self.inspect()["complete"])
+        self.git("update-ref", "refs/remotes/origin/other", oid)
+        self.git("symbolic-ref", alias, "refs/remotes/origin/other")
+        self.freeze()
+        self.git("symbolic-ref", alias, "refs/remotes/origin/main")
+        self.assertFalse(self.inspect()["complete"])
+
+    def test_missing_baseline_symbolic_evidence_keeps_explicit_classification(self):
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        original = c.inventory
+        def unobserved(repo):
+            value = original(repo); value.pop("symbolic_refs"); return value
+        with mock.patch.object(c, "inventory", side_effect=unobserved):
+            self.freeze()
+        self.advance_scoped_main()
+        self.assertFalse(self.inspect()["complete"])
+
+    def test_canonical_head_retargeted_to_foreign_same_oid_is_detected(self):
+        oid = self.git("rev-parse", "refs/remotes/origin/main")
+        self.git("update-ref", "refs/remotes/origin/other", oid)
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.freeze()
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+        self.assertFalse(self.inspect()["complete"])
+
     def test_long_process_identity_is_complete_and_malformed_recovery_is_rejected(self):
         identity = b"Fri Nov  6 10:00:00 2026 program " + b"x" * 10000
         with mock.patch.object(c.subprocess,"run",return_value=subprocess.CompletedProcess([],0,identity,b"")):
