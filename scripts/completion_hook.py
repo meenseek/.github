@@ -202,7 +202,7 @@ def remove_records(record, manifest):
                 if wanted.get("directory"):
                     os.rmdir(relative.name, dir_fd=parent_fd)
                 else:
-                    if c.sha(c.raw_file(str(root / relative))) != wanted["sha256"]:
+                    if c.artifact_sha(root / relative) != wanted["sha256"]:
                         raise c.CompletionError("task record bytes changed")
                     os.unlink(relative.name, dir_fd=parent_fd)
             finally:

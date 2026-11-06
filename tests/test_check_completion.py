@@ -335,6 +335,52 @@ class CompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(c.CompletionError, "installed and owner source bytes differ"):
             c.observe(check, expected)
 
+    def test_artifact_draft_inventory_and_check_have_no_replacement_size_cap(self):
+        artifact = self.artifacts / "large.pdf"
+        with artifact.open("wb") as stream:
+            stream.write(b"%PDF-1.7 synthetic byte-hash fixture\n")
+            stream.truncate(129 * c.MAX_BYTES)
+        with artifact.open("rb") as stream:
+            expected = hashlib.file_digest(stream, "sha256").hexdigest()
+        check = {"id": "pdf", "category": "artifacts", "kind": "file",
+                 "target": {"path": str(artifact)}}
+        self.seed["checks"].append(check)
+        self.reset_categories(); self.freeze()
+        self.result = c.draft_result(self.scope_ref)
+        self.assertEqual(self.result["checks"]["pdf"], {"sha256": expected})
+        self.write(self.result_path, self.result); self.final_review()
+        self.assertEqual(c.tree(str(self.artifacts))[str(artifact)], {"sha256": expected})
+        self.assertTrue(self.inspect()["complete"])
+        with artifact.open("r+b") as stream:
+            stream.write(b"changed")
+        with self.assertRaisesRegex(c.CompletionError, "file differs from reviewed bytes"):
+            c.observe(check, {"sha256": expected})
+
+    def test_artifact_hash_preserves_regular_file_and_link_guards(self):
+        import os
+        source = self.root / "artifact.pdf"
+        source.write_bytes(b"synthetic artifact")
+        link = self.root / "artifact-link"
+        link.symlink_to(source)
+        with self.assertRaisesRegex(c.CompletionError, "symlink"):
+            c.artifact_sha(link)
+        link.unlink(); os.link(source, link)
+        with self.assertRaisesRegex(c.CompletionError, "one link"):
+            c.artifact_sha(source)
+        link.unlink(); os.mkfifo(link)
+        with self.assertRaisesRegex(c.CompletionError, "regular file"):
+            c.artifact_sha(link)
+
+    def test_scope_rejects_missing_or_invalid_installed_source_before_freezing(self):
+        for value in (None, "relative.py", 1):
+            seed = copy.deepcopy(self.seed)
+            if value is None:
+                del seed["checks"][1]["target"]["source"]
+            else:
+                seed["checks"][1]["target"]["source"] = value
+            with self.subTest(value=value), self.assertRaises(c.CompletionError):
+                c.prepare(seed)
+
     def test_installed_binary_reads_keep_the_existing_binary_limit(self):
         oversized = self.root / "oversized-binary"
         with oversized.open("wb") as stream:

@@ -115,6 +115,20 @@ def raw_file(value, limit=MAX_BYTES, links=False):
     return raw
 
 
+def artifact_sha(value):
+    """Hash a regular artifact in chunks, without a metadata-size ceiling."""
+    value = path(str(value))
+    for part in (value, *value.parents):
+        if part.is_symlink():
+            raise CompletionError("symlink input refused")
+    fd = os.open(value, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise CompletionError("artifact must be a regular file with one link")
+        return source_stream_sha(stream)
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -485,7 +499,7 @@ def inventory(repo):
 def file_identity(entry):
     if entry.is_symlink():
         return {"symlink": os.readlink(entry)}
-    return {"sha256": sha(raw_file(str(entry), limit=128*MAX_BYTES))}
+    return {"sha256": artifact_sha(entry)}
 
 
 def tree(root):
@@ -876,7 +890,7 @@ def record_inventory(record):
             if stat.S_ISDIR(info.st_mode):
                 value["directory"] = True
             else:
-                value["sha256"] = sha(raw_file(str(entry)))
+                value["sha256"] = artifact_sha(entry)
             result[str(entry.relative_to(root))] = value
             if len(result) > MAX_FILES:
                 raise CompletionError("record inventory exceeds limit")
@@ -960,6 +974,9 @@ def validate_scope(scope, recovery=None):
             raise CompletionError("duplicate or unsupported check")
         if not isinstance(check["target"], dict):
             raise CompletionError("check target must be an object")
+        if check["kind"] == "installed_file":
+            fields(check["target"], ("path", "source"))
+            path(check["target"]["path"]); path(check["target"]["source"])
         if check["kind"] in {"ref_absent", "remote_ref_absent"}:
             validate_ref_observer(check["kind"], check["target"].get("ref"))
         if check["kind"] == "improvement":
@@ -1139,6 +1156,8 @@ def _draft_result(scope_ref, expectations=None):
                 fields(target, ("path", "plan"))
                 return key, {"sha256": sha(control_bytes(target["path"]))}
             fields(target, ("path",), ("source",))
+            if kind == "file":
+                return key, {"sha256": artifact_sha(target["path"])}
             if kind == "evidence":
                 return key, {"sha256": sha(control_bytes(target["path"]))}
             return key, {"sha256": sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
@@ -1192,7 +1211,8 @@ def observe(check, expected, *, preserved=None, owners=()):
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("source",))
         fields(expected, ("sha256",))
-        actual = (sha(control_bytes(target["path"], expected["sha256"])) if kind == "evidence" else
+        actual = (artifact_sha(target["path"]) if kind == "file" else
+                  sha(control_bytes(target["path"], expected["sha256"])) if kind == "evidence" else
                   sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
                                links=kind == "installed_file")))
         if actual != digest(expected["sha256"]):

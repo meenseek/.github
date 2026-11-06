@@ -471,6 +471,12 @@ owner 근거로 포함한다. HTTP GET은 redirect, 누락 revision/health, 오�
 보장하지 않는다. 큐는 검사 중 DB lock을 놓고 이후 token·attempt·revision·cancel·route·
 시간 및 resource state를 다시 확인한 뒤 완료를 CAS한다.
 
+`file` 산출물과 산출물·임시 기록 inventory의 SHA는 파일을 나눠 읽어 계산하며 용량
+상한을 두지 않는다. 제어 JSON의 입력 한도를 PDF 등 산출물의 제출 조건으로 적용하지
+않는다. 일반 파일·symlink·hardlink·정확한 bytes/identity 검사는 유지한다. `installed_file`은
+`target.path`와 비교 원본 `target.source`의 절대경로가 필수이며 `prepare`와 `bind`에서
+누락·잘못된 경로를 거절한다. 이 정의 오류를 종료 시점의 원본 불일치로 미루지 않는다.
+
 대기·취소·중단은 `outcome`에 현재 근거를 연결한다. 이 상태를 완료로 표현하지 않고 남은
 작업과 해소 조건을 보고한다. 완료 검사가 통과하면 `unbind`가 다시 검사하고 세션 pointer를
 제거한다. 취소·blocked 작업의 세션 재사용은 `release`를 사용한다. 원래 scope·result·상태

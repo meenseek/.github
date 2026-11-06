@@ -137,6 +137,30 @@ class HookTests(unittest.TestCase):
         self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
         self.assertTrue(self.f.owner.exists()); self.assertTrue(self.f.repo.exists())
 
+    def test_complete_removes_large_reviewed_export_without_a_record_size_cap(self):
+        self.record_fixture()
+        export = self.records / "export.pdf"
+        export.write_bytes(b"%PDF-1.7 synthetic export\n" + b"x" * (2 * h.c.MAX_BYTES))
+        self.arm_bind(finalize=False)
+        answer = self.call("complete", *self.completion_args())
+        self.assertTrue(answer["complete"], answer)
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+        self.assertTrue(self.f.owner.exists()); self.assertTrue(self.f.repo.exists())
+
+    def test_bind_rejects_missing_installed_source_without_changing_pointer(self):
+        self.call("arm", "--task-id", self.f.seed["task_id"])
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        malformed = json.loads(self.f.scope_path.read_bytes())
+        del malformed["checks"][1]["target"]["source"]
+        self.f.write(self.f.scope_path, malformed)
+        review = {"scope_sha256": self.f.ref(self.f.scope_path)["sha256"], "status": "No Findings"}
+        self.f.write(self.f.review_path, review)
+        before = self.state.read_bytes()
+        self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", review["scope_sha256"],
+                  "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_unbind_actual_cli_removes_nested_task_records(self):
         self.record_fixture(nested=True)
         self.arm_bind()
