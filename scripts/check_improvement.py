@@ -17,9 +17,9 @@ c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
 
-def bounded_list(value, maximum=32):
-    if not isinstance(value, list) or not 1 <= len(value) <= maximum:
-        raise c.CompletionError("expected a nonempty bounded list")
+def nonempty_list(value):
+    if not isinstance(value, list) or not value:
+        raise c.CompletionError("expected a nonempty list")
     return value
 
 
@@ -55,8 +55,8 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
         raise c.CompletionError("improvement plan belongs to another task")
     # A declared owner edit preserves its original criterion in Git/a snapshot.
     # Match both frozen path and bytes; all other bases remain live references.
-    if not isinstance(owners, (list, tuple)) or len(owners) > 32:
-        raise c.CompletionError("expected bounded owner references")
+    if not isinstance(owners, (list, tuple)):
+        raise c.CompletionError("expected owner references")
     c.fields(plan["basis"], ("path", "sha256"))
     c.path(plan["basis"]["path"]); c.digest(plan["basis"]["sha256"])
     preserved = [owner for owner in owners if isinstance(owner, dict)
@@ -72,7 +72,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
     ids, inputs, paths, phases = set(), set(), set(), set()
     baseline_passes = 0
     reproduced = 0
-    for case in bounded_list(plan["cases"]):
+    for case in nonempty_list(plan["cases"]):
         c.fields(case, ("id", "phase", "input", "baseline", "assertions"))
         key = c.text(case["id"])
         if key in ids or not isinstance(case["phase"], str) or case["phase"] not in {"reproduction", "transfer"}:
@@ -86,9 +86,9 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
         inputs.add(case["input"]["sha256"])
         paths.add(identity)
         assertion_paths = set()
-        for assertion in bounded_list(case["assertions"]):
+        for assertion in nonempty_list(case["assertions"]):
             c.fields(assertion, ("path", "equals"))
-            steps = tuple(c.text(part) for part in bounded_list(assertion["path"], 16))
+            steps = tuple(c.text(part) for part in nonempty_list(assertion["path"]))
             if steps in assertion_paths:
                 raise c.CompletionError("duplicate assertion path")
             assertion_paths.add(steps)
@@ -112,7 +112,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
     if len(set(source_paths)) != len(source_paths):
         raise c.CompletionError("duplicate candidate source")
     candidate_sha = c.sha(c.canonical(candidates))
-    results = bounded_list(record["cases"])
+    results = nonempty_list(record["cases"])
     if len(results) != len(plan["cases"]):
         raise c.CompletionError("improvement case coverage differs from the frozen plan")
     after_refs = []
@@ -125,7 +125,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
         after_refs.append(row["after"])
         if not observation(row["after"], case, candidate_sha):
             raise c.CompletionError("candidate failed a frozen reproduction or transfer assertion")
-    applied = bounded_list(record["application"])
+    applied = nonempty_list(record["application"])
     if len(applied) != len(candidates):
         raise c.CompletionError("actual usage must cover every candidate source")
     installed = set()
@@ -135,7 +135,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
         if row["source"] != source or location in installed:
             raise c.CompletionError("installed source coverage differs or is duplicated")
         installed.add(location)
-        if c.sha(c.raw_file(location, links=True)) != source["sha256"]:
+        if c.working_source_sha(location) != source["sha256"]:
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
     validate_plan(plan_ref, task_id, owners=owners)
@@ -144,7 +144,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=()):
     for ref in after_refs:
         c.control_reference(ref)
     for source, row in zip(candidates, applied):
-        if c.sha(c.raw_file(row["installed_path"], links=True)) != source["sha256"]:
+        if c.working_source_sha(row["installed_path"]) != source["sha256"]:
             raise c.CompletionError("actual usage changed during inspection")
     return {"verified": True, "cases": len(results), "baseline_passes": baseline_passes,
             "candidate_passes": len(results), "candidate_minus_baseline_passes": len(results) - baseline_passes,

@@ -33,9 +33,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHand
 CATEGORIES = ("source", "usage", "deployment", "quality", "artifacts",
               "git_resources", "temporary_resources", "recovery")
 MAX_BYTES = 1024 * 1024
-MAX_FILES = 4096
 TIMEOUT = 5
-MAX_OWNER_RECOVERIES = 16
 CLEANUP_KINDS = {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"}
 KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote_ref_absent",
          "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
@@ -72,8 +70,8 @@ def fields(value, required, optional=()):
 
 
 def text(value):
-    if not isinstance(value, str) or not value.strip() or "\0" in value or len(value.encode()) > 4096:
-        raise CompletionError("expected bounded nonempty text")
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise CompletionError("expected nonempty text without NUL")
     return value
 
 
@@ -97,7 +95,7 @@ def path(value):
     return value
 
 
-def raw_file(value, limit=MAX_BYTES, links=False):
+def raw_file(value, links=False):
     value = path(str(value))
     if not links:
         for part in (value, *value.parents):
@@ -107,11 +105,9 @@ def raw_file(value, limit=MAX_BYTES, links=False):
     fd = os.open(value, flags)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit or (not links and info.st_nlink != 1):
-            raise CompletionError("input must be a bounded regular file with one link")
-        raw = stream.read(limit + 1)
-    if len(raw) > limit:
-        raise CompletionError("input too large")
+        if not stat.S_ISREG(info.st_mode) or (not links and info.st_nlink != 1):
+            raise CompletionError("input must be a regular file with one link")
+        raw = stream.read()
     return raw
 
 
@@ -166,8 +162,8 @@ def read_reference(ref):
 def stored_controls(state, location=None):
     """Only historical control readers use this task-local snapshot context."""
     rows = state.get("control_records", [])
-    if not isinstance(rows, list) or len(rows) > 256:
-        raise CompletionError("expected bounded control records")
+    if not isinstance(rows, list):
+        raise CompletionError("expected control records list")
     seen = set()
     for row in rows:
         fields(row, ("path", "sha256", "data"))
@@ -179,7 +175,7 @@ def stored_controls(state, location=None):
             raw = base64.b64decode(row["data"], validate=True)
         except (ValueError, TypeError) as exc:
             raise CompletionError("invalid control record bytes") from exc
-        if len(raw) > MAX_BYTES or sha(raw) != row["sha256"]:
+        if sha(raw) != row["sha256"]:
             raise CompletionError("control record digest differs")
     token = _CONTROL.set((state, str(location) if location else None))
     try:
@@ -226,8 +222,6 @@ def remember_control(state, ref, raw=None):
     if sha(raw) != digest(ref["sha256"]):
         raise CompletionError("control bytes changed before publication")
     rows.append({**ref, "data": base64.b64encode(raw).decode("ascii")})
-    if len(rows) > 256:
-        raise CompletionError("excessive control records")
 
 
 def capture_controls(state, *, final=False, result_raw=None, location=None):
@@ -250,11 +244,15 @@ def capture_controls(state, *, final=False, result_raw=None, location=None):
         keep(state.get("handoff", {}).get("basis"))
         for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
             binding = state.get(name)
-            for _ in range(MAX_OWNER_RECOVERIES):
-                if not binding:
-                    break
-                keep(binding["evidence"]); keep(binding["review"])
+            seen = set()
+            while binding:
+                fields(binding, ("evidence", "review"))
                 evidence = read_control(binding["evidence"])
+                identity = digest(binding["evidence"]["sha256"])
+                if identity in seen:
+                    raise CompletionError("cyclic recovery history")
+                seen.add(identity)
+                keep(binding["evidence"]); keep(binding["review"])
                 keep(evidence.get("authorization"))
                 for owner in evidence.get("owners", []):
                     for ref in owner.get("snapshots", {}).values():
@@ -331,16 +329,16 @@ def contextual_map(pool, function, values):
 
 
 def refs(values):
-    if not isinstance(values, list) or not 1 <= len(values) <= 32:
-        raise CompletionError("expected 1..32 source references")
+    if not isinstance(values, list) or not values:
+        raise CompletionError("expected nonempty source references")
     for ref in values:
         reference(ref)
     return values
 
 
 def control_refs(values):
-    if not isinstance(values, list) or not 1 <= len(values) <= 32:
-        raise CompletionError("expected 1..32 control references")
+    if not isinstance(values, list) or not values:
+        raise CompletionError("expected nonempty control references")
     for ref in values:
         control_reference(ref)
     return values
@@ -355,7 +353,7 @@ def observer_env():
 
 
 def run(argv, cwd=None, timeout=TIMEOUT):
-    # Spool output to bounded-on-read temporary files, avoiding unbounded pipe RAM.
+    # Spool process output separately from pipes; parse the complete observation.
     import tempfile
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
         try:
@@ -364,9 +362,9 @@ def run(argv, cwd=None, timeout=TIMEOUT):
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise CompletionError("observation unavailable or timed out") from exc
         output.seek(0)
-        raw = output.read(MAX_BYTES + 1)
-        if done.returncode or len(raw) > MAX_BYTES:
-            raise CompletionError("observation failed or exceeded output limit")
+        raw = output.read()
+        if done.returncode:
+            raise CompletionError("observation failed")
         return raw
 
 
@@ -463,10 +461,10 @@ def remote_ref(repo, remote, ref, binding):
 def environment(workspace):
     binaries = {name: shutil.which(name, path=observer_env()["PATH"]) for name in ("git", "gh", "ps")}
     ca = ssl.get_default_verify_paths().openssl_cafile
-    return {"https_ca": {"path": ca, "sha256": sha(raw_file(ca, limit=128*MAX_BYTES, links=True))} if ca and Path(ca).is_file() else None,
+    return {"https_ca": {"path": ca, "sha256": working_source_sha(ca)} if ca and Path(ca).is_file() else None,
             "workspace": str(path(workspace)), "python": str(Path(sys.executable).resolve()),
             "python_version": sys.version, "binaries": binaries,
-            "binary_sha256": {k: sha(raw_file(v, limit=128*MAX_BYTES, links=True)) if v else None for k,v in binaries.items()},
+            "binary_sha256": {k: working_source_sha(v) if v else None for k,v in binaries.items()},
             "settings_sha256": sha(canonical(observer_env()))}
 
 
@@ -518,15 +516,13 @@ def tree(root):
                 files[str(entry)] = {"directory": True}
             else:
                 raise CompletionError("unsupported filesystem resource type")
-            if len(files) > MAX_FILES:
-                raise CompletionError("artifact inventory exceeds limit")
     return dict(sorted(files.items()))
 
 
 def owner_refs(values, recovery=None):
     """Read live contracts or the preserved original of a planned edit."""
-    if not isinstance(values, list) or not 1 <= len(values) <= 32:
-        raise CompletionError("expected 1..32 owner references")
+    if not isinstance(values, list) or not values:
+        raise CompletionError("expected nonempty owner references")
     for ref in values:
         fields(ref, ("path", "sha256"), ("original",))
         if "original" not in ref:
@@ -591,24 +587,44 @@ def owner_history_identity_slots(binding):
     slots, seen = [], set()
     while binding:
         fields(binding, ("evidence", "review"))
-        identity = binding["evidence"]["sha256"]
-        if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
-            raise CompletionError("cyclic or excessive owner recovery history")
-        seen.add(identity)
         evidence = read_control(binding["evidence"])
+        identity = digest(binding["evidence"]["sha256"])
+        if identity in seen:
+            raise CompletionError("cyclic owner recovery history")
+        seen.add(identity)
         slots.extend(owner_identity_slots(evidence))
         binding = evidence.get("previous")
     return slots
 
 
 def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), state=None):
-    """Reconcile exact reviewed owner drifts without replacing the frozen scope."""
+    """Validate the complete reviewed chain without a call-stack depth limit."""
+    chain, identities = [], set(seen)
+    while True:
+        evidence = owner_recovery_header(scope_ref, scope, binding)
+        identity = digest(binding["evidence"]["sha256"])
+        if identity in identities:
+            raise CompletionError("cyclic owner recovery history")
+        identities.add(identity)
+        chain.append((binding, evidence))
+        if "previous" not in evidence:
+            break
+        binding = evidence["previous"]
+    previous = {}
+    for index, (binding, evidence) in enumerate(reversed(chain)):
+        recovered = owner_recovery_step(scope_ref, scope, evidence,
+                historical=historical or index < len(chain) - 1, state=state)
+        if previous.keys() - recovered.keys() or (previous and previous == recovered):
+            raise CompletionError("owner recovery omitted earlier owners or repeated unchanged bytes")
+        previous = recovered
+    return previous
+
+
+def owner_recovery_header(scope_ref, scope, binding):
+    """Validate one exact reviewed control before traversing its predecessor."""
     fields(binding, ("evidence", "review"))
     evidence = read_control(binding["evidence"])
     fields(evidence, ("scope_sha256", "task_id", "session_id", "authorization", "owners"), ("previous",))
-    identity = binding["evidence"]["sha256"]
-    if identity in seen or len(seen) >= MAX_OWNER_RECOVERIES:
-        raise CompletionError("cyclic or excessive owner recovery history")
     if (evidence["scope_sha256"], evidence["task_id"], evidence["session_id"]) != (scope_ref["sha256"], scope["task_id"], scope["session_id"]):
         raise CompletionError("owner recovery belongs to another frozen task")
     control_reference(evidence["authorization"])
@@ -616,7 +632,12 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
     if reviewed != {"scope_sha256": scope_ref["sha256"], "recovery_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("independent recovery review does not cover these exact bytes")
     if not isinstance(evidence["owners"], list) or not 1 <= len(evidence["owners"]) <= len(scope["owners"]):
-        raise CompletionError("recovery requires a bounded list of frozen owners")
+        raise CompletionError("recovery requires a nonempty subset of frozen owners")
+    return evidence
+
+
+def owner_recovery_step(scope_ref, scope, evidence, *, historical, state):
+    """Validate an existing history node; live source checks belong to its head."""
     if not historical and state and "filesystem_recovery" in state:
         # The explicit device review covers both frozen scope and owner-source
         # identities. Only this in-memory view changes; evidence bytes survive.
@@ -626,8 +647,6 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
             row = rows.get(slot["common_dir"])
             if row and {k: slot[k] for k in ("device", "inode")} == row["before"]:
                 slot.update(row["after"])
-    previous = (owner_recovery(scope_ref, scope, evidence["previous"], historical=True, seen=(*seen, identity))
-                if "previous" in evidence else {})
     recovered = {}
     for owner in evidence["owners"]:
         fields(owner, ("owner_path",), ("repository", "identity", "original", "current", "source", "snapshots"))
@@ -678,8 +697,6 @@ def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), stat
             observe(source["definition"], source["expected"])
             reference({"path": owner["owner_path"], "sha256": owner["current"]["sha256"]})
         recovered[owner["owner_path"]] = owner["current"]["sha256"]
-    if previous.keys() - recovered.keys() or (previous and previous == recovered):
-        raise CompletionError("owner recovery omitted earlier owners or repeated unchanged bytes")
     return recovered
 
 
@@ -695,8 +712,8 @@ def source_preservation(scope_ref, scope, binding):
             "source_preservation_sha256": binding["evidence"]["sha256"], "status": "No Findings"}:
         raise CompletionError("source preservation requires review of the exact scope and evidence")
     files = evidence["files"]
-    if not isinstance(files, list) or not 1 <= len(files) <= 32:
-        raise CompletionError("expected 1..32 preserved source files")
+    if not isinstance(files, list) or not files:
+        raise CompletionError("expected nonempty preserved source files")
     preserved = {}
     for entry in files:
         fields(entry, ("check_id", "file", "owner", "basis", "ranges"))
@@ -726,8 +743,8 @@ def source_preservation(scope_ref, scope, binding):
         if sha(original) != owner["sha256"]:
             raise CompletionError("preserved original owner bytes changed")
         ranges = entry["ranges"]
-        if not isinstance(ranges, list) or not 1 <= len(ranges) <= 32:
-            raise CompletionError("expected 1..32 exact preserved byte ranges")
+        if not isinstance(ranges, list) or not ranges:
+            raise CompletionError("expected nonempty exact preserved byte ranges")
         pairs, staged, ends = [], [], {"base": 0, "snapshot": 0}
         for region in ranges:
             fields(region, ("base", "snapshot"))
@@ -777,8 +794,6 @@ def preserved_source_bytes(published, pairs):
         result.extend(published[end:start]); result.extend(after)
         end = start + len(before)
     result.extend(published[end:])
-    if len(result) > MAX_BYTES:
-        raise CompletionError("preserved owner exceeds the bounded owner size")
     return bytes(result)
 
 
@@ -820,8 +835,8 @@ def filesystem_view(scope_ref, scope, state):
     if "owner_recovery" in state:
         slots.extend(owner_history_identity_slots(state["owner_recovery"]))
     identities = evidence["identities"]
-    if not isinstance(identities, list) or not 1 <= len(identities) <= 64:
-        raise CompletionError("filesystem recovery needs bounded exact identities")
+    if not isinstance(identities, list) or not identities:
+        raise CompletionError("filesystem recovery needs nonempty exact identities")
     replacements = {}
     for row in identities:
         fields(row, ("path", "before", "after"))
@@ -892,8 +907,6 @@ def record_inventory(record):
             else:
                 value["sha256"] = artifact_sha(entry)
             result[str(entry.relative_to(root))] = value
-            if len(result) > MAX_FILES:
-                raise CompletionError("record inventory exceeds limit")
     return result
 
 
@@ -964,8 +977,8 @@ def validate_scope(scope, recovery=None):
     control_reference(scope["request"]); digest(scope["request_digest"])
     owners = owner_refs(scope["owners"], recovery)
     fields(scope["categories"], CATEGORIES)
-    if not isinstance(scope["checks"], list) or len(scope["checks"]) > 128:
-        raise CompletionError("expected at most 128 checks")
+    if not isinstance(scope["checks"], list):
+        raise CompletionError("expected checks list")
     checks = {}
     for check in scope["checks"]:
         fields(check, ("id", "category", "kind", "target"))
@@ -1004,15 +1017,15 @@ def validate_scope(scope, recovery=None):
             fields(category["not_applicable"], ("reason", "basis"))
             text(category["not_applicable"]["reason"])
             basis = category["not_applicable"]["basis"]
-            if not isinstance(basis, list) or not 1 <= len(basis) <= 32:
-                raise CompletionError("expected 1..32 N/A owner references")
+            if not isinstance(basis, list) or not basis:
+                raise CompletionError("expected nonempty N/A owner references")
             for ref in basis:
                 fields(ref, ("path", "sha256"))
                 if not any(ref == {"path": owner["path"], "sha256": owner["sha256"]} for owner in owners):
                     raise CompletionError("N/A requires a bound owner contract")
     for key in ("repositories", "artifact_roots"):
-        if not isinstance(scope[key], list) or len(scope[key]) > 16 or len(scope[key]) != len(set(scope[key])):
-            raise CompletionError("expected unique bounded path list")
+        if not isinstance(scope[key], list) or len(scope[key]) != len(set(scope[key])):
+            raise CompletionError("expected unique path list")
         for value in scope[key]:
             path(value)
     path(scope["state_path"])
@@ -1091,7 +1104,7 @@ def process_identity(pid):
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT, env=observer_env())
     if done.returncode == 1 and not done.stdout:
         return None
-    if done.returncode or len(done.stdout) > 8192:
+    if done.returncode:
         raise CompletionError("process observation unavailable")
     return done.stdout.decode().strip()
 
@@ -1160,8 +1173,7 @@ def _draft_result(scope_ref, expectations=None):
                 return key, {"sha256": artifact_sha(target["path"])}
             if kind == "evidence":
                 return key, {"sha256": sha(control_bytes(target["path"]))}
-            return key, {"sha256": sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
-                                               links=kind == "installed_file"))}
+            return key, {"sha256": working_source_sha(target["path"])}
         if kind == "git_source":
             fields(target, ("repository", "remote", "main", "files", "remote_binding"))
             repo = target["repository"]
@@ -1213,12 +1225,11 @@ def observe(check, expected, *, preserved=None, owners=()):
         fields(expected, ("sha256",))
         actual = (artifact_sha(target["path"]) if kind == "file" else
                   sha(control_bytes(target["path"], expected["sha256"])) if kind == "evidence" else
-                  sha(raw_file(target["path"], limit=(128 if kind == "installed_file" else 1)*MAX_BYTES,
-                               links=kind == "installed_file")))
+                  working_source_sha(target["path"]))
         if actual != digest(expected["sha256"]):
             raise CompletionError("file differs from reviewed bytes")
         if kind == "installed_file":
-            if "source" not in target or sha(raw_file(target["source"], limit=128*MAX_BYTES, links=True)) != actual:
+            if "source" not in target or working_source_sha(target["source"]) != actual:
                 raise CompletionError("installed and owner source bytes differ")
         return {"sha256": actual, "observation": "bytes only; invocation/quality remain owner checks"}
     if kind == "absent":
@@ -1367,14 +1378,14 @@ def exception_view(result):
     for value in inline.values():
         classification(value)
     groups = result.get("exception_groups", [])
-    if not isinstance(groups, list) or len(groups) > MAX_FILES:
-        raise CompletionError("exception groups must be a bounded list")
+    if not isinstance(groups, list):
+        raise CompletionError("exception groups must be a list")
     merged = dict(inline)
     for group in groups:
         fields(group, ("items", "classification"))
         items = group["items"]
-        if not isinstance(items, list) or not 1 <= len(items) <= MAX_FILES:
-            raise CompletionError("exception group needs bounded explicit resource keys")
+        if not isinstance(items, list) or not items:
+            raise CompletionError("exception group needs nonempty explicit resource keys")
         classification(group["classification"])
         for key in items:
             text(key)
@@ -1477,8 +1488,8 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
                 failures.append({"id": key, "reason": failure})
             else:
                 observed[key] = observation
-    if not isinstance(resources, list) or len(resources) > 128:
-        raise CompletionError("expected bounded accumulated resource list")
+    if not isinstance(resources, list):
+        raise CompletionError("expected accumulated resource list")
     if len({resource.get("id") for resource in resources if isinstance(resource, dict)}) != len(resources):
         raise CompletionError("duplicate accumulated resource identity")
     for resource in resources:

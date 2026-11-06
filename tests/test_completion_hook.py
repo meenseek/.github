@@ -147,6 +147,51 @@ class HookTests(unittest.TestCase):
         self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
         self.assertTrue(self.f.owner.exists()); self.assertTrue(self.f.repo.exists())
 
+    def test_actual_cli_extends_history_and_still_observes_every_old_resource(self):
+        self.arm_bind()
+        before = json.loads(self.state.read_bytes())
+        history = [{"id":f"history-{index}", "kind":"absent",
+                    "target":{"path":str(self.f.root / f"old-resource-{index}")},
+                    "basis":self.f.ref(self.f.owner)} for index in range(1100)]
+        before["resources"] = history
+        self.f.write(self.state, before)
+        self.call("reserve", "--id", "next", *self.basis())
+        current = json.loads(self.state.read_bytes())
+        self.assertEqual(current["resources"][:1100], history)
+        self.assertEqual(current["scope"], before["scope"])
+        self.assertEqual(current["review"], before["review"])
+        self.call("inspect", ok=False)
+        resource = self.f.root / "next-resource.json"
+        self.f.write(resource, {"kind":"absent", "target":{"path":str(self.f.root / "never-created")}})
+        self.call("attach", "--id", "next", "--resource", str(resource), *self.basis())
+        self.assertTrue(self.call("inspect")["complete"])
+        Path(history[-1]["target"]["path"]).write_text("still owned")
+        failure = self.call("inspect", ok=False)
+        self.assertIn("resource:history-1099", [item["id"] for item in failure["failures"]])
+        self.assertEqual(json.loads(self.state.read_bytes())["resources"][:1100], history)
+
+    def test_large_pointer_is_readable_and_stale_cas_is_atomic(self):
+        self.call("arm", "--task-id", self.f.seed["task_id"])
+        state, before = h.load_state(self.state)
+        state["task_id"] = "x" * (2 * h.c.MAX_BYTES)
+        h.replace(self.state, state, before)
+        self.assertEqual(h.load_state(self.state)[0]["task_id"], state["task_id"])
+        current = self.state.read_bytes()
+        with self.assertRaisesRegex(h.c.CompletionError, "pointer changed"):
+            h.replace(self.state, state, before)
+        self.assertEqual(self.state.read_bytes(), current)
+
+    def test_actual_attach_stdin_accepts_complete_large_json(self):
+        self.arm_bind()
+        self.call("reserve", "--id", "stdin-resource", *self.basis())
+        payload = h.c.canonical({"kind":"absent", "target":{"path":str(self.f.root / "never-created")}})
+        argv = [sys.executable,"-I",str(SCRIPT),"--bindings",str(self.root),"attach",
+                "--session",self.f.seed["session_id"],"--expected-sha256",h.c.sha(self.state.read_bytes()),
+                "--id","stdin-resource","--resource","-",*self.basis()]
+        done = subprocess.run(argv,input=payload+b" "*(2*h.c.MAX_BYTES),capture_output=True,timeout=35)
+        self.assertEqual(done.returncode,0,done.stdout)
+        self.assertTrue(self.call("inspect")["complete"])
+
     def test_bind_rejects_missing_installed_source_without_changing_pointer(self):
         self.call("arm", "--task-id", self.f.seed["task_id"])
         self.f.seed["state_path"] = str(self.state)

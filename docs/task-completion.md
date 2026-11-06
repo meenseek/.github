@@ -111,8 +111,9 @@ seed의 `record_root`에 그 절대경로를 지정한다. `prepare`는 폴더�
 다시 읽기 위해 임시 파일이 계속 남아 있을 필요는 없다. 이후 자원·상태 근거, 최종 기대값·
 리뷰와 선택한 과거 관측도 같은 lock/CAS에 결합한다. 현재 소스·owner·산출물·설치본은
 계속 실제 파일과 원격 상태에서 검사한다. 원래 owner의 명시된 시작 사본은 과거 입력이다.
-무관한 로그·seed·wheel을 통째로 저장하지 않는다. 통제 원문은 최대 256개이며 파일별 및
-상태 전체의 기존 1 MiB 상한을 유지한다. 초과·손상은 기존 상태를 보존하고 거절한다.
+무관한 로그·seed·wheel을 통째로 저장하지 않는다. 통제 원문과 누적 기록에 임의의 개수·용량
+상한을 두지 않는다. 형식·중복·정확한 digest·경로·소유권 검사를 유지하며 유효하지 않은 입력은
+기존 상태를 보존하고 거절한다.
 실제 장기 작업의 state는 기본 `.completion/`에 두며 `--bindings`를 휘발성 폴더로 옮기지 않는다.
 
 소스·사용본·소유 계약·workspace·자원 목록과 겹치는 경로는 거부한다. 최종 리뷰는
@@ -139,7 +140,7 @@ bytes가 HEAD에 보존된 경우 원래 계약의 repository identity·revision
 N/A 근거는 고정한 원래 owner를 가리키고, 변경 뒤 타당성도 최종 리뷰에서 확인한다.
 Git에 원래 bytes가 없는 기존 dirty owner는 첫 수정 전에 원본 bytes를 대상 저장소 밖의
 별도 일반 파일에 보존하고 seed의 `owner_snapshots`에 정확한 owner 경로별 사본 참조를
-명시할 수 있다. 사본은 symlink·hardlink가 아닌 1 MiB 이하 파일이며, 현재 owner와 같은
+명시할 수 있다. 사본은 symlink·hardlink가 아닌 일반 파일이며, 현재 owner와 같은
 SHA여야 한다. 해당 owner는 여전히 `git_source`에 선언해야 한다.
 
 ```json
@@ -188,7 +189,7 @@ python3 scripts/completion_hook.py recover-owner --session SESSION_ID --expected
 별도 `outcome working`으로 한다. 추가 drift는 새 evidence의 `previous`에 현재
 `{evidence, review}`를 그대로 결속해 이어간다. 기존 근거 파일을 덮어쓰거나 이전 연결을
 생략하지 않는다. 새 목록은 이전 owner를 모두 포함하며 각 원래 bytes부터 현재 bytes까지
-대조한다. 최대 16개 연결이며 순환·동일 bytes 재연결을 거부한다. 과거 연결은 고정 Git
+대조한다. 연결 수에 임의 상한을 두지 않으며 순환·동일 bytes 재연결을 거부한다. 과거 연결은 고정 Git
 bytes·identity·리뷰를 확인하고, 최신 연결만 현재 canonical source와 대조한다.
 최종 리뷰는 기존 scope/result SHA와 추가 `owner_recovery_sha256`를 묶는다.
 검사 전후에 원래 owner의 Git bytes, 현재 owner·canonical source와 변경 재확인 리뷰를 다시
@@ -290,8 +291,8 @@ path/SHA와 일치하면 기존 `owners[].original`의 Git 원문 또는 외부 
 근거의 변경은 거부한다. 완료 검사는 고정 scope의 owner 연결을 전달하며, 독립 CLI는 현재 근거를
 계속 대조한다. 계획·기준·기대값을 수정한 문서로 바꾸지 않는다. 각 case는 `id`, `phase` (`reproduction` 또는 `transfer`),
 `input`과 `baseline`(각 path/SHA), `assertions`를 가진다. assertion은 JSON object의 key
-경로 `path: ["complete"]`와 고정한 `equals: false` 같은 값 비교다. case·assertion은 각각
-최대 32개, key 경로는 최대 16개이며 입력 bytes와 path는 사례 사이에 중복하지 않는다.
+경로 `path: ["complete"]`와 고정한 `equals: false` 같은 값 비교다. case·assertion·key 경로에 임의 수량 상한을 두지 않으며 입력 bytes와 path는 사례 사이에
+중복하지 않는다.
 
 각 수정 전후 관측은 `case_id`, `input_sha256`, `implementation_sha256`, `result`를 가진다.
 수정 전 implementation은 계획의 baseline SHA, 수정 후는 아래 candidate 참조 목록의
@@ -390,8 +391,7 @@ dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하�
 owner·reason·scope·removal_condition·basis를 모두 가져야 하며, items는 비어 있지 않은
 명시 목록이다. 그룹 안·그룹 사이·개별 예외와의 중복을 거부하고 wildcard나 prefix를
 해석하지 않는다. 실제 변경 자원 중 어느 쪽에도 없는 key는 계속 실패한다.
-사용되지 않는 명시 key의 처리는 기존 개별 예외와 같다. 원문 1 MiB 제한과 exact result
-SHA의 최종 리뷰를 유지하며 보고서도 그룹을 펼치지 않는다. 검사 마지막에 각 판단의
+사용되지 않는 명시 key의 처리는 기존 개별 예외와 같다. exact result SHA의 최종 리뷰를 유지하며 보고서도 그룹을 펼치지 않는다. 검사 마지막에 각 판단의
 근거 파일을 다시 대조해 검사 중 변조를 거부한다.
 소유 도구의 적용·정리 뒤 `draft`로 이 결과의 후보를 수집할 수 있다.
 아래 `complete`는 직접 채팅의 종료 명령이다. 큐에서는 `finish --status completed`가
@@ -539,3 +539,9 @@ GitHub API 읽기와 HTTP GET을 수행한다. 검사 지연은 실제 대상·�
 따라 측정해 작업의 기존 검증 기록에 남긴다. 서로 다른 조건의 시간으로 절감률을 만들지 않는다.
 Jev가 필요한지는 실제 품질·재작업·비용 비교에서 이 작은 실행 경계로 해결되지 않는 요구가
 확인될 때 재평가한다.
+
+산출물·임시 기록 inventory와 지원하는 참조·의무·예외·자원·검증 사례 목록에 임의의
+항목 수 상한을 두지 않는다. 전체 목록을 대조하고 중복·순환·불일치를 거절한다. 저장된
+제어 JSON·원문·설치 파일에도 제출 용량 상한을 적용하지 않는다. 바이너리·산출물의
+digest는 나눠 읽어 계산한다. 외부 HTTP 상태 응답의 읽기 한도와 도구 실행 timeout은
+네트워크 관측의 실행 경계이며 이력서 파일·문구·대상 수의 제출 조건이 아니다.

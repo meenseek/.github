@@ -21,6 +21,66 @@ spec.loader.exec_module(c)
 
 
 class CompletionTests(unittest.TestCase):
+    def test_long_process_identity_is_complete_and_malformed_recovery_is_rejected(self):
+        identity = b"Fri Nov  6 10:00:00 2026 program " + b"x" * 10000
+        with mock.patch.object(c.subprocess,"run",return_value=subprocess.CompletedProcess([],0,identity,b"")):
+            self.assertEqual(c.process_identity(123),identity.decode())
+        bad = {"evidence":{"path":str(self.owner),"sha256":[]},"review":self.ref(self.owner)}
+        with self.assertRaisesRegex(c.CompletionError,"SHA-256"):
+            c.owner_recovery(self.scope_ref,json.loads(self.scope_path.read_bytes()),bad)
+
+    def test_long_owner_history_keeps_every_snapshot_without_recursion(self):
+        scope = json.loads(self.scope_path.read_bytes())
+        original = self.root / "owner-original.md"
+        original.write_bytes(self.owner.read_bytes())
+        binding = None
+        for index in range(1100):
+            current = self.root / f"owner-current-{index}.md"
+            current.write_text(f"owner generation {index}")
+            evidence = {"scope_sha256":self.scope_ref["sha256"], "task_id":scope["task_id"],
+                        "session_id":scope["session_id"], "authorization":self.ref(self.request),
+                        "owners":[{"owner_path":str(self.owner),"snapshots":{
+                            "original":self.ref(original),"current":self.ref(current)}}]}
+            if binding: evidence["previous"] = binding
+            proof = self.root / f"history-{index}.json"; self.write(proof,evidence)
+            review = self.root / f"history-review-{index}.json"
+            self.write(review,{"scope_sha256":self.scope_ref["sha256"],
+                               "recovery_sha256":self.ref(proof)["sha256"],"status":"No Findings"})
+            binding = {"evidence":self.ref(proof),"review":self.ref(review)}
+        self.owner.write_bytes(current.read_bytes())
+        self.assertEqual(c.owner_recovery(self.scope_ref,scope,binding),
+                         {str(self.owner):self.ref(current)["sha256"]})
+        (self.root / "owner-current-500.md").write_text("changed historical bytes")
+        with self.assertRaisesRegex(c.CompletionError,"source bytes changed"):
+            c.owner_recovery(self.scope_ref,scope,binding)
+
+    def test_inventory_past4096_still_checks_late_file_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for index in range(4100):
+                (root / str(index)).write_bytes(b"synthetic record")
+            record = c.record_directory(str(root))
+            self.assertEqual(len(c.tree(str(root))), 4101)
+            self.assertEqual(len(c.record_inventory(record)), 4100)
+            (root / "late-link").symlink_to(root / "4099")
+            with self.assertRaisesRegex(c.CompletionError, "symlink"):
+                c.record_inventory(record)
+
+    def test_control_records_and_json_have_no_item_or_byte_budget(self):
+        import base64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw = c.canonical({"text": "x" * (2 * c.MAX_BYTES)})
+            source = root / "input.json"; source.write_bytes(raw)
+            self.assertEqual(c.read_reference({"path":str(source), "sha256":c.sha(raw)})["text"], "x" * (2 * c.MAX_BYTES))
+            rows = [{"path":str(root / str(index)), "sha256":c.sha(b"{}"),
+                     "data":base64.b64encode(b"{}").decode()} for index in range(300)]
+            with c.stored_controls({"control_records":rows}):
+                self.assertEqual(c.read_control({"path":rows[-1]["path"],"sha256":rows[-1]["sha256"]}), {})
+            rows[-1]["data"] = base64.b64encode(b"changed").decode()
+            with self.assertRaisesRegex(c.CompletionError, "digest"):
+                with c.stored_controls({"control_records":rows}): pass
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -171,10 +231,10 @@ class CompletionTests(unittest.TestCase):
         self.write(self.result_path, self.result)
         with self.assertRaisesRegex(c.CompletionError, "final review"): self.inspect()
 
-    def test_exception_groups_keep_the_exact_input_limit(self):
+    def test_large_exception_groups_keep_exact_review_binding(self):
         self.grouped_result(["path:" + str(self.artifacts / "retained.txt")])
         payload = self.result_path.read_bytes()
-        self.result_path.write_bytes(payload + b" " * (c.MAX_BYTES - len(payload)))
+        self.result_path.write_bytes(payload + b" " * (2 * c.MAX_BYTES))
         self.final_review()
         self.assertTrue(self.inspect()["complete"])
         self.result_path.write_bytes(self.result_path.read_bytes() + b" ")
@@ -381,20 +441,19 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(c.CompletionError):
                 c.prepare(seed)
 
-    def test_installed_binary_reads_keep_the_existing_binary_limit(self):
+    def test_installed_binary_has_no_size_budget_and_still_checks_its_source(self):
         oversized = self.root / "oversized-binary"
         with oversized.open("wb") as stream:
             stream.truncate(129 * c.MAX_BYTES)
         self.installed.unlink(); self.installed.symlink_to(oversized)
-        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
-            c.draft_result(self.scope_ref)
+        expected = {"sha256":c.working_source_sha(oversized)}
+        self.assertEqual(c.draft_result(self.scope_ref)["checks"]["installed"], expected)
         check = json.loads(self.scope_path.read_bytes())["checks"][1]
-        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
-            c.observe(check, self.result["checks"]["installed"])
-        self.installed.unlink(); self.installed.symlink_to(self.repo / "tool.py")
         check["target"]["source"] = str(oversized)
-        with self.assertRaisesRegex(c.CompletionError, "bounded regular file"):
-            c.observe(check, self.result["checks"]["installed"])
+        self.assertEqual(c.observe(check,expected)["sha256"],expected["sha256"])
+        check["target"]["source"] = str(self.repo / "tool.py")
+        with self.assertRaisesRegex(c.CompletionError, "installed and owner source bytes differ"):
+            c.observe(check, expected)
 
     def test_source_hash_rejects_missing_blob_nonregular_file_and_timeout(self):
         revision = self.git("rev-parse", "main")
@@ -408,14 +467,15 @@ class CompletionTests(unittest.TestCase):
             with self.assertRaisesRegex(c.CompletionError, "source observation unavailable or timed out"):
                 c.git_source_sha(str(self.repo), revision, "tool.py")
 
-    def test_metadata_and_policy_byte_limits_remain_enforced(self):
-        policy = self.root / "oversized.json"
-        policy.write_bytes(b" " * (c.MAX_BYTES + 1))
-        with self.assertRaises(c.CompletionError):
-            c.raw_file(str(policy))
-        with self.assertRaisesRegex(c.CompletionError, "exceeded output limit"):
-            c.run([sys.executable, "-I", "-c",
-                   "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024 + 1))"])
+    def test_metadata_and_process_observations_are_complete_past_old_byte_limit(self):
+        policy = self.root / "large.json"
+        raw = c.canonical({"text":"x" * (c.MAX_BYTES + 1)})
+        policy.write_bytes(raw)
+        self.assertEqual(c.raw_file(str(policy)),raw)
+        with self.assertRaisesRegex(c.CompletionError,"source bytes changed"):
+            c.read_reference({"path":str(policy),"sha256":"0"*64})
+        self.assertEqual(len(c.run([sys.executable, "-I", "-c",
+                   "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024 + 1))"])),c.MAX_BYTES+1)
 
     def test_draft_actual_cli_collects_candidate_without_claiming_completion(self):
         output = self.root / "candidate.json"

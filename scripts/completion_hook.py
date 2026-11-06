@@ -117,8 +117,6 @@ def locked(root):
 
 
 def replace(filename, value, expected):
-    if len(c.canonical(value)) + 1 > c.MAX_BYTES:
-        raise c.CompletionError("completion state exceeds input limit")
     if filename.exists() and c.sha(c.raw_file(str(filename))) != expected:
         raise c.CompletionError("pointer changed; reread before mutation")
     if not filename.exists() and expected is not None:
@@ -444,7 +442,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "hook":
-            answer = hook(c.decode(sys.stdin.buffer.read(c.MAX_BYTES + 1)), Path(args.bindings))
+            answer = hook(c.decode(sys.stdin.buffer.read()), Path(args.bindings))
         elif args.command == "configure":
             answer = c.write_new(args.output, configuration(c.decode(c.raw_file(args.existing))))
         else:
@@ -492,11 +490,11 @@ def main(argv=None):
                             basis = c.control_reference({"path": args.basis, "sha256": args.basis_sha256})
                             found = [r for r in state["resources"] if r["id"] == args.id]
                             if args.command == "reserve":
-                                if found or len(state["resources"]) >= 128: raise c.CompletionError("duplicate or excessive resource reservation")
+                                if found: raise c.CompletionError("duplicate resource reservation")
                                 state["resources"].append({"id": c.text(args.id), "kind": "reserved", "target": {}, "basis": basis})
                             else:
                                 if len(found) != 1 or found[0]["kind"] != "reserved": raise c.CompletionError("resource must be reserved before creation")
-                                resource = c.decode(sys.stdin.buffer.read(c.MAX_BYTES + 1) if args.resource == "-"
+                                resource = c.decode(sys.stdin.buffer.read() if args.resource == "-"
                                                     else c.raw_file(args.resource))
                                 c.fields(resource, ("kind", "target"))
                                 if resource["kind"] not in {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"} or not isinstance(resource["target"], dict):
@@ -565,7 +563,7 @@ def main(argv=None):
                             if args.inputs:
                                 if any((args.result, args.review, args.review_sha256)):
                                     raise c.CompletionError("use stdin inputs or file inputs, not both")
-                                payload = c.decode(sys.stdin.buffer.read(c.MAX_BYTES + 1))
+                                payload = c.decode(sys.stdin.buffer.read())
                                 c.fields(payload, ("result", "review"))
                                 scope = c.read_control(state["scope"])
                                 root = c.path(scope["record_root"]["path"])
