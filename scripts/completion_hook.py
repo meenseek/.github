@@ -85,6 +85,7 @@ def measurement_event(payload, explicit_root=None):
 
 def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=None):
     """A missing observer cannot change a successful cleanup into task failure."""
+    bound = None
     try:
         if Path(binding_path).parent != ROOT:
             return
@@ -99,6 +100,8 @@ def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=N
             else:
                 return store.finish_cleanup(state["task_id"], answer)
     except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error) as exc:
+        if preparing and bound and isinstance(exc, getattr(bound[0], 'RepairIncomplete', ())):
+            raise c.CompletionError(str(exc)) from exc
         print(json.dumps({"measurement": "pending", "error_type": type(exc).__name__}), file=sys.stderr)
 
 
@@ -334,6 +337,8 @@ def _hook(payload, root=ROOT, measurement_root=None):
             raise c.CompletionError("armed task has no frozen reviewed scope")
         scope = c.read_control(state["scope"])
         c.validate_state_identity(scope, state, filename)
+        if not state.get('result_path') or not state.get('final_review'):
+            raise c.CompletionError('required work observations and independent final review have not been finalized')
         answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"], workspace=str(cwd), review_ref=state["review"], state_path=str(filename))
         if answer["complete"]: return {"systemMessage": "정리 검사 통과: 고정한 범위의 현재 관측 완료. 사용자 최종 보고에 적용·배포·잔여 자원·예외를 포함하세요."}
         reason = "정리 미완료: " + json.dumps(answer["failures"], ensure_ascii=False)[:3000]

@@ -21,6 +21,33 @@ spec.loader.exec_module(c)
 
 
 class CompletionTests(unittest.TestCase):
+    def test_work_predicates_reject_failure_missing_fields_and_bool_number_coercion(self):
+        report=self.root/'work-observations.json'
+        definition={'id':'owner-quality','category':'quality','kind':'evidence','target':{'path':str(report),
+            'assertions':[{'path':['artifact','playable'],'equals':True},{'path':['owner','accepted'],'equals':True}]}}
+        for value in ({'artifact':{'playable':False},'owner':{'accepted':True}},
+                      {'artifact':{'playable':True}},
+                      {'artifact':{'playable':1},'owner':{'accepted':True}}):
+            self.write(report,value)
+            with self.assertRaises(c.CompletionError):c.observe(definition,{'sha256':self.ref(report)['sha256']})
+        self.write(report,{'artifact':{'playable':True},'owner':{'accepted':True}})
+        self.assertEqual(c.observe(definition,{'sha256':self.ref(report)['sha256']})['assertions_checked'],2)
+        definition['target']['assertions']=[]
+        self.seed['checks'].append(definition);self.reset_categories()
+        with self.assertRaisesRegex(c.CompletionError,'nonempty frozen'):c.prepare(self.seed)
+
+    def test_scoped_work_predicates_are_required_for_actual_completion(self):
+        report=self.root/'work-observations.json';self.write(report,{'passed':False})
+        self.seed['checks'].append({'id':'owner-quality','category':'quality','kind':'evidence',
+            'target':{'path':str(report),'assertions':[{'path':['passed'],'equals':True}]}})
+        self.reset_categories();self.freeze()
+        self.result['checks']['owner-quality']={'sha256':self.ref(report)['sha256']}
+        self.write(self.result_path,self.result);self.final_review()
+        self.assertFalse(self.inspect()['complete'])
+        self.write(report,{'passed':True});self.result['checks']['owner-quality']={'sha256':self.ref(report)['sha256']}
+        self.write(self.result_path,self.result);self.final_review()
+        self.assertTrue(self.inspect()['complete'])
+
     def advance_scoped_main(self):
         (self.repo / "tool.py").write_text("print('updated synthetic tool')\n")
         self.git("commit", "-am", "test: advance main")
