@@ -399,6 +399,19 @@ stash는 현재 Git ref를 확인하므로 packed ref와 reflog 없는 ref도 �
 worktree 정리는 점유·보존 확인과 해당 앱의 archive 경계를 따른다. 다른 작업의 브랜치,
 dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하지 않는다.
 
+Codex가 managed worktree를 채팅의 기본 checkout으로 사용하면 `archive_worktree`는
+`The task's primary checkout cannot be removed.`로 거절할 수 있다. 이 경우 정상 handoff로
+로컬 checkout에서 이어간 뒤, 반환된 대상 채팅·작업 경로와 변경 보존을 확인하고 그 채팅의
+`list_artifacts`에서 남은 attachment를 조회해 archive한다. 기본 checkout 보호를 해제하거나
+Git·파일 삭제로 우회하지 않는다. Handoff가 새 대상 채팅을 반환할 수 있으므로 원래 채팅의
+경로나 ID가 바뀌었다고 가정하지 않는다.
+목적지의 기존 변경이 이전을 막으면 정확한 대상 파일과 index·작업 bytes를 먼저 고정한다.
+한시적 보관이 필요하면 그 경로만 보관하고, 같은 HEAD에서 index까지 복원·대조한 뒤
+이번 보관본만 정확한 OID로 정리한다. 임시 보관본도 reserve/attach로 연결한다.
+현재 채팅은 자신을 handoff할 수 없으며, 다른 채팅으로 지시를 보내려면 해당 도구의
+명시적 사용자 승인을 따른다. 이 조건이 남았으면 필요한 이전·archive 단계를 구체적으로
+보고하고, 워크트리 부재나 정리 완료로 대신하지 않는다.
+
 최종 result는 고정 scope SHA, 모든 obligation ID의 실제 기대값, 정확한 예외만 담는다.
 
 여러 자원이 같은 보존 판단을 공유하면 optional `exception_groups`에
