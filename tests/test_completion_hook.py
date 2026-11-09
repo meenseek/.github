@@ -524,6 +524,378 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.state.exists())
         self.assertEqual(json.loads(self.state.read_bytes())["resources"][0]["id"], "late")
 
+    def legacy_resource(self, target, *, kind="absent", basis=None):
+        state = json.loads(self.state.read_bytes())
+        resource = {"id":"retired-runtime", "kind":kind, "target":{"path":str(target)},
+                    "basis":basis or self.f.ref(self.f.owner)}
+        if kind == "worktree_absent":
+            resource["target"]["repository"] = str(self.f.repo)
+        state["resources"].append(resource)
+        self.f.write(self.state, state)
+        return resource
+
+    def direct_complete(self):
+        return ["--bindings", str(self.root), "complete", "--session", self.f.seed["session_id"],
+                "--expected-sha256", h.c.sha(self.state.read_bytes()), *self.goal_args(), *self.completion_args()]
+
+    def test_legacy_missing_record_child_completes_without_rewriting_resource_or_scope(self):
+        self.record_fixture(nested=True)
+        self.arm_bind(finalize=False)
+        marker = self.records / "nested" / "retired-runtime.json"
+        resource = self.legacy_resource(marker)
+        original = json.loads(self.state.read_bytes())
+        self.call("finalize", *self.completion_args())
+        accepted = json.loads(self.state.read_bytes())
+        for name in ("scope", "review", "resources"):
+            self.assertEqual(accepted[name], original[name])
+        self.assertEqual(accepted["resources"], [resource])
+        self.assertNotIn(str(marker), [row["path"] for row in accepted["control_records"]])
+        self.assertNotIn("nested/retired-runtime.json", accepted["record_manifest"])
+        self.assertTrue(self.call("inspect")["complete"])
+        self.assertTrue(self.call("unbind")["binding_released"])
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    def test_legacy_record_absence_supports_terminal_release(self):
+        self.stopped_record_fixture()
+        self.legacy_resource(self.records / "retired-runtime.json")
+        answer = self.call("release")
+        self.assertTrue(answer["stopped"]); self.assertFalse(answer["complete"])
+        self.assertFalse(self.records.exists()); self.assertTrue(self.stop_basis.exists())
+
+    def test_legacy_record_absence_supports_stdin_final_inputs(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        self.legacy_resource(self.records / "retired-runtime.json")
+        result = json.loads(self.f.result_path.read_bytes())
+        review = {"scope_sha256":self.f.scope_ref["sha256"], "status":"No Findings",
+                  "result_sha256":h.c.sha(h.c.canonical(result)),
+                  "record_inventory_sha256":h.c.reviewed_record_inventory(
+                      h.c.record_directory(str(self.records)), str(self.records / ".state-final-review.json"))}
+        stdin = io.TextIOWrapper(io.BytesIO(h.c.canonical({"result":result,"review":review})))
+        args = self.direct_complete(); args = args[:args.index("--result")] + ["--inputs","-"]
+        with mock.patch.object(h.sys,"stdin",stdin), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(args),0)
+        self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    def test_legacy_record_absence_rejects_root_ancestor_and_worktree_kind(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        for target, kind in ((self.records,"absent"), (self.records.parent,"absent"),
+                             (self.records / "missing", "worktree_absent")):
+            with self.subTest(target=target, kind=kind):
+                self.legacy_resource(target, kind=kind)
+                before = self.state.read_bytes()
+                self.call("complete", *self.completion_args(), ok=False)
+                self.assertEqual(self.state.read_bytes(), before)
+                value = json.loads(before); value["resources"] = []; self.f.write(self.state, value)
+        self.assertTrue(self.f.request.exists())
+
+    def test_legacy_record_absence_rejects_existing_files_directories_and_symlinks_before_capture(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        marker = self.records / "retired-runtime.json"
+        self.legacy_resource(marker)
+        before = self.state.read_bytes()
+        for kind in ("file", "directory", "dangling-symlink", "symlink-loop"):
+            with self.subTest(kind=kind):
+                if kind == "file": marker.write_text("preserve recreated runtime")
+                elif kind == "directory": marker.mkdir()
+                elif kind == "dangling-symlink": marker.symlink_to(self.records / "never-created")
+                else: marker.symlink_to(marker)
+                with mock.patch.object(h.c, "remember_control", side_effect=AssertionError("capture must not begin")), redirect_stdout(io.StringIO()):
+                    self.assertEqual(h.main(self.direct_complete()), 2)
+                self.assertTrue(h.os.path.lexists(marker)); self.assertEqual(self.state.read_bytes(), before)
+                if kind == "directory": marker.rmdir()
+                else: marker.unlink()
+        alias = self.records / "alias"; alias.symlink_to(self.f.root, target_is_directory=True)
+        value = json.loads(before); value["resources"][0]["target"]["path"] = str(alias / "missing")
+        self.f.write(self.state, value); before = self.state.read_bytes()
+        self.call("complete", *self.completion_args(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before); self.assertTrue(alias.is_symlink())
+
+    def test_legacy_record_absence_rejects_changed_root_identity_before_capture(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        self.legacy_resource(self.records / "missing")
+        before = self.state.read_bytes(); args = self.direct_complete(); moved = self.records.with_name("old-records")
+        self.records.rename(moved); self.records.mkdir()
+        with mock.patch.object(h.c, "remember_control", side_effect=AssertionError("capture must not begin")), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(args), 2)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue((moved / "request.txt").exists())
+
+    def test_legacy_record_absence_cannot_overlap_active_basis_or_accepted_controls(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        marker = self.records / "retired-runtime.json"
+        for role in ("basis", "accepted", "active-input", "manifest"):
+            with self.subTest(role=role):
+                start = self.state.read_bytes()
+                marker.write_text("previous accepted input")
+                ref = self.f.ref(marker)
+                self.legacy_resource(marker, basis=ref if role == "basis" else None)
+                state = json.loads(self.state.read_bytes())
+                if role == "accepted":
+                    import base64
+                    state["control_records"].append({**ref,"data":base64.b64encode(marker.read_bytes()).decode()})
+                elif role == "active-input": state["status_basis"] = ref
+                elif role == "manifest": state["record_manifest"] = {marker.name:{"device":marker.stat().st_dev,"inode":marker.stat().st_ino,"sha256":ref["sha256"]}}
+                marker.unlink(); self.f.write(self.state,state); before = self.state.read_bytes()
+                self.call("complete", *self.completion_args(), ok=False)
+                self.assertEqual(self.state.read_bytes(),before); self.assertTrue(self.f.request.exists())
+                self.state.write_bytes(start)
+
+    def test_legacy_absence_cannot_become_new_control_or_captured_record(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        marker = self.records / "retired-runtime.json"; self.legacy_resource(marker)
+        before = self.state.read_bytes(); original = h.c.record_inventory
+        def capture_then_disappear(record):
+            marker.write_text("unreviewed transient runtime")
+            result = original(record); marker.unlink(); return result
+        with mock.patch.object(h.c,"record_inventory",side_effect=capture_then_disappear), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(self.direct_complete()),2)
+        self.assertEqual(self.state.read_bytes(),before)
+        state = json.loads(before)
+        with self.assertRaisesRegex(h.c.CompletionError,"active completion records"):
+            h.c.remember_control(state,{"path":str(marker),"sha256":h.c.sha(b"input")},b"input")
+        self.assertNotIn(str(marker),[row["path"] for row in state["control_records"]])
+
+    def test_legacy_absence_rechecks_recreation_after_observing_and_before_cleanup(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        marker = self.records / "retired-runtime.json"; self.legacy_resource(marker)
+        original = h.c.observe
+        def recreate(check, expected, **kwargs):
+            answer = original(check,expected,**kwargs)
+            if check.get("id") == "retired-runtime": marker.write_text("preserve runtime recreated after observation")
+            return answer
+        with mock.patch.object(h.c,"observe",side_effect=recreate), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(self.direct_complete()),2)
+        self.assertTrue(marker.exists()); self.assertTrue(self.f.request.exists()); marker.unlink()
+        original_close = h.close_checked
+        def before_cleanup(*args,**kwargs):
+            marker.write_text("preserve runtime recreated before cleanup")
+            return original_close(*args,**kwargs)
+        with mock.patch.object(h,"close_checked",side_effect=before_cleanup), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(self.direct_complete()),2)
+        self.assertTrue(marker.exists()); self.assertTrue(self.f.request.exists()); self.assertTrue(self.state.exists())
+
+    def test_legacy_absence_stale_cas_preserves_original_state_and_records(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        self.legacy_resource(self.records / "missing")
+        before = self.state.read_bytes(); args = self.direct_complete()
+        args[args.index("--expected-sha256")+1] = "0"*64
+        with redirect_stdout(io.StringIO()): self.assertEqual(h.main(args),2)
+        self.assertEqual(self.state.read_bytes(),before); self.assertTrue(self.f.request.exists())
+
+    def test_final_publication_cannot_admit_a_new_record_child_resource(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        state,before=h.load_state(self.state)
+        state['resources'].append({'id':'new-runtime','kind':'absent',
+            'target':{'path':str(self.records/'never-registered')},'basis':self.f.ref(self.f.owner)})
+        original=self.state.read_bytes()
+        with self.assertRaisesRegex(h.c.CompletionError,'preserve the accepted'):
+            h.publish(self.state,state,before,final=True)
+        self.assertEqual(self.state.read_bytes(),original);self.assertTrue(self.f.request.exists())
+
+    def test_legacy_state_can_reserve_and_attach_unrelated_resources_without_weakening_admission(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        legacy=self.legacy_resource(self.records/'legacy-missing')
+        self.call('reserve','--id','new-runtime',*self.basis())
+        definition=self.f.root/'new-resource.json'
+        self.f.write(definition,{'kind':'absent','target':{'path':str(self.records/'new-child')}})
+        before=self.state.read_bytes()
+        self.call('attach','--id','new-runtime','--resource',str(definition),*self.basis(),ok=False)
+        self.assertEqual(self.state.read_bytes(),before)
+        runtime=self.f.root/'new-runtime';runtime.write_text('owned unrelated runtime')
+        self.f.write(definition,{'kind':'absent','target':{'path':str(runtime)}})
+        self.call('attach','--id','new-runtime','--resource',str(definition),*self.basis())
+        self.assertEqual(json.loads(self.state.read_bytes())['resources'][0],legacy)
+        failure=self.call('complete',*self.completion_args(),ok=False)
+        self.assertIn('resource:new-runtime',[item['id'] for item in failure['failures']])
+        self.assertTrue(runtime.exists());self.assertTrue(self.f.request.exists())
+        runtime.unlink()
+        self.assertTrue(self.call('complete',*self.completion_args())['binding_released'])
+
+    def test_shared_publication_preserves_legacy_obligations_and_strictly_admits_only_new_resources(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        legacy=self.legacy_resource(self.records/'legacy-missing')
+        state,before=h.load_state(self.state)
+        state['resources'].append({'id':'new-runtime','kind':'reserved',
+            'target':{},'basis':self.f.ref(self.f.owner)})
+        h.publish(self.state,state,before)
+        state,before=h.load_state(self.state)
+        state['resources'][-1].update(kind='absent',target={'path':str(self.f.root/'unrelated-missing')})
+        h.publish(self.state,state,before)
+        state,before=h.load_state(self.state)
+        state['resources'].append({'id':'new-child','kind':'reserved','target':{},'basis':self.f.ref(self.f.owner)})
+        h.publish(self.state,state,before)
+        state,before=h.load_state(self.state);original=self.state.read_bytes()
+        self.assertEqual(state['resources'][0],legacy)
+        state['resources'][-1].update(kind='absent',target={'path':str(self.records/'new-child')})
+        with self.assertRaisesRegex(h.c.CompletionError,'active completion records'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+        state,_=h.load_state(self.state);state['resources']=state['resources'][1:]
+        with self.assertRaisesRegex(h.c.CompletionError,'preserve accumulated'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+        state,_=h.load_state(self.state);state['resources'].reverse()
+        with self.assertRaisesRegex(h.c.CompletionError,'preserve accumulated'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+        state,_=h.load_state(self.state)
+        state['resources'][-1].update(kind='absent',target={'path':str(self.f.root/'another-missing')})
+        h.publish(self.state,state,before)
+        self.assertTrue(self.call('complete',*self.completion_args())['binding_released'])
+
+    def test_shared_publication_preserves_accepted_controls_and_manifest_from_disk(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        marker=self.records/'historical-input';marker.write_bytes(b'accepted historical input')
+        state,before=h.load_state(self.state);h.c.remember_control(state,self.f.ref(marker));marker.unlink()
+        state['resources'].append({'id':'legacy','kind':'absent','target':{'path':str(marker)},'basis':self.f.ref(self.f.owner)})
+        self.f.write(self.state,state);original=self.state.read_bytes()
+        state,before=h.load_state(self.state)
+        state.update(result_path=str(self.f.result_path),final_review=self.f.ref(self.f.final_review_path))
+        state['control_records']=[row for row in state['control_records'] if row['path']!=str(marker)]
+        with self.assertRaisesRegex(h.c.CompletionError,'accepted controls'):
+            h.publish(self.state,state,before,final=True)
+        self.assertEqual(self.state.read_bytes(),original)
+        state,before=h.load_state(self.state);state['resources']=[]
+        state['record_manifest']={'historical-input':{'device':1,'inode':2,'sha256':h.c.sha(b'old')}}
+        self.f.write(self.state,state);original=self.state.read_bytes()
+        for value in (None,{}):
+            state,before=h.load_state(self.state)
+            if value is None:state.pop('record_manifest')
+            else:state['record_manifest']=value
+            with self.assertRaisesRegex(h.c.CompletionError,'prior record manifest'):
+                h.publish(self.state,state,before)
+            self.assertEqual(self.state.read_bytes(),original)
+
+    def test_shared_publication_rejects_owner_field_changes_and_unreserved_append(self):
+        self.arm_bind(finalize=False);original=self.state.read_bytes()
+        mutations={'task_id':'different-task','session_id':'different-session','intent':'different-intent',
+            'execution_owner':'operations','outcome':'waiting','status_basis':self.f.ref(self.f.owner),
+            'owner_recovery':None,'filesystem_recovery':None,'source_preservation':None,
+            'origin':{},'handoff':{},'review':self.f.ref(self.f.owner),'scope':None,
+            'result_path':str(self.f.result_path),'final_review':self.f.ref(self.f.final_review_path)}
+        for key,value in mutations.items():
+            with self.subTest(field=key):
+                state,before=h.load_state(self.state);state[key]=value
+                with self.assertRaises(h.c.CompletionError):h.publish(self.state,state,before)
+                self.assertEqual(self.state.read_bytes(),original)
+        state,before=h.load_state(self.state)
+        state['resources'].append({'id':'not-reserved','kind':'absent','target':{'path':str(self.f.root/'missing')},'basis':self.f.ref(self.f.owner)})
+        with self.assertRaisesRegex(h.c.CompletionError,'reserve new resources'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+
+    def test_shared_publication_only_capture_appends_control_history(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        state,before=h.load_state(self.state);original=self.state.read_bytes()
+        extra=self.f.root/'unselected-input';extra.write_bytes(b'unselected')
+        h.c.remember_control(state,self.f.ref(extra))
+        with self.assertRaisesRegex(h.c.CompletionError,'accepted controls'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+        state,before=h.load_state(self.state)
+        with mock.patch.object(h.c,'capture_controls',side_effect=lambda proposed,**kwargs:proposed['control_records'].clear()):
+            with self.assertRaisesRegex(h.c.CompletionError,'accepted control prefix'):
+                h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original)
+
+    def test_shared_final_capture_retains_different_hashes_at_the_same_control_path(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        state,before=h.load_state(self.state)
+        state.update(result_path=str(self.f.result_path),final_review=self.f.ref(self.f.final_review_path))
+        first_result=self.f.result_path.read_bytes();h.publish(self.state,state,before,final=True)
+        accepted=json.loads(self.state.read_bytes());second_result=first_result+b'\n'
+        self.f.result_path.write_bytes(second_result)
+        review=json.loads(self.f.final_review_path.read_bytes())
+        review['result_sha256']=h.c.sha(second_result)
+        review['record_inventory_sha256']=h.c.reviewed_record_inventory(h.c.record_directory(str(self.records)),str(self.f.final_review_path))
+        self.f.write(self.f.final_review_path,review)
+        state,before=h.load_state(self.state);state['final_review']=self.f.ref(self.f.final_review_path)
+        h.publish(self.state,state,before,final=True)
+        current=json.loads(self.state.read_bytes())
+        self.assertEqual(current['control_records'][:len(accepted['control_records'])],accepted['control_records'])
+        rows=[row for row in current['control_records'] if row['path']==str(self.f.result_path)]
+        self.assertEqual([row['sha256'] for row in rows],[h.c.sha(first_result),h.c.sha(second_result)])
+        self.assertTrue(self.call('complete')['binding_released'])
+
+    def test_shared_new_scope_admission_still_rejects_previously_accumulated_record_children(self):
+        self.record_fixture();self.call('arm','--task-id',self.f.seed['task_id'])
+        self.f.seed['state_path']=str(self.state);self.f.freeze()
+        self.legacy_resource(self.records/'old-child')
+        state,before=h.load_state(self.state);original=self.state.read_bytes()
+        state.update(scope=self.f.scope_ref,review=self.f.ref(self.f.review_path))
+        for final in (False,True):
+            with self.subTest(final=final), self.assertRaises(h.c.CompletionError):
+                h.publish(self.state,state,before,final=final)
+            self.assertEqual(self.state.read_bytes(),original)
+        fresh=self.root/'uncreated-final.json'
+        with self.assertRaisesRegex(h.c.CompletionError,'existing frozen scope'):
+            h.publish(fresh,state,None,final=True)
+        self.assertFalse(fresh.exists());self.assertEqual(self.state.read_bytes(),original)
+
+    def test_legacy_child_pending_cleanup_resumes_after_root_removal_and_rejects_recreated_roots(self):
+        self.record_fixture(nested=True);self.arm_bind(finalize=False)
+        legacy=self.legacy_resource(self.records/'legacy-missing')
+        replacement=self.f.root/'replacement-root';replacement.mkdir()
+        complete=self.direct_complete();unlink=Path.unlink
+        def interrupted_pointer(path,*args,**kwargs):
+            if path == self.state:raise PermissionError('synthetic post-removal pointer failure')
+            return unlink(path,*args,**kwargs)
+        with mock.patch.object(Path,'unlink',autospec=True,side_effect=interrupted_pointer), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(complete),2)
+        self.assertFalse(self.records.exists());self.assertTrue(self.state.exists())
+        pending=json.loads(self.state.read_bytes());self.assertIn('cleanup',pending)
+        self.assertEqual(pending['resources'],[legacy]);original=self.state.read_bytes()
+        for transition in ('unchanged','removed','changed'):
+            proposed=json.loads(original)
+            if transition=='removed':proposed.pop('cleanup')
+            elif transition=='changed':proposed['cleanup']['answer']['complete']=False
+            with self.subTest(transition=transition), self.assertRaisesRegex(h.c.CompletionError,'pending record cleanup'):
+                h.publish(self.state,proposed,h.c.sha(original))
+            self.assertEqual(self.state.read_bytes(),original);self.assertFalse(self.records.exists())
+        args=['--bindings',str(self.root),'complete','--session',self.f.seed['session_id'],
+              '--expected-sha256',h.c.sha(original),*self.goal_args()]
+        replacement.rename(self.records)
+        with redirect_stdout(io.StringIO()):self.assertEqual(h.main(args),2)
+        self.assertEqual(self.state.read_bytes(),original);self.assertTrue(self.records.exists())
+        self.records.rmdir();self.records.symlink_to(self.f.repo,target_is_directory=True)
+        with redirect_stdout(io.StringIO()):self.assertEqual(h.main(args),2)
+        self.assertEqual(self.state.read_bytes(),original);self.assertTrue(self.records.is_symlink())
+        self.records.unlink()
+        with mock.patch.object(h.c,'check_scope',side_effect=AssertionError('cleanup must use the accepted observation')), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.main(args),0)
+        self.assertFalse(self.records.exists());self.assertFalse(self.state.exists())
+        self.assertTrue(self.f.owner.exists());self.assertTrue((self.f.repo/'tool.py').exists())
+
+    def test_generic_publication_cannot_create_a_cleanup_certificate(self):
+        self.record_fixture();self.arm_bind(finalize=False)
+        state,before=h.load_state(self.state);original=self.state.read_bytes()
+        state['cleanup']={'record_root':h.c.record_directory(str(self.records)),
+            'manifest':h.c.record_inventory(h.c.record_directory(str(self.records))),
+            'request_digest':self.f.seed['request_digest'],
+            'answer':{'complete':True,'stopped':False,'task_id':self.f.seed['task_id'],'scope_sha256':self.f.scope_ref['sha256']}}
+        with self.assertRaisesRegex(h.c.CompletionError,'pending record cleanup'):
+            h.publish(self.state,state,before)
+        self.assertEqual(self.state.read_bytes(),original);self.assertTrue(self.f.request.exists())
+
+    def test_new_recovery_control_cannot_capture_a_legacy_absence_target(self):
+        self.record_fixture(); self.arm_bind(finalize=False)
+        marker=self.records/'recovery-basis.json';self.legacy_resource(marker)
+        state,before=h.load_state(self.state)
+        raw=b'{"reason":"new recovery authorization"}'
+        ref={'path':str(marker),'sha256':h.c.sha(raw)}
+        state['handoff']={'basis':ref}
+        original=self.state.read_bytes()
+        control_bytes=h.c.control_bytes
+        def selected_bytes(filename,expected=None):
+            return raw if filename == str(marker) else control_bytes(filename,expected)
+        with mock.patch.object(h.c,'control_bytes',side_effect=selected_bytes):
+            with self.assertRaisesRegex(h.c.CompletionError,'active completion records'):
+                h.c.capture_controls(state,location=self.state,observing=True)
+        self.assertNotIn(str(marker),[row['path'] for row in state['control_records']])
+        self.assertEqual(self.state.read_bytes(),original);self.assertTrue(self.f.request.exists())
+
     def test_cleanup_registration_protects_record_root_and_its_relatives(self):
         self.record_fixture()
         self.arm_bind(finalize=False)
@@ -1004,6 +1376,14 @@ class HookTests(unittest.TestCase):
         recovered = json.loads(self.state.read_bytes())
         self.assertEqual(recovered["outcome"], "waiting"); self.assertEqual(recovered["scope"], waiting["scope"])
         self.assertEqual(recovered["resources"], waiting["resources"]); self.assertEqual(recovered["status_basis"], waiting["status_basis"])
+        preserved=self.state.read_bytes()
+        for mutation in ('drop','replace-review'):
+            proposed=json.loads(preserved)
+            if mutation=='drop':proposed.pop('owner_recovery')
+            else:proposed['owner_recovery']['review']=self.f.ref(self.f.owner)
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(h.c.CompletionError,'preserve owner state'):
+                h.publish(self.state,proposed,h.c.sha(preserved))
+            self.assertEqual(self.state.read_bytes(),preserved)
         self.call("recover-owner", *args, ok=False)
         self.call("outcome", "--status", "working", "--basis", str(self.f.request), "--basis-sha256", self.f.ref(self.f.request)["sha256"])
         self.assertTrue(self.call("inspect")["complete"])
