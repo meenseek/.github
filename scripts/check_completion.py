@@ -247,13 +247,15 @@ def remember_control(state, ref, raw=None):
     rows = state.setdefault("control_records", [])
     if any((r["path"], r["sha256"]) == (ref["path"], ref["sha256"]) for r in rows):
         return
+    for resource in state["resources"]:
+        protect_completion_records(resource, [ref["path"]])
     raw = raw_file(ref["path"]) if raw is None else raw
     if sha(raw) != digest(ref["sha256"]):
         raise CompletionError("control bytes changed before publication")
     rows.append({**ref, "data": base64.b64encode(raw).decode("ascii")})
 
 
-def capture_controls(state, *, final=False, result_raw=None, location=None):
+def capture_controls(state, *, final=False, result_raw=None, location=None, observing=False):
     """Save the exact accepted inputs in the same CAS as their references."""
     if not state.get("scope"):
         return
@@ -261,9 +263,15 @@ def capture_controls(state, *, final=False, result_raw=None, location=None):
         def keep(ref):
             if ref:
                 remember_control(state, ref, control_bytes(ref["path"], ref["sha256"]))
-        keep(state["scope"]); keep(state["review"])
         scope = read_control(state["scope"])
         scope = filesystem_scope(state["scope"], scope, state)
+        def guard():
+            if final or observing:
+                protect_bound_records(scope, state, location, state["resources"], observing=observing)
+            else:
+                protect_control_records(scope, state, location, state["resources"])
+        guard()
+        keep(state["scope"]); keep(state["review"])
         keep(scope["request"])
         for owner in scope["owners"]:
             keep(owner.get("original", {}).get("snapshot"))
@@ -321,6 +329,7 @@ def capture_controls(state, *, final=False, result_raw=None, location=None):
                             keep(case["after"])
             if final and "record_root" in scope:
                 state["record_manifest"] = record_inventory(scope["record_root"])
+        guard()
 
 
 def state_location(scope):
@@ -996,11 +1005,62 @@ def protect_completion_records(check, protected):
     """Absence checks must not require removal of their own verification inputs."""
     if check["kind"] not in {"absent", "worktree_absent"}:
         return
-    target = path(check["target"]["path"]).resolve()
+    target = path(check["target"]["path"])
     for value in protected:
-        record = path(value).resolve()
-        if target.is_relative_to(record) or record.is_relative_to(target):
-            raise CompletionError("cleanup target overlaps active completion records")
+        record = path(value)
+        try:
+            resolved = target.resolve(), record.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise CompletionError("cleanup target has invalid symlink resolution") from exc
+        for candidate, protected_path in ((target, record), resolved):
+            if candidate.is_relative_to(protected_path) or protected_path.is_relative_to(candidate):
+                raise CompletionError("cleanup target overlaps active completion records")
+
+
+def protect_control_records(scope, state, location, resources):
+    """Metadata capture must never turn an absence target into a control input."""
+    protected = [str(location)] if location is not None else []
+    for name in ("scope", "review", "final_review", "status_basis"):
+        if state.get(name):
+            protected.append(state[name]["path"])
+    if state.get("result_path"):
+        protected.append(state["result_path"])
+    protected.extend(row["path"] for row in state.get("control_records", []))
+    protected.extend(resource["basis"]["path"] for resource in state["resources"])
+    checks = scope["checks"] if scope else []
+    if scope:
+        protected.append(scope["request"]["path"])
+    protected = list(dict.fromkeys(protected))
+    for check in [*checks, *resources]:
+        protect_completion_records(check, protected)
+
+
+def protect_bound_records(scope, state, location, resources, *, observing=False):
+    """Keep admission strict; only observe already absent accumulated children."""
+    protect_control_records(scope, state, location, resources)
+    if not scope or "record_root" not in scope:
+        return
+    record = scope["record_root"]
+    root = path(record["path"])
+    for check in scope["checks"]:
+        protect_completion_records(check, [str(root)])
+    for resource in resources:
+        if (observing and resource["kind"] == "absent"
+                and (target := path(resource["target"]["path"])) != root and target.is_relative_to(root)):
+            # This is an observation, never authorization to delete the target.
+            if any(part.is_symlink() for part in (target, *target.parents)):
+                raise CompletionError("record absence target has a symlink component")
+            if os.path.lexists(root) and record_directory(str(root)) != record:
+                raise CompletionError("record root identity changed")
+            if os.path.lexists(target):
+                raise CompletionError("record absence target remains")
+            for manifest in (state.get("record_manifest", {}), state.get("cleanup", {}).get("manifest", {})):
+                if not isinstance(manifest, dict):
+                    raise CompletionError("expected record manifest")
+                if any((entry := root / name) == target or entry.is_relative_to(target) for name in manifest):
+                    raise CompletionError("record absence target overlaps captured record manifest")
+        else:
+            protect_completion_records(resource, [str(root)])
 
 
 def validate_record_root(scope):
@@ -1499,6 +1559,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     if (state["task_id"], state["intent"], state["scope"]) != (scope["task_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
     scope, resources = filesystem_view(scope_ref, scope, state)
+    protect_bound_records(scope, state, location, resources, observing=True)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
     preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
@@ -1613,6 +1674,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
     # Recheck immutable inputs and accumulated handles after observations.
+    protect_bound_records(scope, state, location, resources, observing=True)
     filesystem_scope(scope_ref, read_control(scope_ref), state)
     control_reference(scope_ref); control_reference(scope["request"])
     if recovery: owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)

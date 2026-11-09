@@ -35,22 +35,11 @@ def pointer(root, session):
     return c.path(str(root)) / (session + ".json")
 
 
-def protect_records(state, filename, resources):
-    protected = [str(filename)]
-    for name in ("scope", "review", "final_review", "status_basis"):
-        if state.get(name):
-            protected.append(state[name]["path"])
-    if state.get("result_path"):
-        protected.append(state["result_path"])
-    checks = []
+def protect_records(state, filename, resources, *, observing=False):
+    scope = None
     if state.get("scope"):
-        scope = c.read_control(state["scope"])
-        protected.append(scope["request"]["path"])
-        if scope.get("record_root"):
-            protected.append(scope["record_root"]["path"])
-        checks = scope["checks"]
-    for resource in [*checks, *resources]:
-        c.protect_completion_records(resource, protected)
+        scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), state)
+    c.protect_bound_records(scope, state, filename, resources, observing=observing)
 
 
 def measurement_store(explicit_root=None):
@@ -228,6 +217,7 @@ def finish_cleanup(filename, state, before):
         c.reference(state.get("status_basis"))
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
+    protect_records(state, filename, state["resources"], observing=True)
     remove_records(cleanup["record_root"], cleanup["manifest"])
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
@@ -255,6 +245,7 @@ def _close_checked(filename, state, before, scope, answer, measurement_turns=Non
         if observed: result["work_measurement"] = observed
         return result
     scope = c.filesystem_scope(state["scope"], scope, state)
+    c.protect_bound_records(scope, state, filename, state["resources"], observing=True)
     record = scope["record_root"]
     if answer.get("stopped") and c.path(state["status_basis"]["path"]).is_relative_to(c.path(record["path"])):
         raise c.CompletionError("stopped disposition must remain in the owner records outside task records")
@@ -400,11 +391,92 @@ def adopt_session(filename, state, before, args):
             "task_id": state["task_id"], "origin_preserved": True}
 
 
+def publication_admissions(state, accepted, *, final):
+    """Validate allowed deltas against the disk CAS state before capturing inputs."""
+    c.fields(state, c.STATE_FIELDS, c.STATE_OPTIONAL)
+    if state["intent"] != "closure":
+        raise c.CompletionError("invalid closure intent")
+    if not isinstance(state["resources"], list):
+        raise c.CompletionError("expected accumulated resource list")
+    if "cleanup" in state or accepted is not None and "cleanup" in accepted:
+        raise c.CompletionError("pending record cleanup must use complete/unbind/release")
+    if final and (accepted is None or accepted["scope"] is None):
+        raise c.CompletionError("final publication requires an existing frozen scope")
+    previous_rows = accepted.get("control_records", []) if accepted else []
+    rows = state.get("control_records", [])
+    if (not isinstance(previous_rows, list) or not isinstance(rows, list)
+            or ("control_records" in state) != (accepted is not None and "control_records" in accepted)
+            or c.canonical(rows) != c.canonical(previous_rows)):
+        raise c.CompletionError("publication must preserve accepted controls before capture")
+    if (("record_manifest" in state) != (accepted is not None and "record_manifest" in accepted)
+            or c.canonical(state.get("record_manifest")) != c.canonical(accepted.get("record_manifest") if accepted else None)):
+        raise c.CompletionError("publication must preserve the prior record manifest before capture")
+    if accepted is None:
+        # A fresh producer can create an initial state, not import historical authority.
+        allowed = set(c.STATE_FIELDS) | {"execution_owner"}
+        if (set(state) - allowed or rows or state["outcome"] != "working"
+                or state["resources"] or state["result_path"] is not None or state["final_review"] is not None):
+            raise c.CompletionError("initial publication cannot claim history or final inputs")
+        if (state["scope"] is None) != (state["review"] is None):
+            raise c.CompletionError("initial scope and review must be paired")
+        if state["scope"] is not None:
+            c.fields(state["scope"], ("path", "sha256")); c.fields(state["review"], ("path", "sha256"))
+        return state["resources"]
+    # Resource updates and reviewed final inputs are the only generic transitions.
+    # bind/outcome/adopt/recover and cleanup retain their dedicated owner boundaries.
+    allowed = {"resources"} | ({"result_path", "final_review"} if final else set())
+    controlled = {"control_records", "record_manifest"}
+    changed = {name for name in (state.keys() | accepted.keys()) - controlled
+               if name not in state or name not in accepted
+               or c.canonical(state[name]) != c.canonical(accepted[name])}
+    if changed - allowed:
+        raise c.CompletionError("publication must preserve owner state: " + ", ".join(sorted(changed - allowed)))
+    if final and c.canonical(accepted["resources"]) != c.canonical(state["resources"]):
+        raise c.CompletionError("final publication must preserve the accepted accumulated resources")
+    if final and (state["result_path"] is None or state["final_review"] is None):
+        raise c.CompletionError("final publication requires the result/review pair")
+    for resource in state["resources"]:
+        c.fields(resource, ("id", "kind", "target", "basis"))
+        c.text(resource["id"])
+    previous = {resource["id"]:resource for resource in accepted["resources"]}
+    current = {resource["id"]:resource for resource in state["resources"]}
+    if len(previous) != len(accepted["resources"]) or len(current) != len(state["resources"]):
+        raise c.CompletionError("duplicate accumulated resource identity")
+    if list(current)[:len(previous)] != list(previous):
+        raise c.CompletionError("publication must preserve accumulated resource order")
+    for key, old in previous.items():
+        new = current.get(key)
+        if c.canonical(new) != c.canonical(old):
+            attached = (old["kind"] == "reserved" and new and new["kind"] in c.CLEANUP_KINDS
+                        and {k:v for k,v in new.items() if k not in {"kind", "target"}}
+                        == {k:v for k,v in old.items() if k not in {"kind", "target"}})
+            if not attached:
+                raise c.CompletionError("publication must preserve accumulated resource obligations")
+    if any(resource["kind"] != "reserved" or resource["target"] != {}
+           for resource in state["resources"][len(previous):]):
+        raise c.CompletionError("publication must reserve new resources before attaching them")
+    return state["resources"] if final else [resource for resource in state["resources"]
+        if c.canonical(previous.get(resource["id"])) != c.canonical(resource)]
+
+
 def publish(filename, state, before, *, final=False):
-    """Shared publication boundary for direct and registered Workspace callers."""
-    c.capture_controls(state, final=final, location=filename)
+    """Shared publication boundary; the disk state owns authority and history."""
+    accepted = None
+    if os.path.lexists(filename):
+        accepted, digest = load_state(filename)
+        if digest != before:
+            raise c.CompletionError("pointer changed; reread before publication")
+    elif before is not None:
+        raise c.CompletionError("pointer disappeared")
+    admitted = publication_admissions(state, accepted, final=final)
     with c.stored_controls(state, filename):
-        protect_records(state, filename, state["resources"])
+        protect_records(state, filename, admitted, observing=final)
+    c.capture_controls(state, final=final, location=filename, observing=final)
+    previous_rows = accepted.get("control_records", []) if accepted else []
+    if c.canonical(state.get("control_records", [])[:len(previous_rows)]) != c.canonical(previous_rows):
+        raise c.CompletionError("capture changed the accepted control prefix")
+    with c.stored_controls(state, filename):
+        protect_records(state, filename, admitted, observing=final)
     return replace(filename, state, before)
 
 
@@ -578,9 +650,10 @@ def main(argv=None):
                                     raise c.CompletionError("stdin control origins must not shadow staging files")
                                 state.update(result_path=str(result_origin), final_review={
                                     "path": str(review_origin), "sha256": c.sha(review_raw)})
+                                protect_records(state, filename, state["resources"], observing=True)
                                 c.remember_control(state, {"path": state["result_path"], "sha256": c.sha(result_raw)}, result_raw)
                                 c.remember_control(state, state["final_review"], review_raw)
-                                c.capture_controls(state, final=True, result_raw=result_raw, location=filename)
+                                c.capture_controls(state, final=True, result_raw=result_raw, location=filename, observing=True)
                             elif any((args.result, args.review, args.review_sha256)):
                                 if not all((args.result, args.review, args.review_sha256)):
                                     raise c.CompletionError("provide all result/review references together")
@@ -589,14 +662,14 @@ def main(argv=None):
                                            or not any((r["path"], r["sha256"]) == (final["path"], final["sha256"])
                                                       for r in state.get("control_records", [])))
                                 state.update(result_path=str(c.path(args.result)), final_review=c.control_reference(final))
-                                c.capture_controls(state, final=changed, location=filename)
+                                c.capture_controls(state, final=changed, location=filename, observing=True)
                             elif not state.get("final_review") or not state.get("result_path"):
                                 raise c.CompletionError("publish reviewed final inputs before completing")
-                            protect_records(state, filename, state["resources"])
+                            protect_records(state, filename, state["resources"], observing=True)
                             if args.command == "complete":
                                 # Preserve reviewed inputs for recovery before observing. A failed
                                 # inspection leaves this CAS-updated pointer bound for retry.
-                                c.capture_controls(state, location=filename)
+                                c.capture_controls(state, location=filename, observing=True)
                                 before = replace(filename, state, before)["sha256"]
                                 scope = c.read_control(state["scope"])
                                 answer = c.check_scope(state["scope"], state["result_path"], task_id=state["task_id"],
@@ -628,7 +701,7 @@ def main(argv=None):
                             c.remember_control(state, state["status_basis"], c.control_bytes(
                                 state["status_basis"]["path"], state["status_basis"]["sha256"]))
                         else:
-                            c.capture_controls(state, location=filename)
+                            c.capture_controls(state, location=filename, observing=args.command == "finalize")
                         answer = replace(filename, state, before)
         print(c.canonical(answer).decode()); return 0
     except (c.CompletionError, OSError, ValueError, TypeError, KeyError) as exc:

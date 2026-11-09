@@ -220,6 +220,15 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(c.CompletionError, "active completion records"):
                 c.prepare(seed)
 
+    def test_record_guard_preserves_lexical_and_resolved_protection_across_aliases(self):
+        records=self.root/'records';records.mkdir()
+        outside=self.root/'outside';outside.mkdir()
+        (records/'escaped').symlink_to(outside,target_is_directory=True)
+        alias=self.root/'alias';alias.symlink_to(records,target_is_directory=True)
+        for target in (records/'escaped'/'missing',alias/'missing'):
+            with self.subTest(target=target), self.assertRaisesRegex(c.CompletionError,'active completion records'):
+                c.protect_completion_records({'kind':'absent','target':{'path':str(target)}},[str(records)])
+
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True).stdout.decode().strip()
 
