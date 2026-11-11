@@ -411,6 +411,34 @@ stash는 현재 Git ref를 확인하므로 packed ref와 reflog 없는 ref도 �
 
 ## 검증과 종료
 
+### 진행 중 확인된 후속 범위 연결
+
+이미 고정된 작업에서 사용자가 추가 수정을 승인하면 `extend`로 새 범위를 연결한다.
+원래 task/session/request/digest, 실행 환경과 기록 폴더를 유지하며, 기존 검사·owner·저장소·
+산출물 루트와 시작 inventory는 그대로 보존한다. 새 항목만 뒤에 추가하고 category의 검사
+목록을 재계산한다. 원래 검사를 삭제·수정하거나 시작 상태를 최신 상태로 덮어쓰지 않는다.
+
+기존 `waiting` pointer의 최신 SHA, 새 범위와 일반 범위 리뷰, 추가 지시 원문,
+독립 delta 리뷰를 함께 전달한다. delta 리뷰는 `previous_scope_sha256`, `scope_sha256`,
+`authorization_sha256`, `previous_state_sha256`, `status: No Findings`를 정확히 묶는다.
+기존 recovery 연결이 있으면 해당 복구 경계를 먼저 해결하며 이를 새 범위로 재해석하지 않는다.
+기록 manifest가 고정됐거나 cleanup이 시작됐으면 해당 종료 경계를 먼저 마치며,
+`extend`로 기록 검토를 초기화하지 않는다.
+
+```sh
+python3 scripts/completion_hook.py extend --session SESSION --expected-sha256 POINTER_SHA \
+  --scope NEW_SCOPE --scope-sha256 NEW_SCOPE_SHA \
+  --review SCOPE_REVIEW --review-sha256 SCOPE_REVIEW_SHA \
+  --authorization USER_REQUEST --authorization-sha256 USER_REQUEST_SHA \
+  --delta-review DELTA_REVIEW --delta-review-sha256 DELTA_REVIEW_SHA
+```
+
+이 전이는 원래 scope/review와 추가 지시·delta 리뷰를 `scope_history`에 누적한다.
+기존 최종 결과·리뷰도 원문으로 보존하지만 새 범위의 완료 판정에는 재사용하지 않는다.
+현재 자원과 미해결 예약·상태는 그대로 남고, 재개는 별도 `outcome working`으로 수행한다.
+최종 리뷰는 새 scope/result와 함께 전체 `scope_history_sha256`도 묶는다.
+`bind` 교체나 일반 publication으로 이 연결을 대신하지 않는다.
+
 작업 소유 도구로 승인된 적용·배포·정리를 수행한다. 원격 branch 삭제는 현재 OID lease,
 worktree 정리는 점유·보존 확인과 해당 앱의 archive 경계를 따른다. 다른 작업의 브랜치,
 dirty bytes, 산출물을 이 정리의 이름으로 삭제하거나 publish하지 않는다.
