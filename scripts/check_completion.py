@@ -39,7 +39,8 @@ KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote
          "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
 STATE_FIELDS = ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome")
 STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup",
-                  "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history")
+                  "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history",
+                  "reservation_resolutions")
 _CONTROL = ContextVar("completion_control", default=None)
 
 
@@ -280,6 +281,9 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
             keep(owner.get("original", {}).get("snapshot"))
         for resource in state["resources"]:
             keep(resource["basis"])
+        for resolution in state.get("reservation_resolutions", []):
+            keep(resolution["evidence"]); keep(resolution["review"])
+            keep(read_control(resolution["evidence"])["source"])
         keep(state.get("status_basis"))
         keep(state.get("handoff", {}).get("basis"))
         for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
@@ -1030,6 +1034,9 @@ def protect_control_records(scope, state, location, resources):
         protected.append(state["result_path"])
     protected.extend(row["path"] for row in state.get("control_records", []))
     protected.extend(resource["basis"]["path"] for resource in state["resources"])
+    for resolution in state.get("reservation_resolutions", []):
+        protected.extend(resolution[name]["path"] for name in ("evidence", "review"))
+        protected.append(read_control(resolution["evidence"])["source"]["path"])
     checks = scope["checks"] if scope else []
     if scope:
         protected.append(scope["request"]["path"])
@@ -1582,10 +1589,61 @@ def exception_view(result):
     return merged
 
 
+def reservation_resolutions(scope, state):
+    """Reviewed pre-dispatch denials do not erase or invent resource handles."""
+    if "reservation_resolutions" not in state:
+        return {}
+    rows = state["reservation_resolutions"]
+    if not scope or not isinstance(rows, list) or not rows:
+        raise CompletionError("reservation resolutions require a frozen scope and nonempty history")
+    resources = {resource["id"]: resource for resource in state["resources"]}
+    if len(resources) != len(state["resources"]):
+        raise CompletionError("duplicate accumulated resource identity")
+    scope_digests = {state["scope"]["sha256"],
+                     *(step["scope"]["sha256"] for step in state.get("scope_history", []))}
+    resolved = {}
+    for row in rows:
+        fields(row, ("id", "evidence", "review"))
+        key = text(row["id"])
+        resource = resources.get(key)
+        if key in resolved or resource is None or resource["kind"] != "reserved" or resource["target"] != {}:
+            raise CompletionError("resolution must retain one unique original reservation")
+        fields(resource, ("id", "kind", "target", "basis"))
+        evidence = read_control(row["evidence"])
+        fields(evidence, ("task_id", "session_id", "request_digest", "scope_sha256", "resource",
+                          "previous_state_sha256", "disposition", "dispatch_status", "created",
+                          "source_tool", "source_call_id", "source", "reason"))
+        if ((evidence["task_id"], evidence["session_id"], evidence["request_digest"])
+                != (scope["task_id"], scope["session_id"], scope["request_digest"])
+                or evidence["scope_sha256"] not in scope_digests
+                or canonical(evidence["resource"]) != canonical(resource)):
+            raise CompletionError("resolution differs from the original task or reservation")
+        if (evidence["disposition"] != "not_created"
+                or evidence["dispatch_status"] != "rejected_before_dispatch" or evidence["created"] is not False):
+            raise CompletionError("only proven pre-dispatch rejection can resolve a reservation")
+        for name in ("source_tool", "source_call_id", "reason"):
+            text(evidence[name])
+        digest(evidence["previous_state_sha256"])
+        control_reference(evidence["source"])
+        control_reference(resource["basis"])
+        expected = {"scope_sha256": evidence["scope_sha256"],
+                    "evidence_sha256": row["evidence"]["sha256"],
+                    "resource_sha256": sha(canonical(resource)),
+                    "previous_state_sha256": evidence["previous_state_sha256"], "status": "No Findings"}
+        if read_control(row["review"]) != expected:
+            raise CompletionError("resolution requires review of the exact reservation and denial")
+        resolved[key] = {"disposition": "not_created", "evidence_sha256": row["evidence"]["sha256"],
+                         "source_sha256": evidence["source"]["sha256"]}
+    return resolved
+
+
 def final_review_fields(scope_ref, scope, state, result_sha, review_path, *, fresh_inventory=False, stopped=False):
     expected = {"scope_sha256": scope_ref["sha256"], "result_sha256": result_sha, "status": "No Findings"}
     if "scope_history" in state:
         expected["scope_history_sha256"] = sha(canonical(scope_history(scope_ref, state)))
+    if "reservation_resolutions" in state:
+        reservation_resolutions(scope, state)
+        expected["reservation_resolutions_sha256"] = sha(canonical(state["reservation_resolutions"]))
     for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
         if name in state:
             expected[name + "_sha256"] = state[name]["evidence"]["sha256"]
@@ -1616,6 +1674,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         raise CompletionError("current resource pointer differs from frozen task")
     scope, resources = filesystem_view(scope_ref, scope, state)
     scope_history(scope_ref, state)
+    resolved = reservation_resolutions(scope, state)
     protect_bound_records(scope, state, location, resources, observing=True)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
@@ -1687,6 +1746,9 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         fields(resource, ("id", "kind", "target", "basis"))
         try:
             control_reference(resource["basis"])
+            if resource["id"] in resolved:
+                observed["resource:" + resource["id"]] = resolved[resource["id"]]
+                continue
             if resource["kind"] not in CLEANUP_KINDS:
                 raise CompletionError("unresolved reservation or unsupported host resource observation")
             observe(resource, {})
