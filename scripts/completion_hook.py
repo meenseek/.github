@@ -129,6 +129,9 @@ def load_state(filename):
     value = c.decode(raw)
     c.fields(value, c.STATE_FIELDS, c.STATE_OPTIONAL)
     if value["intent"] != "closure": raise c.CompletionError("invalid closure intent")
+    if "scope_history" in value:
+        with c.stored_controls(value, filename):
+            c.scope_history(value["scope"], value)
     return value, c.sha(raw)
 
 
@@ -391,6 +394,39 @@ def adopt_session(filename, state, before, args):
             "task_id": state["task_id"], "origin_preserved": True}
 
 
+def extend_scope(state, before, filename, args):
+    if state["scope"] is None or state["outcome"] != "waiting":
+        raise c.CompletionError("scope extension requires the existing waiting binding")
+    if any(name in state for name in ("owner_recovery", "source_preservation", "filesystem_recovery")):
+        raise c.CompletionError("resolve the existing recovery boundary before extending scope")
+    if "cleanup" in state or "record_manifest" in state:
+        raise c.CompletionError("reviewed record cleanup must finish before extending scope")
+    c.control_reference(state.get("status_basis"))
+    old_scope = c.read_control(state["scope"])
+    new_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
+    new_scope = c.read_control(new_ref)
+    c.additive_scope(old_scope, new_scope)
+    c.validate_state_identity(new_scope, state, filename)
+    c.validate_scope(new_scope)
+    normal = c.control_reference({"path": args.review, "sha256": args.review_sha256})
+    if c.read_control(normal) != {"scope_sha256": new_ref["sha256"], "status": "No Findings"}:
+        raise c.CompletionError("scope review does not cover the extended scope")
+    # Capture the old final verdict before invalidating it for the added work.
+    c.capture_controls(state, location=filename)
+    step = {"scope": state["scope"], "review": state["review"],
+            "authorization": c.control_reference({"path": args.authorization, "sha256": args.authorization_sha256}),
+            "delta_review": c.control_reference({"path": args.delta_review, "sha256": args.delta_review_sha256}),
+            "previous_state_sha256": before,
+            "result": ({"path": state["result_path"], "sha256": c.sha(c.control_bytes(state["result_path"]))}
+                       if state["result_path"] else None), "final_review": state["final_review"]}
+    proposed = {**state, "scope": new_ref, "review": normal,
+                "scope_history": [*state.get("scope_history", []), step],
+                "result_path": None, "final_review": None}
+    c.scope_history(new_ref, proposed)
+    c.protect_bound_records(new_scope, proposed, filename, proposed["resources"])
+    return proposed
+
+
 def publication_admissions(state, accepted, *, final):
     """Validate allowed deltas against the disk CAS state before capturing inputs."""
     c.fields(state, c.STATE_FIELDS, c.STATE_OPTIONAL)
@@ -487,7 +523,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
+    for name in ("arm", "bind", "extend", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -497,9 +533,12 @@ def main(argv=None):
             item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
             item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
         if name == "adopt": item.add_argument("--from-session", required=True)
-        if name == "bind":
+        if name in {"bind", "extend"}:
             item.add_argument("--scope", required=True); item.add_argument("--scope-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
+        if name == "extend":
+            item.add_argument("--authorization", required=True); item.add_argument("--authorization-sha256", required=True)
+            item.add_argument("--delta-review", required=True); item.add_argument("--delta-review-sha256", required=True)
         if name in {"reserve", "attach", "adopt"}:
             if name != "adopt": item.add_argument("--id", required=True)
             item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
@@ -552,7 +591,9 @@ def main(argv=None):
                             goal = task_context(state, filename, args.session)
                             if (c.text(args.task_id), c.digest(args.request_digest)) != (goal["task_id"], goal.get("request_digest")):
                                 raise c.CompletionError("current task/request differs from the frozen binding; preserve it and review the current goal")
-                        if args.command == "bind":
+                        if args.command == "extend":
+                            state = extend_scope(state, before, filename, args)
+                        elif args.command == "bind":
                             if state["scope"] is not None: raise c.CompletionError("scope already frozen; recovery must not replace original obligations")
                             scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
                             review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})

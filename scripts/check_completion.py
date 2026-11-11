@@ -39,7 +39,7 @@ KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote
          "worktree_absent", "process_absent", "http_json", "evidence", "improvement"}
 STATE_FIELDS = ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome")
 STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup",
-                  "control_records", "record_manifest", "origin", "handoff", "execution_owner")
+                  "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history")
 _CONTROL = ContextVar("completion_control", default=None)
 
 
@@ -272,6 +272,9 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
                 protect_control_records(scope, state, location, state["resources"])
         guard()
         keep(state["scope"]); keep(state["review"])
+        for step in state.get("scope_history", []):
+            for name in ("scope", "review", "authorization", "delta_review", "result", "final_review"):
+                keep(step.get(name))
         keep(scope["request"])
         for owner in scope["owners"]:
             keep(owner.get("original", {}).get("snapshot"))
@@ -1089,6 +1092,57 @@ def validate_record_root(scope):
         protect_completion_records(check, [str(root)])
 
 
+def additive_scope(previous, current):
+    """A follow-up can add obligations, never replace their original meaning."""
+    mutable = {"owners", "checks", "repositories", "artifact_roots", "baseline", "categories"}
+    if set(previous) != set(current) or any(previous[k] != current[k] for k in previous.keys() - mutable):
+        raise CompletionError("scope extension changed the original identity, request or environment")
+    for name in ("owners", "checks", "repositories", "artifact_roots"):
+        if current[name][:len(previous[name])] != previous[name]:
+            raise CompletionError("scope extension must preserve the original " + name)
+    for name in ("repositories", "artifact_roots"):
+        if any(current["baseline"][name].get(k) != v for k, v in previous["baseline"][name].items()):
+            raise CompletionError("scope extension changed the starting inventory")
+    for name, category in previous["categories"].items():
+        if not category["checks"] and not current["categories"][name]["checks"]:
+            if current["categories"][name] != category:
+                raise CompletionError("scope extension changed an existing N/A decision")
+    if len(current["checks"]) <= len(previous["checks"]):
+        raise CompletionError("scope extension adds no obligations")
+    if len({owner["path"] for owner in current["owners"]}) != len(current["owners"]):
+        raise CompletionError("scope extension duplicated an owner")
+
+
+def scope_history(scope_ref, state):
+    history = state.get("scope_history", [])
+    if not isinstance(history, list):
+        raise CompletionError("expected scope history list")
+    for index, step in enumerate(history):
+        fields(step, ("scope", "review", "authorization", "delta_review", "previous_state_sha256",
+                      "result", "final_review"))
+        digest(step["previous_state_sha256"])
+        prior = read_control(step["scope"])
+        normal = read_control(step["review"])
+        if normal != {"scope_sha256": step["scope"]["sha256"], "status": "No Findings"}:
+            raise CompletionError("scope history lost its original independent review")
+        control_reference(step["authorization"])
+        for key in ("result", "final_review"):
+            if step[key] is not None:
+                control_reference(step[key])
+        next_ref = history[index + 1]["scope"] if index + 1 < len(history) else scope_ref
+        # Lineage describes frozen bytes; filesystem recovery projections are
+        # applied separately to current observations, never to one history edge.
+        next_scope = read_control(next_ref)
+        additive_scope(prior, next_scope)
+        expected = {"previous_scope_sha256": step["scope"]["sha256"],
+                    "scope_sha256": next_ref["sha256"],
+                    "authorization_sha256": step["authorization"]["sha256"],
+                    "previous_state_sha256": step["previous_state_sha256"], "status": "No Findings"}
+        if read_control(step["delta_review"]) != expected:
+            raise CompletionError("scope extension review differs from the exact authorized delta")
+    return history
+
+
 def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
@@ -1530,6 +1584,8 @@ def exception_view(result):
 
 def final_review_fields(scope_ref, scope, state, result_sha, review_path, *, fresh_inventory=False, stopped=False):
     expected = {"scope_sha256": scope_ref["sha256"], "result_sha256": result_sha, "status": "No Findings"}
+    if "scope_history" in state:
+        expected["scope_history_sha256"] = sha(canonical(scope_history(scope_ref, state)))
     for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
         if name in state:
             expected[name + "_sha256"] = state[name]["evidence"]["sha256"]
@@ -1559,6 +1615,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     if (state["task_id"], state["intent"], state["scope"]) != (scope["task_id"], "closure", scope_ref):
         raise CompletionError("current resource pointer differs from frozen task")
     scope, resources = filesystem_view(scope_ref, scope, state)
+    scope_history(scope_ref, state)
     protect_bound_records(scope, state, location, resources, observing=True)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
     checks = validate_scope(scope, recovery)
