@@ -129,9 +129,10 @@ def load_state(filename):
     value = c.decode(raw)
     c.fields(value, c.STATE_FIELDS, c.STATE_OPTIONAL)
     if value["intent"] != "closure": raise c.CompletionError("invalid closure intent")
-    if "scope_history" in value:
+    if "scope_history" in value or "reservation_resolutions" in value:
         with c.stored_controls(value, filename):
             c.scope_history(value["scope"], value)
+            c.reservation_resolutions(c.read_control(value["scope"]) if value["scope"] else None, value)
     return value, c.sha(raw)
 
 
@@ -427,6 +428,21 @@ def extend_scope(state, before, filename, args):
     return proposed
 
 
+def resolve_reservation(state, before, args):
+    if state["scope"] is None:
+        raise c.CompletionError("reservation resolution requires a frozen scope")
+    if any(row["id"] == args.id for row in state.get("reservation_resolutions", [])):
+        raise c.CompletionError("reservation already resolved; preserve its original history")
+    row = {"id": c.text(args.id), "evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+           "review": {"path": args.review, "sha256": args.review_sha256}}
+    evidence = c.read_control(row["evidence"])
+    if evidence["previous_state_sha256"] != before:
+        raise c.CompletionError("resolution is not for the exact previous pointer")
+    proposed = {**state, "reservation_resolutions": [*state.get("reservation_resolutions", []), row]}
+    c.reservation_resolutions(c.read_control(state["scope"]), proposed)
+    return proposed
+
+
 def publication_admissions(state, accepted, *, final):
     """Validate allowed deltas against the disk CAS state before capturing inputs."""
     c.fields(state, c.STATE_FIELDS, c.STATE_OPTIONAL)
@@ -476,6 +492,7 @@ def publication_admissions(state, accepted, *, final):
         c.text(resource["id"])
     previous = {resource["id"]:resource for resource in accepted["resources"]}
     current = {resource["id"]:resource for resource in state["resources"]}
+    resolved = {row["id"] for row in accepted.get("reservation_resolutions", [])}
     if len(previous) != len(accepted["resources"]) or len(current) != len(state["resources"]):
         raise c.CompletionError("duplicate accumulated resource identity")
     if list(current)[:len(previous)] != list(previous):
@@ -483,6 +500,8 @@ def publication_admissions(state, accepted, *, final):
     for key, old in previous.items():
         new = current.get(key)
         if c.canonical(new) != c.canonical(old):
+            if key in resolved:
+                raise c.CompletionError("publication must preserve resolved original reservations")
             attached = (old["kind"] == "reserved" and new and new["kind"] in c.CLEANUP_KINDS
                         and {k:v for k,v in new.items() if k not in {"kind", "target"}}
                         == {k:v for k,v in old.items() if k not in {"kind", "target"}})
@@ -523,7 +542,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "extend", "reserve", "attach", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
+    for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -543,10 +562,11 @@ def main(argv=None):
             if name != "adopt": item.add_argument("--id", required=True)
             item.add_argument("--basis", required=True); item.add_argument("--basis-sha256", required=True)
         if name == "attach": item.add_argument("--resource", required=True, help="JSON with fixed kind,target; actual tool handle and owner record")
+        if name == "resolve-reservation": item.add_argument("--id", required=True)
         if name in {"finalize", "complete"}:
             item.add_argument("--result"); item.add_argument("--review"); item.add_argument("--review-sha256")
             item.add_argument("--inputs", choices=("-",), help="read {result,review} JSON from stdin without staging files")
-        if name in {"recover-owner", "preserve-source", "recover-filesystem"}:
+        if name in {"recover-owner", "preserve-source", "recover-filesystem", "resolve-reservation"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "recover-filesystem":
@@ -604,6 +624,8 @@ def main(argv=None):
                             proposed = {**state, "scope": scope_ref, "review": review_ref}
                             protect_records(proposed, filename, state["resources"])
                             state.update(proposed)
+                        elif args.command == "resolve-reservation":
+                            state = resolve_reservation(state, before, args)
                         elif args.command in {"reserve", "attach"}:
                             basis = c.control_reference({"path": args.basis, "sha256": args.basis_sha256})
                             found = [r for r in state["resources"] if r["id"] == args.id]
@@ -611,6 +633,8 @@ def main(argv=None):
                                 if found: raise c.CompletionError("duplicate resource reservation")
                                 state["resources"].append({"id": c.text(args.id), "kind": "reserved", "target": {}, "basis": basis})
                             else:
+                                if any(row["id"] == args.id for row in state.get("reservation_resolutions", [])):
+                                    raise c.CompletionError("resolved reservation cannot later attach a resource")
                                 if len(found) != 1 or found[0]["kind"] != "reserved": raise c.CompletionError("resource must be reserved before creation")
                                 resource = c.decode(sys.stdin.buffer.read() if args.resource == "-"
                                                     else c.raw_file(args.resource))

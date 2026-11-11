@@ -374,6 +374,32 @@ argv가 바뀌어도 같은 시작 시각이면 살아 있는 프로세스로 �
 담는다. 선택한 과거 통제 원문 외의 소스·미디어·무관한 로그·자격증명은 복제하지 않는다.
 private `.completion/`은 Git에서 제외하며 기존 private 권한을 유지한다.
 
+도구가 **실제 dispatch 전에 요청을 거부하여 생성되지 않았음이 확인된 경우**에는
+`resolve-reservation` 전용 전이를 사용한다. 원래 `reserved` 항목과 basis는 바꾸거나
+삭제하지 않고 `reservation_resolutions`에 근거·독립 리뷰를 추가한다. 응답 없는 요청,
+timeout, dispatch 뒤의 취소·불명확한 종료는 이 경로로 해소하지 않는다.
+
+근거 JSON은 정확히 `task_id`, `session_id`(원래 scope의 세션), `request_digest`,
+`scope_sha256`, `resource`(원래 예약 객체 전체), `previous_state_sha256`,
+`disposition: not_created`, `dispatch_status: rejected_before_dispatch`, `created: false`,
+`source_tool`, `source_call_id`, `source: {path, sha256}`, `reason`을 가진다.
+`source`에는 해당 호출의 실제 거부 결과 원문만 연결한다. 다른 채팅 원문·자격증명·무관한
+로그를 복제하지 않는다. 독립 리뷰는 실제 호출과 거부 결과가 정확한 예약에 해당하고,
+실행 전 거부였음을 확인한 뒤 정확히 `scope_sha256`, `evidence_sha256`,
+`resource_sha256`(원래 예약 객체의 canonical JSON digest), `previous_state_sha256`,
+`status: No Findings`를 결속한다. 도구는 이 고정 구조·digest·리뷰를 검사하며,
+실제 생성 여부를 임의로 추론하거나 리뷰의 사실 확인을 대신하지 않는다.
+
+```sh
+python3 scripts/completion_hook.py resolve-reservation --session SESSION_ID --expected-sha256 POINTER_SHA --id RESERVED_ID --evidence /absolute/denial.json --evidence-sha256 DENIAL_SHA --review /absolute/denial-review.json --review-sha256 REVIEW_SHA
+```
+
+전이는 최신 pointer의 CAS를 요구하고 원래 목표·범위·자원·통제 기록을 유지한다.
+근거·리뷰·거부 원문은 기존 통제 원문 보존 경로로 함께 저장한다. 해소한 예약은 다시
+`attach`할 수 없으며 일반 게시로 해소 이력을 추가·변경·삭제할 수 없다. 후속 범위 확장도
+원래 해소 이력을 유지한다. 최종 리뷰는 `reservation_resolutions_sha256`도 결속하며,
+이 필드가 없는 이전 리뷰로 완료할 수 없다. 해소되지 않은 나머지 예약은 계속 완료를 막는다.
+
 기록 폴더는 `complete`의 검토된 삭제 절차가 소유한다. `absent`·`worktree_absent`에
 그 폴더·하위 경로나 이를 포함하는 상위 폴더를 등록하지 않는다. `prepare`는 고정 검사를,
 `bind`는 기존 누적 자원까지 새 scope와 대조하고, `attach`는 새 자원 등록을 검사한다.
