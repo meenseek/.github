@@ -398,7 +398,7 @@ def adopt_session(filename, state, before, args):
 def extend_scope(state, before, filename, args):
     if state["scope"] is None or state["outcome"] != "waiting":
         raise c.CompletionError("scope extension requires the existing waiting binding")
-    if any(name in state for name in ("owner_recovery", "source_preservation", "filesystem_recovery")):
+    if any(name in state for name in ("source_preservation", "filesystem_recovery")):
         raise c.CompletionError("resolve the existing recovery boundary before extending scope")
     if "cleanup" in state or "record_manifest" in state:
         raise c.CompletionError("reviewed record cleanup must finish before extending scope")
@@ -408,9 +408,11 @@ def extend_scope(state, before, filename, args):
     new_scope = c.read_control(new_ref)
     c.additive_scope(old_scope, new_scope)
     c.validate_state_identity(new_scope, state, filename)
-    c.validate_scope(new_scope)
+    recovery = (c.owner_recovery(state["scope"], old_scope, state["owner_recovery"], state=state)
+                if "owner_recovery" in state else None)
+    c.validate_scope(new_scope, recovery)
     normal = c.control_reference({"path": args.review, "sha256": args.review_sha256})
-    if c.read_control(normal) != {"scope_sha256": new_ref["sha256"], "status": "No Findings"}:
+    if c.read_control(normal) != c.scope_review_value(new_ref, state.get("owner_recovery")):
         raise c.CompletionError("scope review does not cover the extended scope")
     # Capture the old final verdict before invalidating it for the added work.
     c.capture_controls(state, location=filename)
@@ -420,10 +422,14 @@ def extend_scope(state, before, filename, args):
             "previous_state_sha256": before,
             "result": ({"path": state["result_path"], "sha256": c.sha(c.control_bytes(state["result_path"]))}
                        if state["result_path"] else None), "final_review": state["final_review"]}
+    if "owner_recovery" in state:
+        step["owner_recovery"] = state["owner_recovery"]
     proposed = {**state, "scope": new_ref, "review": normal,
                 "scope_history": [*state.get("scope_history", []), step],
                 "result_path": None, "final_review": None}
     c.scope_history(new_ref, proposed)
+    if recovery is not None and c.owner_recovery(new_ref, new_scope, proposed["owner_recovery"], state=proposed) != recovery:
+        raise c.CompletionError("owner recovery changed while extending scope")
     c.protect_bound_records(new_scope, proposed, filename, proposed["resources"])
     return proposed
 
