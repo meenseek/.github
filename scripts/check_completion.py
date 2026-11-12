@@ -674,21 +674,33 @@ def owner_history_identity_slots(binding):
 
 def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), state=None):
     """Validate the complete reviewed chain without a call-stack depth limit."""
+    contexts = {scope_ref["sha256"]: (scope_ref, scope)}
+    history = scope_history(scope_ref, state) if state and state.get("scope") == scope_ref else []
+    for step in history:
+        contexts[step["scope"]["sha256"]] = (step["scope"], read_control(step["scope"]))
     chain, identities = [], set(seen)
     while True:
-        evidence = owner_recovery_header(scope_ref, scope, binding)
+        raw = read_control(binding["evidence"])
+        selected = contexts.get(raw.get("scope_sha256"))
+        if selected is None:
+            raise CompletionError("owner recovery scope is not a verified ancestor")
+        node_ref, node_scope = selected
+        evidence = owner_recovery_header(node_ref, node_scope, binding)
         identity = digest(binding["evidence"]["sha256"])
         if identity in identities:
             raise CompletionError("cyclic owner recovery history")
         identities.add(identity)
-        chain.append((binding, evidence))
+        chain.append((binding, evidence, node_ref, node_scope))
         if "previous" not in evidence:
             break
         binding = evidence["previous"]
+    bindings = {canonical(node[0]) for node in chain}
+    if any("owner_recovery" in step and canonical(step["owner_recovery"]) not in bindings for step in history):
+        raise CompletionError("owner recovery omitted an extension's original recovery binding")
     previous = {}
-    for index, (binding, evidence) in enumerate(reversed(chain)):
-        recovered = owner_recovery_step(scope_ref, scope, evidence,
-                historical=historical or index < len(chain) - 1, state=state)
+    for index, (binding, evidence, node_ref, node_scope) in enumerate(reversed(chain)):
+        recovered = owner_recovery_step(node_ref, node_scope, evidence,
+                historical=historical or index < len(chain) - 1, state=state, active_scope_ref=scope_ref)
         if previous.keys() - recovered.keys() or (previous and previous == recovered):
             raise CompletionError("owner recovery omitted earlier owners or repeated unchanged bytes")
         previous = recovered
@@ -711,12 +723,13 @@ def owner_recovery_header(scope_ref, scope, binding):
     return evidence
 
 
-def owner_recovery_step(scope_ref, scope, evidence, *, historical, state):
+def owner_recovery_step(scope_ref, scope, evidence, *, historical, state, active_scope_ref=None):
     """Validate an existing history node; live source checks belong to its head."""
     if not historical and state and "filesystem_recovery" in state:
         # The explicit device review covers both frozen scope and owner-source
         # identities. Only this in-memory view changes; evidence bytes survive.
-        filesystem_scope(scope_ref, read_control(scope_ref), state)
+        active = active_scope_ref or scope_ref
+        filesystem_scope(active, read_control(active), state)
         rows = {row["path"]: row for row in read_control(state["filesystem_recovery"]["evidence"])["identities"]}
         for slot in owner_identity_slots(evidence):
             row = rows.get(slot["common_dir"])
@@ -769,7 +782,17 @@ def owner_recovery_step(scope_ref, scope, evidence, *, historical, state):
                 if git_source_sha(owner["repository"], source["expected"]["local_revision"], filename) != wanted:
                     raise CompletionError("historical recovery source bytes changed")
         else:
-            observe(source["definition"], source["expected"])
+            # The policy bytes stay pinned when unrelated published code advances.
+            expected = source["expected"]
+            current = git(owner["repository"], "rev-parse", "refs/heads/" + text(target["main"])).decode().strip()
+            if current != expected.get("local_revision"):
+                previous = text(expected.get("local_revision"))
+                if (not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", previous)
+                        or expected.get("remote_revision") != previous):
+                    raise CompletionError("invalid reviewed owner source revision")
+                git(owner["repository"], "merge-base", "--is-ancestor", "--", previous, current)
+                expected = {**expected, "local_revision": current, "remote_revision": current}
+            observe(source["definition"], expected)
             reference({"path": owner["owner_path"], "sha256": owner["current"]["sha256"]})
         recovered[owner["owner_path"]] = owner["current"]["sha256"]
     return recovered
@@ -1120,17 +1143,27 @@ def additive_scope(previous, current):
         raise CompletionError("scope extension duplicated an owner")
 
 
+def scope_review_value(scope_ref, recovery=None):
+    value = {"scope_sha256": scope_ref["sha256"], "status": "No Findings"}
+    if recovery is not None:
+        value["owner_recovery_sha256"] = digest(recovery["evidence"]["sha256"])
+    return value
+
+
 def scope_history(scope_ref, state):
     history = state.get("scope_history", [])
     if not isinstance(history, list):
         raise CompletionError("expected scope history list")
+    contexts = {}
     for index, step in enumerate(history):
         fields(step, ("scope", "review", "authorization", "delta_review", "previous_state_sha256",
-                      "result", "final_review"))
+                      "result", "final_review"), ("owner_recovery",))
         digest(step["previous_state_sha256"])
         prior = read_control(step["scope"])
+        contexts[step["scope"]["sha256"]] = (step["scope"], prior)
         normal = read_control(step["review"])
-        if normal != {"scope_sha256": step["scope"]["sha256"], "status": "No Findings"}:
+        carried = history[index - 1].get("owner_recovery") if index else None
+        if normal != scope_review_value(step["scope"], carried):
             raise CompletionError("scope history lost its original independent review")
         control_reference(step["authorization"])
         for key in ("result", "final_review"):
@@ -1145,8 +1178,19 @@ def scope_history(scope_ref, state):
                     "scope_sha256": next_ref["sha256"],
                     "authorization_sha256": step["authorization"]["sha256"],
                     "previous_state_sha256": step["previous_state_sha256"], "status": "No Findings"}
+        if "owner_recovery" in step:
+            binding = step["owner_recovery"]
+            fields(binding, ("evidence", "review"))
+            evidence = read_control(binding["evidence"])
+            context = contexts.get(evidence.get("scope_sha256"))
+            if context is None:
+                raise CompletionError("extension recovery belongs to an unverified ancestor")
+            owner_recovery_header(*context, binding)
+            expected["owner_recovery_sha256"] = binding["evidence"]["sha256"]
         if read_control(step["delta_review"]) != expected:
             raise CompletionError("scope extension review differs from the exact authorized delta")
+    if any("owner_recovery" in step for step in history) and "owner_recovery" not in state:
+        raise CompletionError("scope extension lost its owner recovery binding")
     return history
 
 
@@ -1710,8 +1754,9 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         raise CompletionError("task is waiting or stopped, not completed")
     selected_review = control_reference(review_ref if review_ref is not None else state["review"])
     reviewed = read_control(selected_review)
-    fields(reviewed, ("scope_sha256", "status"))
-    if reviewed != {"scope_sha256": scope_ref["sha256"], "status": "No Findings"}:
+    history = state.get("scope_history", [])
+    carried = history[-1].get("owner_recovery") if history else None
+    if reviewed != scope_review_value(scope_ref, carried):
         raise CompletionError("scope review does not cover these exact scope bytes")
     selected_final = control_reference(final_review_ref if final_review_ref is not None else state["final_review"])
     reviewed_final = read_control(selected_final)
