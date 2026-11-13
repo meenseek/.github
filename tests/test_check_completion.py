@@ -220,6 +220,21 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(c.CompletionError, "active completion records"):
                 c.prepare(seed)
 
+    def test_scope_rejects_removal_of_source_observer(self):
+        for target in (self.repo, self.repo.parent):
+            seed = copy.deepcopy(self.seed)
+            seed["checks"].append({"id": "cleanup", "category": "git_resources", "kind": "worktree_absent",
+                                   "target": {"repository": str(self.repo), "path": str(target)}})
+            seed["categories"]["git_resources"] = {"checks": ["cleanup"], "not_applicable": None}
+            with self.subTest(target=target), self.assertRaisesRegex(c.CompletionError, "live source observer|active completion records"):
+                c.prepare(seed)
+
+    def test_scope_allows_cleanup_of_separate_child_worktree(self):
+        self.seed["checks"].append({"id": "cleanup", "category": "git_resources", "kind": "worktree_absent",
+                                    "target": {"repository": str(self.repo), "path": str(self.repo / "child-worktree")}})
+        self.reset_categories()
+        c.prepare(self.seed)
+
     def test_record_guard_preserves_lexical_and_resolved_protection_across_aliases(self):
         records=self.root/'records';records.mkdir()
         outside=self.root/'outside';outside.mkdir()

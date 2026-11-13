@@ -1281,6 +1281,19 @@ def validate_scope(scope, recovery=None):
         validate_record_root(scope)
     for check in scope["checks"]:
         protect_completion_records(check, [scope["request"]["path"], scope["state_path"]])
+    # A checkout used to observe source cannot also be required to disappear.
+    # Child worktrees remain valid cleanup targets when the observer survives.
+    observers = [path(repo) for repo in scope["repositories"]]
+    observers.extend(path(check["target"]["repository"]) for check in checks.values()
+                     if check["kind"] == "git_source")
+    for check in checks.values():
+        if check["kind"] not in {"absent", "worktree_absent"}:
+            continue
+        target = path(check["target"]["path"])
+        for observer in observers:
+            for candidate, source in ((target, observer), (target.resolve(), observer.resolve())):
+                if source.is_relative_to(candidate):
+                    raise CompletionError("cleanup target contains a live source observer; use a surviving checkout")
     return checks
 
 
