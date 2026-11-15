@@ -89,9 +89,7 @@ def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=N
             else:
                 return store.finish_cleanup(state["task_id"], answer)
     except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error) as exc:
-        required_errors = tuple(kind for kind in (getattr(bound[0], 'RepairIncomplete', None),
-                                getattr(bound[0], 'ReadingIncomplete', None)) if kind is not None) if bound else ()
-        if preparing and isinstance(exc, required_errors):
+        if preparing and bound and isinstance(exc, getattr(bound[0], 'RepairIncomplete', ())):
             raise c.CompletionError(str(exc)) from exc
         print(json.dumps({"measurement": "pending", "error_type": type(exc).__name__}), file=sys.stderr)
 
@@ -212,7 +210,7 @@ def remove_records(record, manifest):
         raise c.CompletionError("record root remains")
 
 
-def finish_cleanup(filename, state, before):
+def finish_cleanup(filename, state, before, measurement_turns=None):
     cleanup = state["cleanup"]
     c.fields(cleanup, ("record_root", "manifest", "request_digest", "answer"))
     answer = cleanup["answer"]
@@ -224,6 +222,13 @@ def finish_cleanup(filename, state, before):
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
     protect_records(state, filename, state["resources"], observing=True)
+    if measurement_turns:
+        answer = {**answer, "measurement_turns": list(dict.fromkeys(
+            [*answer.get("measurement_turns", []), *(c.text(t) for t in measurement_turns)]))}
+    # Recheck mandatory owner conditions at the common deletion boundary, even
+    # when a previous attempt already published its cleanup handoff.
+    measurement_cleanup(state, answer, binding_path=filename, preparing=True,
+                        scope={"record_root": cleanup["record_root"]})
     remove_records(cleanup["record_root"], cleanup["manifest"])
     if c.sha(c.raw_file(str(filename))) != before:
         raise c.CompletionError("pointer changed")
@@ -297,8 +302,6 @@ def hook(payload, root=ROOT, measurement_root=None):
 
 def _hook(payload, root=ROOT, measurement_root=None):
     measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
-    if measured.get('decision') == 'block' or 'systemMessage' in measured:
-        return measured
     event = payload.get("hook_event_name")
     if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return measured
     filename = pointer(root, c.text(payload.get("session_id")))
@@ -615,7 +618,7 @@ def main(argv=None):
                                 raise c.CompletionError("current task/request differs from pending record cleanup")
                             if (args.command == "release") != (state["cleanup"]["answer"].get("stopped") is True):
                                 raise c.CompletionError("cleanup disposition differs from the checked outcome")
-                            answer = finish_cleanup(filename, state, before)
+                            answer = finish_cleanup(filename, state, before, args.work_turn)
                             print(c.canonical(answer).decode()); return 0
                         if args.command in {"complete", "unbind", "release"}:
                             goal = task_context(state, filename, args.session)

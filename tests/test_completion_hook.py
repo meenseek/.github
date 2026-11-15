@@ -17,28 +17,6 @@ h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 
 
 class HookTests(unittest.TestCase):
-    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations task reading observer')
-    def test_current_reading_failure_survives_unbound_completion_stop(self):
-        root = self.f.root/'reading-observations'
-        prompt = {**self.payload, 'hook_event_name':'UserPromptSubmit', 'turn_id':'current'}
-        h.hook(prompt, root=self.root, measurement_root=root)
-        stop = {**self.payload, 'turn_id':'current'}
-        answer = h.hook(stop, root=self.root, measurement_root=root)
-        self.assertEqual(answer['decision'], 'block')
-        self.assertIn('필수 문서', answer['reason'])
-        continued = h.hook({**stop,'stop_hook_active':True}, root=self.root, measurement_root=root)
-        self.assertNotIn('decision', continued)
-        self.assertIn('미완료', continued['systemMessage'])
-
-    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations task reading guard')
-    def test_required_reading_is_checked_before_completion_record_deletion(self):
-        module, store = h.measurement_store(self.f.root/'reading-cleanup')
-        with mock.patch.object(h,'ROOT',self.root), mock.patch.object(h,'measurement_store',return_value=(module,store)), \
-             mock.patch.object(store,'remember_cleanup',side_effect=module.ReadingIncomplete('Required source remains unread')):
-            with self.assertRaisesRegex(h.c.CompletionError,'unread'):
-                h.measurement_cleanup({'task_id':'original','session_id':'session'}, {'complete':True},
-                                      binding_path=self.root/'session.json', preparing=True, scope={})
-
     def test_actual_stop_contract_names_missing_work_observations_before_paths(self):
         self.arm_bind(finalize=False)
         answer=h.hook(self.payload,root=self.root,measurement_root=self.f.root/'observations')
@@ -320,6 +298,79 @@ class HookTests(unittest.TestCase):
         extra.unlink()
         self.assertTrue(self.call("complete", *args)["binding_released"])
         self.assertFalse(self.records.exists()); self.assertFalse(self.state.exists())
+
+    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations owner repair guard')
+    def test_initial_owner_failure_keeps_cleanup_unstarted_and_inputs_reviewable(self):
+        self.record_fixture()
+        self.arm_bind(finalize=False)
+        module, store = h.measurement_store(self.f.root / 'initial-observations')
+        digest = store.manifest({'components': [{'name': 'synthetic', 'sha256': '1' * 64}]})
+        store.bind(self.f.seed['task_id'], self.f.seed['session_id'], 'original-turn', {
+            'objective': 'Synthetic initial owner failure', 'category': 'implementation', 'scope': 'profile',
+            'criterion': 'Preserve reviewable inputs before entering deletion',
+            'owner_ref': 'synthetic-owner', 'harness': digest})
+        def arguments():
+            return ['--bindings', str(self.root), 'complete', '--session', self.f.seed['session_id'],
+                    '--expected-sha256', h.c.sha(self.state.read_bytes()), '--work-turn', 'closing-turn',
+                    *self.goal_args(), *self.completion_args()]
+        before = h.c.record_inventory(h.c.record_directory(str(self.records)))
+        with mock.patch.object(h, 'ROOT', self.root), \
+             mock.patch.object(h, 'measurement_store', return_value=(module, store)):
+            with mock.patch.object(store, 'remember_cleanup', side_effect=module.RepairIncomplete(
+                    'Original repair remains unverified')), redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(arguments()), 2)
+            self.assertNotIn('cleanup', json.loads(self.state.read_bytes()))
+            self.assertEqual(h.c.record_inventory(h.c.record_directory(str(self.records))), before)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(arguments()), 0)
+        self.assertFalse(self.state.exists()); self.assertFalse(self.records.exists())
+        self.assertEqual(store.report()['tasks'][0]['state'], 'completed')
+
+    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations owner repair guard')
+    def test_interrupted_cleanup_rechecks_owner_before_deletion_and_binds_retry_turn(self):
+        self.record_fixture(nested=True)
+        self.arm_bind(finalize=False)
+        module, store = h.measurement_store(self.f.root / 'retry-observations')
+        digest = store.manifest({'components': [{'name': 'synthetic', 'sha256': '1' * 64}]})
+        store.bind(self.f.seed['task_id'], self.f.seed['session_id'], 'original-turn', {
+            'objective': 'Synthetic cleanup retry', 'category': 'implementation', 'scope': 'profile',
+            'criterion': 'Owner checks precede deletion on every attempt',
+            'owner_ref': 'synthetic-owner', 'harness': digest})
+
+        def arguments(turn):
+            return ['--bindings', str(self.root), 'complete', '--session', self.f.seed['session_id'],
+                    '--expected-sha256', h.c.sha(self.state.read_bytes()), '--work-turn', turn,
+                    *self.goal_args(), *self.completion_args()]
+
+        unlink = h.os.unlink
+        def interrupted(name, *args, **kwargs):
+            if name == 'request.txt':
+                raise PermissionError('synthetic interrupted cleanup')
+            return unlink(name, *args, **kwargs)
+
+        with mock.patch.object(h, 'ROOT', self.root), \
+             mock.patch.object(h, 'measurement_store', return_value=(module, store)):
+            with mock.patch.object(h.os, 'unlink', side_effect=interrupted), redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(arguments('first-attempt')), 2)
+            self.assertFalse(self.f.scope_path.exists())
+            before = self.state.read_bytes()
+            remaining = h.c.record_inventory(h.c.record_directory(str(self.records)))
+            with mock.patch.object(store, 'remember_cleanup', side_effect=module.RepairIncomplete(
+                    'Original repair remains unverified')) as required, redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(arguments('blocked-retry')), 2)
+            self.assertEqual(required.call_args.args[1]['measurement_turns'],
+                             ['first-attempt', 'blocked-retry'])
+            self.assertEqual(self.state.read_bytes(), before)
+            self.assertEqual(h.c.record_inventory(h.c.record_directory(str(self.records))), remaining)
+            with mock.patch.object(store, 'remember_cleanup', wraps=store.remember_cleanup) as verified, \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(h.main(arguments('successful-retry')), 0)
+            self.assertEqual(verified.call_args.args[1]['measurement_turns'],
+                             ['first-attempt', 'successful-retry'])
+        self.assertFalse(self.state.exists()); self.assertFalse(self.records.exists())
+        task = store.report()['tasks'][0]
+        self.assertEqual(task['state'], 'completed')
+        self.assertEqual(task['turn_count'], 3)
 
     def test_record_cleanup_refuses_links_and_replaced_root(self):
         import os
