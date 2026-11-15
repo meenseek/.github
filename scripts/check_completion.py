@@ -1816,10 +1816,9 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     unclassified = []
     for repo, before in scope["baseline"]["repositories"].items():
         after = inventory(repo)
-        mains = canonical_main_refs(repo, before, after, checks.values())
+        mains = set() if stopped else canonical_main_refs(repo, before, after, checks.values())
         if after["identity"] != before["identity"]:
             raise CompletionError("repository identity changed during task")
-        if stopped: mains = set()
         for name in before["refs"].keys() | after["refs"].keys():
             symbolic_changed = ("symbolic_refs" in before
                                 and before["symbolic_refs"].get(name) != after["symbolic_refs"].get(name))

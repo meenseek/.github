@@ -1208,6 +1208,32 @@ class HookTests(unittest.TestCase):
         context = h.hook({**self.payload, "hook_event_name": "UserPromptSubmit"}, self.root)
         self.assertNotIn("기존 연결 작업", str(context))
 
+    def test_terminal_release_can_leave_malformed_source_unfulfilled_but_checks_resources(self):
+        source = self.f.seed['checks'][0]['target']
+        source['ref'] = 'refs/heads/' + source.pop('main')
+        self.stopped_record_fixture()
+        scope = json.loads(self.f.scope_path.read_bytes())
+        # Successful completion still rejects the malformed source definition.
+        with self.assertRaises(h.c.CompletionError):
+            h.c.observe(scope['checks'][0], self.f.result['checks']['source'])
+        remaining = self.f.root / 'unfinished-resource'
+        remaining.write_text('synthetic task-owned resource')
+        self.call('reserve', '--id', 'unfinished', *self.basis())
+        resource = self.f.root / 'resource.json'
+        self.f.write(resource, {'kind': 'absent', 'target': {'path': str(remaining)}})
+        self.call('attach', '--id', 'unfinished', '--resource', str(resource), *self.basis())
+        self.call('release', ok=False)
+        self.assertTrue(self.state.exists()); self.assertTrue(self.records.exists())
+        remaining.unlink()
+        argv = ['--bindings', str(self.root), 'release', '--session', self.f.seed['session_id'],
+                '--expected-sha256', h.c.sha(self.state.read_bytes()), *self.goal_args()]
+        with mock.patch.object(h.c, 'canonical_main_refs', side_effect=AssertionError(
+                'Stopped source is unfulfilled, not a main publication')), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(h.main(argv), 0)
+        answer = json.loads(output.getvalue())
+        self.assertTrue(answer['stopped']); self.assertFalse(answer['complete'])
+        self.assertFalse(self.state.exists()); self.assertFalse(self.records.exists())
+
     def test_terminal_release_requires_disposition_outside_disposable_records(self):
         self.stopped_record_fixture()
         self.call("outcome", "--status", "cancelled", "--basis", str(self.f.request),
