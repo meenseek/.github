@@ -89,7 +89,9 @@ def measurement_cleanup(state, answer, *, binding_path, preparing=False, scope=N
             else:
                 return store.finish_cleanup(state["task_id"], answer)
     except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error) as exc:
-        if preparing and bound and isinstance(exc, getattr(bound[0], 'RepairIncomplete', ())):
+        required_errors = tuple(kind for kind in (getattr(bound[0], 'RepairIncomplete', None),
+                                getattr(bound[0], 'ReadingIncomplete', None)) if kind is not None) if bound else ()
+        if preparing and isinstance(exc, required_errors):
             raise c.CompletionError(str(exc)) from exc
         print(json.dumps({"measurement": "pending", "error_type": type(exc).__name__}), file=sys.stderr)
 
@@ -295,6 +297,8 @@ def hook(payload, root=ROOT, measurement_root=None):
 
 def _hook(payload, root=ROOT, measurement_root=None):
     measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
+    if measured.get('decision') == 'block' or 'systemMessage' in measured:
+        return measured
     event = payload.get("hook_event_name")
     if event not in {"SessionStart", "UserPromptSubmit", "Stop"}: return measured
     filename = pointer(root, c.text(payload.get("session_id")))

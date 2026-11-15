@@ -17,6 +17,28 @@ h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 
 
 class HookTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations task reading observer')
+    def test_current_reading_failure_survives_unbound_completion_stop(self):
+        root = self.f.root/'reading-observations'
+        prompt = {**self.payload, 'hook_event_name':'UserPromptSubmit', 'turn_id':'current'}
+        h.hook(prompt, root=self.root, measurement_root=root)
+        stop = {**self.payload, 'turn_id':'current'}
+        answer = h.hook(stop, root=self.root, measurement_root=root)
+        self.assertEqual(answer['decision'], 'block')
+        self.assertIn('필수 문서', answer['reason'])
+        continued = h.hook({**stop,'stop_hook_active':True}, root=self.root, measurement_root=root)
+        self.assertNotIn('decision', continued)
+        self.assertIn('미완료', continued['systemMessage'])
+
+    @unittest.skipUnless(HAS_COLLECTOR, 'Requires operations task reading guard')
+    def test_required_reading_is_checked_before_completion_record_deletion(self):
+        module, store = h.measurement_store(self.f.root/'reading-cleanup')
+        with mock.patch.object(h,'ROOT',self.root), mock.patch.object(h,'measurement_store',return_value=(module,store)), \
+             mock.patch.object(store,'remember_cleanup',side_effect=module.ReadingIncomplete('Required source remains unread')):
+            with self.assertRaisesRegex(h.c.CompletionError,'unread'):
+                h.measurement_cleanup({'task_id':'original','session_id':'session'}, {'complete':True},
+                                      binding_path=self.root/'session.json', preparing=True, scope={})
+
     def test_actual_stop_contract_names_missing_work_observations_before_paths(self):
         self.arm_bind(finalize=False)
         answer=h.hook(self.payload,root=self.root,measurement_root=self.f.root/'observations')
