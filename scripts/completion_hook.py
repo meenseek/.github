@@ -417,6 +417,7 @@ def extend_scope(state, before, filename, args):
     c.validate_state_identity(new_scope, state, filename)
     recovery = (c.owner_recovery(state["scope"], old_scope, state["owner_recovery"], state=state)
                 if "owner_recovery" in state else None)
+    c.validate_source_targets(new_scope["checks"])
     c.validate_scope(new_scope, recovery)
     normal = c.control_reference({"path": args.review, "sha256": args.review_sha256})
     if c.read_control(normal) != c.scope_review_value(new_ref, state.get("owner_recovery")):
@@ -486,6 +487,7 @@ def publication_admissions(state, accepted, *, final):
             raise c.CompletionError("initial scope and review must be paired")
         if state["scope"] is not None:
             c.fields(state["scope"], ("path", "sha256")); c.fields(state["review"], ("path", "sha256"))
+            c.validate_source_targets(c.read_control(state["scope"])["checks"])
         return state["resources"]
     # Resource updates and reviewed final inputs are the only generic transitions.
     # bind/outcome/adopt/recover and cleanup retain their dedicated owner boundaries.
@@ -630,7 +632,9 @@ def main(argv=None):
                             if state["scope"] is not None: raise c.CompletionError("scope already frozen; recovery must not replace original obligations")
                             scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
                             review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
-                            scope = c.read_control(scope_ref); c.validate_scope(scope)
+                            scope = c.read_control(scope_ref)
+                            c.validate_source_targets(scope["checks"])
+                            c.validate_scope(scope)
                             c.validate_state_identity(scope, state, filename)
                             if c.read_control(review_ref) != {"scope_sha256": args.scope_sha256, "status": "No Findings"}:
                                 raise c.CompletionError("review is not for this exact scope")

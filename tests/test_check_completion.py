@@ -554,6 +554,24 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(c.CompletionError):
                 c.prepare(seed)
 
+    def test_prepare_rejects_invalid_source_definitions_before_observation(self):
+        invalid = [{"ref": "refs/heads/main"}, {"main": "bad main"}, {"main": "bad..main"},
+                   {"main": "main.lock"}, {"main": "main/"}, {"main": "main//branch"}, {"remote": "bad remote"},
+                   {"repository": "relative"}, {"files": []}, {"files": "tool.py"},
+                   {"files": ["tool.py", "tool.py"]}, {"files": ["../tool.py"]},
+                   {"files": ["/tool.py"]}, {"files": [1]}]
+        invalid.extend({key: None} for key in ("repository", "remote", "main", "files"))
+        for changes in invalid:
+            seed = copy.deepcopy(self.seed)
+            target = seed["checks"][0]["target"]
+            target.update(changes)
+            for key, value in changes.items():
+                if value is None:
+                    del target[key]
+            with self.subTest(changes=changes), mock.patch.object(c, "remote_identity", side_effect=AssertionError(
+                    "Invalid definitions must fail before remote observation")), self.assertRaises(c.CompletionError):
+                c.prepare(seed)
+
     def test_installed_binary_has_no_size_budget_and_still_checks_its_source(self):
         oversized = self.root / "oversized-binary"
         with oversized.open("wb") as stream:

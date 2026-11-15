@@ -586,6 +586,9 @@ owner 근거로 포함한다. HTTP GET은 redirect, 누락 revision/health, 오�
 않는다. 일반 파일·symlink·hardlink·정확한 bytes/identity 검사는 유지한다. `installed_file`은
 `target.path`와 비교 원본 `target.source`의 절대경로가 필수이며 `prepare`와 `bind`에서
 누락·잘못된 경로를 거절한다. 이 정의 오류를 종료 시점의 원본 불일치로 미루지 않는다.
+`git_source`의 필수 필드·main/remote 이름·파일 목록과 상대 경로도 `prepare` 및 새 범위의
+`bind`·`extend`·초기 게시에서 검증한다. 이미 묶인 작업의 중단 해제는 기존 자원 보존·부재
+검사를 유지하며, 미달성 source를 새 입력으로 수락하거나 목표 완료로 처리하지 않는다.
 
 대기·취소·중단은 `outcome`에 현재 근거를 연결한다. 이 상태를 완료로 표현하지 않고 남은
 작업과 해소 조건을 보고한다. 완료 검사가 통과하면 `unbind`가 다시 검사하고 세션 pointer를

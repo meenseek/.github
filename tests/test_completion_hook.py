@@ -221,6 +221,57 @@ class HookTests(unittest.TestCase):
                   "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
         self.assertEqual(self.state.read_bytes(), before)
 
+    def test_bind_rejects_invalid_source_definitions_without_changing_pointer(self):
+        self.call("arm", "--task-id", self.f.seed["task_id"])
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        original = json.loads(self.f.scope_path.read_bytes())
+        before = self.state.read_bytes()
+        changes = [{key: None} for key in ("repository", "remote", "main", "files", "remote_binding")]
+        changes += [{"ref": "refs/heads/main"}, {"main": "bad main"}, {"main": "bad..main"},
+                    {"main": "main.lock"}, {"main": "main/"}, {"main": "main//branch"}, {"files": ["../tool.py"]}]
+        for change in changes:
+            malformed = json.loads(json.dumps(original))
+            target = malformed["checks"][0]["target"]
+            target.update(change)
+            for key, value in change.items():
+                if value is None:
+                    del target[key]
+            self.f.write(self.f.scope_path, malformed)
+            review = {"scope_sha256": self.f.ref(self.f.scope_path)["sha256"], "status": "No Findings"}
+            self.f.write(self.f.review_path, review)
+            with self.subTest(change=change):
+                self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", review["scope_sha256"],
+                          "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
+                self.assertEqual(self.state.read_bytes(), before)
+
+    def test_initial_publication_rejects_invalid_source_without_creating_pointer(self):
+        self.f.seed["checks"][0]["target"]["main"] = "bad main"
+        scope = json.loads(self.f.scope_path.read_bytes())
+        scope["checks"][0]["target"]["main"] = "bad main"
+        self.f.write(self.f.scope_path, scope)
+        state = {**self.f.state, "scope": self.f.ref(self.f.scope_path), "result_path": None, "final_review": None}
+        with self.assertRaisesRegex(h.c.CompletionError, "invalid named Git"):
+            h.publish(self.state, state, None)
+        self.assertFalse(self.state.exists())
+
+    def test_extend_rejects_invalid_new_source_without_changing_pointer(self):
+        self.arm_bind()
+        self.call("outcome", "--status", "waiting", *self.basis())
+        scope = json.loads(self.f.scope_path.read_bytes())
+        extra = json.loads(json.dumps(scope["checks"][0]))
+        extra["id"] = "followup-source"
+        extra["target"]["ref"] = "refs/heads/" + extra["target"].pop("main")
+        scope["checks"].append(extra)
+        scope["categories"]["source"]["checks"].append(extra["id"])
+        target = self.f.root / "extended-scope.json"
+        self.f.write(target, scope)
+        before = self.state.read_bytes()
+        with self.assertRaises(h.c.CompletionError):
+            h.extend_scope(json.loads(before), h.c.sha(before), self.state,
+                           type("Args", (), {"scope": str(target), "scope_sha256": self.f.ref(target)["sha256"]})())
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_unbind_actual_cli_removes_nested_task_records(self):
         self.record_fixture(nested=True)
         self.arm_bind()
@@ -1211,7 +1262,20 @@ class HookTests(unittest.TestCase):
     def test_terminal_release_can_leave_malformed_source_unfulfilled_but_checks_resources(self):
         source = self.f.seed['checks'][0]['target']
         source['ref'] = 'refs/heads/' + source.pop('main')
-        self.stopped_record_fixture()
+        def previously_bound(finalize=True):
+            self.call('arm', '--task-id', self.f.seed['task_id'])
+            self.f.seed['state_path'] = str(self.state)
+            # Construct an already frozen input; new admission must never accept it.
+            with mock.patch.object(fixture_module.c, 'validate_git_source_target'), \
+                    mock.patch.object(fixture_module.c, 'validate_source_targets'):
+                self.f.freeze()
+            state, before = h.load_state(self.state)
+            state.update(scope=self.f.scope_ref, review=self.f.ref(self.f.review_path))
+            h.replace(self.state, state, before)
+            if finalize:
+                self.call('finalize', *self.completion_args())
+        with mock.patch.object(self, 'arm_bind', side_effect=previously_bound):
+            self.stopped_record_fixture()
         scope = json.loads(self.f.scope_path.read_bytes())
         # Successful completion still rejects the malformed source definition.
         with self.assertRaises(h.c.CompletionError):

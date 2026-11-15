@@ -1194,6 +1194,31 @@ def scope_history(scope_ref, state):
     return history
 
 
+def validate_git_source_target(target):
+    fields(target, ("repository", "remote", "main", "files"), ("remote_binding",))
+    path(target["repository"])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", text(target["main"])) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text(target["remote"])):
+        raise CompletionError("invalid named Git main or remote")
+    git(target["repository"], "check-ref-format", "refs/heads/" + target["main"])
+    if not isinstance(target["files"], list) or not target["files"]:
+        raise CompletionError("expected nonempty source file list")
+    for filename in target["files"]:
+        relative = Path(text(filename))
+        if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
+            raise CompletionError("invalid repository-relative source path")
+    if len(target["files"]) != len(set(target["files"])):
+        raise CompletionError("duplicate source file")
+
+
+def validate_source_targets(checks):
+    """Admit new source obligations without observing their eventual results."""
+    for check in checks:
+        fields(check, ("id", "category", "kind", "target"))
+        if check["kind"] == "git_source":
+            fields(check["target"], ("repository", "remote", "main", "files", "remote_binding"))
+            validate_git_source_target(check["target"])
+
+
 def validate_scope(scope, recovery=None):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
@@ -1302,6 +1327,9 @@ def prepare(seed):
     fields(seed, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                   "repositories", "artifact_roots", "state_path", "workspace"), ("owner_snapshots", "record_root"))
     seed = decode(canonical(seed))
+    for check in seed["checks"]:
+        if check["kind"] == "git_source":
+            validate_git_source_target(check["target"])
     if "record_root" in seed:
         seed["record_root"] = record_directory(seed["record_root"])
     refs(seed["owners"])
@@ -1340,6 +1368,7 @@ def prepare(seed):
         "repositories": {repo: inventory(repo) for repo in seed["repositories"]},
         "artifact_roots": {root: tree(root) for root in seed["artifact_roots"]}}, "environment": execution}
     validate_scope(scope)
+    validate_source_targets(scope["checks"])
     return scope
 
 
@@ -1421,19 +1450,14 @@ def _draft_result(scope_ref, expectations=None):
                 return key, {"sha256": sha(control_bytes(target["path"]))}
             return key, {"sha256": working_source_sha(target["path"])}
         if kind == "git_source":
-            fields(target, ("repository", "remote", "main", "files", "remote_binding"))
+            validate_source_targets([check])
             repo = target["repository"]
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", text(target["main"])) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text(target["remote"])):
-                raise CompletionError("invalid named Git main or remote")
             local = git(repo, "rev-parse", "refs/heads/" + text(target["main"])).decode().strip()
             remote = remote_ref(repo, target["remote"], "refs/heads/" + target["main"], target["remote_binding"])
             if remote is None:
                 raise CompletionError("remote main could not be observed")
             files = {}
             for filename in target["files"]:
-                relative = Path(text(filename))
-                if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
-                    raise CompletionError("invalid repository-relative source path")
                 files[filename] = (None if (repo, filename) in planned
                                    and not git_source_present(repo, local, filename)
                                    else git_source_sha(repo, local, filename))
@@ -1550,11 +1574,9 @@ def observe(check, expected, *, preserved=None, owners=()):
             raise CompletionError("running revision or health differs")
         return actual
     if kind == "git_source":
-        fields(target, ("repository", "remote", "main", "files", "remote_binding"))
+        validate_source_targets([check])
         fields(expected, ("local_revision", "remote_revision", "files"), ("retained_branch",))
         main, remote = text(target["main"]), text(target["remote"])
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", main) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
-            raise CompletionError("invalid named Git main or remote")
         repo = target["repository"]
         local = git(repo, "rev-parse", "refs/heads/" + main).decode().strip()
         retained = expected.get("retained_branch")
@@ -1582,9 +1604,6 @@ def observe(check, expected, *, preserved=None, owners=()):
         if not target["files"] or set(target["files"]) != set(expected["files"]):
             raise CompletionError("reviewed file coverage differs")
         for filename, wanted in expected["files"].items():
-            relative = Path(filename)
-            if relative.is_absolute() or ".." in relative.parts or filename.startswith(":"):
-                raise CompletionError("invalid repository-relative source path")
             if wanted is None:
                 if preserved and filename in preserved:
                     raise CompletionError("cannot delete a file with preserved foreign regions")
