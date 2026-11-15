@@ -1122,6 +1122,118 @@ class HookTests(unittest.TestCase):
     def basis(self):
         return ["--basis", str(self.f.owner), "--basis-sha256", self.f.ref(self.f.owner)["sha256"]]
 
+    def process_repair_fixture(self, identity=None):
+        self.record_fixture(); self.arm_bind(finalize=True)
+        state = json.loads(self.state.read_bytes())
+        resource = {"id": "legacy-process", "kind": "process_absent",
+                    "target": {"pid": 99999999, "identity": identity}, "basis": self.f.ref(self.f.owner)}
+        # Historical malformed state fixture; never admitted through new attach.
+        state["resources"].append(resource); self.f.write(self.state, state)
+        observed = "Sun Nov 15 00:00:00 2026     synthetic-test-process"
+        source = self.f.root / "process-observation.json"
+        self.f.write(source, {"pid": resource["target"]["pid"], "identity": observed,
+                             "source_tool": "synthetic-fixture", "source_call_id": "fixture-observation"})
+        proof = {"task_id": state["task_id"], "session_id": state["session_id"],
+                 "request_digest": self.f.seed["request_digest"], "scope_sha256": state["scope"]["sha256"],
+                 "previous_state_sha256": h.c.sha(self.state.read_bytes()), "resource": resource,
+                 "identity": observed, "source": self.f.ref(source),
+                 "reason": "Controlled historical observation fixture", "previous_final_review": state["final_review"]}
+        evidence = self.f.root / "process-repair.json"; review = self.f.root / "process-repair-review.json"
+        def write_proof(value):
+            self.f.write(evidence, value)
+            self.f.write(review, {"scope_sha256": state["scope"]["sha256"],
+                "evidence_sha256": self.f.ref(evidence)["sha256"],
+                "resource_sha256": h.c.sha(h.c.canonical(resource)),
+                "previous_state_sha256": h.c.sha(self.state.read_bytes()), "status": "No Findings"})
+        write_proof(proof)
+        def arguments():
+            return [*self.goal_args(), "--id", resource["id"], "--evidence", str(evidence),
+                    "--evidence-sha256", self.f.ref(evidence)["sha256"], "--review", str(review),
+                    "--review-sha256", self.f.ref(review)["sha256"]]
+        return state, proof, evidence, review, source, write_proof, arguments
+
+    def test_attach_rejects_invalid_process_handles_without_publishing(self):
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "process", *self.basis())
+        target = self.f.root / "process.json"
+        before = self.state.read_bytes()
+        observed = "Sun Nov 15 00:00:00 2026     fixture"
+        invalid = [(123, None), (123, ""), (123, "no start identity")]
+        invalid.extend((pid, observed) for pid in [True, 0, -1, 2**31])
+        for pid, identity in invalid:
+            with self.subTest(pid=pid, identity=identity):
+                self.f.write(target, {"kind": "process_absent", "target": {"pid": pid, "identity": identity}})
+                self.call("attach", "--id", "process", *self.basis(), "--resource", str(target), ok=False)
+                self.assertEqual(self.state.read_bytes(), before)
+
+    def test_attach_accepts_a_live_observed_process_without_requiring_absence(self):
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "process", *self.basis())
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
+        try:
+            identity = h.c.process_identity(child.pid); self.assertIsNotNone(identity)
+            target = self.f.root / "process.json"
+            self.f.write(target, {"kind": "process_absent", "target": {"pid": child.pid, "identity": identity}})
+            self.call("attach", "--id", "process", *self.basis(), "--resource", str(target))
+            self.assertIsNone(child.poll())
+        finally:
+            child.terminate(); child.wait(timeout=3)
+
+    def test_reviewed_null_identity_repair_preserves_history_and_completes_actual_owner(self):
+        state, proof, evidence, review, source, _, arguments = self.process_repair_fixture()
+        self.call("repair-process-record", *arguments())
+        after = json.loads(self.state.read_bytes())
+        for key in state.keys() - {"resources", "control_records", "final_review"}:
+            self.assertEqual(after[key], state[key])
+        self.assertEqual(after["control_records"][:len(state["control_records"])], state["control_records"])
+        self.assertEqual(after["resources"][-1], {**state["resources"][-1],
+            "target": {**state["resources"][-1]["target"], "identity": proof["identity"]}})
+        self.assertIsNone(after["final_review"])
+        retained = {(row["path"], row["sha256"]) for row in after["control_records"]}
+        for ref in [self.f.ref(evidence), self.f.ref(review), self.f.ref(source), proof["previous_final_review"]]:
+            self.assertIn((ref["path"], ref["sha256"]), retained)
+        self.call("complete", ok=False)  # New review cannot be omitted.
+        fresh = h.c.final_review_fields(after["scope"], json.loads(self.f.scope_path.read_bytes()), after,
+            self.f.ref(self.f.result_path)["sha256"], str(self.f.final_review_path), fresh_inventory=True)
+        self.f.write(self.f.final_review_path, fresh)
+        self.call("complete", *self.completion_args())
+        self.assertFalse(self.state.exists()); self.assertFalse(self.records.exists())
+
+    def test_process_repair_rejects_changed_goal_resource_observation_or_review(self):
+        state, proof, evidence, review, source, write_proof, arguments = self.process_repair_fixture()
+        before = self.state.read_bytes()
+        mutations = [lambda p: p.update(scope_sha256="f"*64),
+                     lambda p: p.update(previous_state_sha256="0"*64),
+                     lambda p: p["resource"]["target"].update(pid=99999998),
+                     lambda p: p.update(identity="Sun Nov 15 01:00:00 2026     different-observation")]
+        for mutation in mutations:
+            value = json.loads(json.dumps(proof)); mutation(value); write_proof(value)
+            self.call("repair-process-record", *arguments(), ok=False)
+            self.assertEqual(self.state.read_bytes(), before)
+        write_proof(proof)
+        value = json.loads(review.read_bytes()); value["status"] = "unreviewed"; self.f.write(review, value)
+        self.call("repair-process-record", *arguments(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+        write_proof(proof); source.unlink()
+        self.call("repair-process-record", *arguments(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_process_repair_cannot_overwrite_a_known_identity(self):
+        _, _, _, _, _, _, arguments = self.process_repair_fixture("Sun Nov 15 00:00:00 2026     already-recorded")
+        before = self.state.read_bytes()
+        self.call("repair-process-record", *arguments(), ok=False)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_process_repair_does_not_supplement_a_currently_live_pid(self):
+        _, _, _, _, _, _, arguments = self.process_repair_fixture()
+        before = self.state.read_bytes()
+        with mock.patch.object(h.c, "process_identity", return_value="Sun Nov 15 01:00:00 2026     live-process"), \
+                redirect_stdout(io.StringIO()):
+            code = h.main(["--bindings", str(self.root), "repair-process-record",
+                "--session", self.f.seed["session_id"], "--expected-sha256", h.c.sha(before), *arguments()])
+        self.assertEqual(code, 2)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_installed_cli_does_not_create_local_bytecode(self):
         runtime = self.f.root / "runtime"; runtime.mkdir()
         import shutil

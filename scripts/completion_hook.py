@@ -457,6 +457,67 @@ def resolve_reservation(state, before, args):
     return proposed
 
 
+def process_target(target):
+    """Validate a captured handle at admission, without requiring its absence."""
+    c.fields(target, ("pid", "identity"))
+    if type(target["pid"]) is not int or not 1 <= target["pid"] <= 2**31 - 1:
+        raise c.CompletionError("valid positive process PID required")
+    identity = c.text(target["identity"])
+    if re.match(r"^[A-Za-z]{3} [A-Za-z]{3} [ 0-9]{2} [0-9:]{8} [0-9]{4}\b", identity) is None:
+        raise c.CompletionError("observed process start identity required")
+
+
+def repair_process_record(state, before, args):
+    """Supplement only a historical null identity; never replace a process."""
+    if state["scope"] is None:
+        raise c.CompletionError("process record repair requires the frozen scope")
+    proof_ref = c.control_reference({"path": args.evidence, "sha256": args.evidence_sha256})
+    review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
+    proof = c.read_control(proof_ref)
+    c.fields(proof, ("task_id", "session_id", "request_digest", "scope_sha256", "previous_state_sha256",
+                     "resource", "identity", "source", "reason", "previous_final_review"))
+    scope = c.read_control(state["scope"])
+    if ((args.task_id, args.request_digest) != (state["task_id"], scope["request_digest"])
+            or (proof["task_id"], proof["session_id"], proof["request_digest"], proof["scope_sha256"],
+                proof["previous_state_sha256"], proof["previous_final_review"]) !=
+               (state["task_id"], state["session_id"], scope["request_digest"], state["scope"]["sha256"],
+                before, state["final_review"])):
+        raise c.CompletionError("process repair differs from the exact current goal and pointer")
+    found = [item for item in state["resources"] if item["id"] == args.id]
+    if len(found) != 1 or c.canonical(found[0]) != c.canonical(proof["resource"]):
+        raise c.CompletionError("process repair must preserve the exact original resource")
+    original = found[0]
+    if original["kind"] != "process_absent":
+        raise c.CompletionError("only a historical process record can be supplemented")
+    c.fields(original["target"], ("pid", "identity"))
+    if original["target"]["identity"] is not None:
+        raise c.CompletionError("only a missing null process identity can be supplemented")
+    target = {**original["target"], "identity": proof["identity"]}
+    process_target(target)
+    c.text(proof["reason"])
+    source_ref = c.control_reference(proof["source"])
+    source = c.read_control(source_ref)
+    c.fields(source, ("pid", "identity", "source_tool", "source_call_id"))
+    c.text(source["source_tool"]); c.text(source["source_call_id"])
+    if c.canonical({key: source[key] for key in target}) != c.canonical(target):
+        raise c.CompletionError("process identity differs from the supplied observation")
+    if c.process_identity(target["pid"]) is not None:
+        raise c.CompletionError("historical process repair requires current PID absence")
+    expected = {"scope_sha256": state["scope"]["sha256"], "evidence_sha256": proof_ref["sha256"],
+                "resource_sha256": c.sha(c.canonical(original)), "previous_state_sha256": before,
+                "status": "No Findings"}
+    if c.read_control(review_ref) != expected:
+        raise c.CompletionError("exact independent process repair review required")
+    # Preserve the malformed original, old final review, source, and judgment in
+    # existing append-only control history. No state reset or check relaxation.
+    for ref in (proof_ref, review_ref, source_ref, state["final_review"]):
+        if ref:
+            c.remember_control(state, ref, c.control_bytes(ref["path"], ref["sha256"]))
+    original["target"] = target
+    state["final_review"] = None  # Require a new final review after this correction.
+    return state
+
+
 def publication_admissions(state, accepted, *, final):
     """Validate allowed deltas against the disk CAS state before capturing inputs."""
     c.fields(state, c.STATE_FIELDS, c.STATE_OPTIONAL)
@@ -557,13 +618,14 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
+    for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "repair-process-record", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
-        if name in {"complete", "unbind", "release", "adopt"}:
-            item.add_argument('--work-turn',action='append',help='Current explicit goal turn(s) to attach to automatic cleanup measurement; never infer them from an old binding')
+        if name in {"complete", "unbind", "release", "adopt", "repair-process-record"}:
+            if name != "repair-process-record":
+                item.add_argument('--work-turn',action='append',help='Current explicit goal turn(s) to attach to automatic cleanup measurement; never infer them from an old binding')
             item.add_argument("--task-id", required=True, help="current user goal identity, not a task inferred from an old session")
             item.add_argument("--request-digest", required=True, help="current goal's frozen request digest; completion binding does not supply caller intent")
         if name == "adopt": item.add_argument("--from-session", required=True)
@@ -581,7 +643,8 @@ def main(argv=None):
         if name in {"finalize", "complete"}:
             item.add_argument("--result"); item.add_argument("--review"); item.add_argument("--review-sha256")
             item.add_argument("--inputs", choices=("-",), help="read {result,review} JSON from stdin without staging files")
-        if name in {"recover-owner", "preserve-source", "recover-filesystem", "resolve-reservation"}:
+        if name == "repair-process-record": item.add_argument("--id", required=True)
+        if name in {"recover-owner", "preserve-source", "recover-filesystem", "resolve-reservation", "repair-process-record"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "recover-filesystem":
@@ -643,6 +706,8 @@ def main(argv=None):
                             state.update(proposed)
                         elif args.command == "resolve-reservation":
                             state = resolve_reservation(state, before, args)
+                        elif args.command == "repair-process-record":
+                            state = repair_process_record(state, before, args)
                         elif args.command in {"reserve", "attach"}:
                             basis = c.control_reference({"path": args.basis, "sha256": args.basis_sha256})
                             found = [r for r in state["resources"] if r["id"] == args.id]
@@ -658,6 +723,8 @@ def main(argv=None):
                                 c.fields(resource, ("kind", "target"))
                                 if resource["kind"] not in {"absent", "ref_absent", "remote_ref_absent", "worktree_absent", "process_absent"} or not isinstance(resource["target"], dict):
                                     raise c.CompletionError("pointer covers temporary resources only; retained outputs/runtime need fixed owner scope checks")
+                                if resource["kind"] == "process_absent":
+                                    process_target(resource["target"])
                                 if resource["kind"] in {"ref_absent", "remote_ref_absent"}:
                                     c.validate_ref_observer(resource["kind"], resource["target"].get("ref"))
                                 if resource["kind"] == "remote_ref_absent":
