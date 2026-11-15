@@ -672,6 +672,26 @@ def owner_history_identity_slots(binding):
     return slots
 
 
+class RecoveredOwners(dict):
+    """Current owner digests plus the original proofs verified by recovery."""
+
+    def __init__(self):
+        super().__init__()
+        self.originals = {}
+
+    def verify_original(self, basis):
+        original = self.originals.get(basis["path"])
+        if original is None or original["sha256"] != basis["sha256"]:
+            return False
+        if "snapshot" in original:
+            if original["snapshot"]["sha256"] != basis["sha256"]:
+                return False
+            control_reference(original["snapshot"])
+        else:
+            owner_refs([original])
+        return True
+
+
 def owner_recovery(scope_ref, scope, binding, *, historical=False, seen=(), state=None):
     """Validate the complete reviewed chain without a call-stack depth limit."""
     contexts = {scope_ref["sha256"]: (scope_ref, scope)}
@@ -735,7 +755,7 @@ def owner_recovery_step(scope_ref, scope, evidence, *, historical, state, active
             row = rows.get(slot["common_dir"])
             if row and {k: slot[k] for k in ("device", "inode")} == row["before"]:
                 slot.update(row["after"])
-    recovered = {}
+    recovered = RecoveredOwners()
     for owner in evidence["owners"]:
         fields(owner, ("owner_path",), ("repository", "identity", "original", "current", "source", "snapshots"))
         selected = [ref for ref in scope["owners"] if ref["path"] == owner["owner_path"]]
@@ -755,6 +775,8 @@ def owner_recovery_step(scope_ref, scope, evidence, *, historical, state, active
             if not historical:
                 reference({"path": owner["owner_path"], "sha256": current})
             recovered[owner["owner_path"]] = current
+            recovered.originals[owner["owner_path"]] = {
+                "sha256": selected[0]["sha256"], "snapshot": snapshots["original"]}
             continue
         fields(owner, ("owner_path", "repository", "identity", "original", "current", "source"))
         actual_identity = repo_identity(owner["repository"])
@@ -795,6 +817,9 @@ def owner_recovery_step(scope_ref, scope, evidence, *, historical, state, active
             observe(source["definition"], expected)
             reference({"path": owner["owner_path"], "sha256": owner["current"]["sha256"]})
         recovered[owner["owner_path"]] = owner["current"]["sha256"]
+        recovered.originals[owner["owner_path"]] = {**selected[0], "original": {
+            "repository": owner["repository"], "file": owner["original"]["file"],
+            "identity": actual_identity, "revision": owner["original"]["revision"]}}
     return recovered
 
 
@@ -1251,7 +1276,7 @@ def validate_scope(scope, recovery=None):
             path(check["target"]["path"])
             if check["category"] != "quality":
                 raise CompletionError("improvement observations belong to quality")
-            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"], owners=owners)
+            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"], owners=owners, recovery=recovery)
         checks[key] = check
     for owner in owners:
         if "original" in owner and not any(
@@ -1485,11 +1510,11 @@ def _draft_result(scope_ref, expectations=None):
     return result
 
 
-def observe(check, expected, *, preserved=None, owners=()):
+def observe(check, expected, *, preserved=None, owners=(), recovery=None):
     kind, target = check["kind"], check["target"]
     if kind == "improvement":
         fields(target, ("path", "plan")); fields(expected, ("sha256",))
-        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])}, owners=owners)
+        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])}, owners=owners, recovery=recovery)
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("assertions",) if kind == "evidence" else ("source",))
         fields(expected, ("sha256",))
@@ -1802,7 +1827,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         if stopped and definition["kind"] not in CLEANUP_KINDS:
             return key, {"unfulfilled": True, "reason": "terminal stop; original goal is not claimed complete"}, None
         try:
-            options = {"owners": scope["owners"]} if definition["kind"] == "improvement" else {}
+            options = {"owners": scope["owners"], "recovery": recovery} if definition["kind"] == "improvement" else {}
             if key in preserved:
                 options["preserved"] = preserved[key]
             return key, observe(definition, wanted, **options), None

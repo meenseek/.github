@@ -38,7 +38,7 @@ def observation(ref, case, implementation):
     return matches(value["result"], case["assertions"])
 
 
-def validate_plan(plan_ref, task_id=None, *, owners=()):
+def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None):
     plan = c.read_control(plan_ref)
     c.fields(plan, ("task_id", "problem", "criterion", "basis", "baseline_sha256", "cases"))
     for key in ("task_id", "problem", "criterion"):
@@ -58,6 +58,11 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
         raise c.CompletionError("duplicate preserved basis")
     if preserved:
         c.owner_refs(preserved)
+    elif (isinstance(recovery, c.RecoveredOwners)
+          and any(owner.get("path") == plan["basis"]["path"]
+                  and owner.get("sha256") == plan["basis"]["sha256"] for owner in owners)
+          and recovery.verify_original(plan["basis"])):
+        c.owner_refs(list(owners), recovery)
     else:
         c.reference(plan["basis"])
     c.digest(plan["baseline_sha256"])
@@ -86,8 +91,8 @@ def validate_plan(plan_ref, task_id=None, *, owners=()):
     return plan, baseline_passes
 
 
-def inspect(plan_ref, record_ref, task_id=None, *, owners=(), check_application=True):
-    plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners)
+def inspect(plan_ref, record_ref, task_id=None, *, owners=(), recovery=None, check_application=True):
+    plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners, recovery=recovery)
     record = c.read_control(record_ref)
     c.fields(record, ("plan_sha256", "candidate", "cases", "application"))
     if record["plan_sha256"] != plan_ref["sha256"]:
@@ -123,7 +128,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=(), check_application=
         if check_application and c.working_source_sha(location) != source["sha256"]:
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
-    validate_plan(plan_ref, task_id, owners=owners)
+    validate_plan(plan_ref, task_id, owners=owners, recovery=recovery)
     c.control_reference(record_ref)
     c.refs(candidates)
     for ref in after_refs:

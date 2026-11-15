@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import test_check_completion as completion_fixture
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/check_improvement.py"
@@ -197,6 +198,101 @@ class ImprovementTests(unittest.TestCase):
             return answer
         with mock.patch.object(i, "observation", side_effect=mutate), self.assertRaisesRegex(ValueError, "source bytes changed"):
             i.inspect(self.plan_ref, self.record_ref, owners=[owner])
+
+    def recovered_basis_fixture(self):
+        bindings = self.root / "bindings"; bindings.mkdir(mode=0o700)
+        state = bindings / "basis-recovery.json"
+        request = self.write("request.json", {"request": "Synthetic owner recovery"})
+        check = {"id": "prevention", "category": "quality", "kind": "improvement",
+                 "target": {"path": str(self.record_path), "plan": self.plan_ref}}
+        categories = {name: {"checks": [], "not_applicable": {
+            "reason": "Synthetic test observes only the improvement boundary.", "basis": [self.plan["basis"]]}}
+            for name in c.CATEGORIES}
+        categories["quality"] = {"checks": ["prevention"], "not_applicable": None}
+        scope = c.prepare({"task_id": self.plan["task_id"], "session_id": "basis-recovery",
+            "request": request, "request_digest": request["sha256"], "owners": [self.plan["basis"]],
+            "categories": categories, "checks": [check], "repositories": [], "artifact_roots": [],
+            "state_path": str(state), "workspace": str(self.root)})
+        scope_ref = self.write("scope.json", scope)
+        review = self.write("scope-review.json", {"scope_sha256": scope_ref["sha256"], "status": "No Findings"})
+        hook = SCRIPT.with_name("completion_hook.py")
+        def call(command, *args):
+            argv = [sys.executable, "-I", str(hook), "--bindings", str(bindings), command,
+                    "--session", "basis-recovery"]
+            if state.exists(): argv += ["--expected-sha256", self.ref(state)["sha256"]]
+            if command == "complete": argv += ["--task-id", scope["task_id"], "--request-digest", scope["request_digest"]]
+            done = subprocess.run([*argv, *args], capture_output=True, timeout=35)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            return json.loads(done.stdout)
+        call("arm", "--task-id", scope["task_id"])
+        call("bind", "--scope", scope_ref["path"], "--scope-sha256", scope_ref["sha256"],
+             "--review", review["path"], "--review-sha256", review["sha256"])
+        original = self.root / "original.md"; original.write_bytes(self.basis.read_bytes())
+        current = self.root / "current.md"; current.write_text("Normal independent owner update.\n")
+        self.basis.write_bytes(current.read_bytes())
+        evidence = self.write("recovery.json", {"scope_sha256": scope_ref["sha256"],
+            "task_id": scope["task_id"], "session_id": scope["session_id"], "authorization": request,
+            "owners": [{"owner_path": str(self.basis), "snapshots": {
+                "original": self.ref(original), "current": self.ref(current)}}]})
+        reviewed = self.write("recovery-review.json", {"scope_sha256": scope_ref["sha256"],
+            "recovery_sha256": evidence["sha256"], "status": "No Findings"})
+        return scope_ref, scope, state, request, original, {"evidence": evidence, "review": reviewed}, call
+
+    def test_recovered_basis_actual_cli_preserves_criteria_and_completes(self):
+        scope_ref, scope, state, request, original, binding, call = self.recovered_basis_fixture()
+        frozen = Path(scope_ref["path"]).read_bytes(), self.plan_path.read_bytes()
+        call("outcome", "--status", "waiting", "--basis", request["path"], "--basis-sha256", request["sha256"])
+        call("recover-owner", "--evidence", binding["evidence"]["path"], "--evidence-sha256", binding["evidence"]["sha256"],
+             "--review", binding["review"]["path"], "--review-sha256", binding["review"]["sha256"])
+        call("outcome", "--status", "working", "--basis", request["path"], "--basis-sha256", request["sha256"])
+        result = c.draft_result(scope_ref, state_path=str(state))
+        result_ref = self.write("result.json", result)
+        final_path = self.root / "final-review.json"
+        reviewed = c.final_review_fields(scope_ref, scope, json.loads(state.read_bytes()),
+                                        result_ref["sha256"], str(final_path), stopped=False)
+        final_ref = self.write(final_path.name, reviewed)
+        answer = call("complete", "--work-turn", "synthetic-closing-turn", "--result", result_ref["path"],
+                      "--review", final_ref["path"], "--review-sha256", final_ref["sha256"])
+        self.assertTrue(answer["binding_released"])
+        self.assertFalse(state.exists())
+        self.assertEqual(frozen, (Path(scope_ref["path"]).read_bytes(), self.plan_path.read_bytes()))
+        self.assertEqual(self.basis.read_bytes(), (self.root / "current.md").read_bytes())
+
+    def test_recovered_basis_rejects_plain_map_wrong_lineage_and_changed_original(self):
+        scope_ref, scope, state, request, original, binding, call = self.recovered_basis_fixture()
+        recovery = c.owner_recovery(scope_ref, scope, binding)
+        self.assertTrue(i.inspect(self.plan_ref, self.record_ref, owners=scope["owners"], recovery=recovery)["verified"])
+        original_proof = recovery.originals[str(self.basis)]["snapshot"]
+        recovery.originals[str(self.basis)]["snapshot"] = self.ref(self.root / "current.md")
+        with self.assertRaises(ValueError):
+            i.validate_plan(self.plan_ref, owners=scope["owners"], recovery=recovery)
+        recovery.originals[str(self.basis)]["snapshot"] = original_proof
+        with self.assertRaisesRegex(ValueError, "source bytes changed"):
+            i.validate_plan(self.plan_ref, owners=scope["owners"], recovery=dict(recovery))
+        self.plan["basis"] = {**self.plan["basis"], "sha256": "0" * 64}; self.freeze()
+        with self.assertRaises(ValueError):
+            i.validate_plan(self.plan_ref, owners=scope["owners"], recovery=recovery)
+        self.plan["basis"] = scope["owners"][0]; self.freeze()
+        observation = i.observation
+        def mutate(*args):
+            result = observation(*args)
+            if args[2] == self.candidate_sha:
+                original.write_text("Altered preserved criterion after observing the candidate.\n")
+            return result
+        with mock.patch.object(i, "observation", side_effect=mutate), self.assertRaisesRegex(ValueError, "source bytes changed"):
+            i.inspect(self.plan_ref, self.record_ref, owners=scope["owners"], recovery=recovery)
+
+    def test_recovered_git_basis_rechecks_original_revision(self):
+        fixture = completion_fixture.CompletionTests()
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        fixture.recovery_fixture()
+        scope = json.loads(fixture.scope_path.read_bytes())
+        self.plan["basis"] = scope["owners"][0]; self.freeze()
+        recovery = c.owner_recovery(fixture.scope_ref, scope, fixture.recovery_binding)
+        self.assertTrue(i.inspect(self.plan_ref, self.record_ref, owners=scope["owners"], recovery=recovery)["verified"])
+        recovery.originals[str(fixture.owner)]["original"]["revision"] = "0" * 40
+        with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+            i.validate_plan(self.plan_ref, owners=scope["owners"], recovery=recovery)
 
     def test_json_bool_is_not_number(self):
         self.assertFalse(i.matches({"x": 0}, [{"path": ["x"], "equals": False}]))
