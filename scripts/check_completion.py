@@ -324,12 +324,16 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
                                    *(g["classification"] for g in result.get("exception_groups", []))]:
                 for ref in classification["basis"]:
                     keep(ref)
+            reviewed = read_control(state["final_review"])
+            stopped = isinstance(reviewed, dict) and reviewed.get("disposition") == "stopped"
             for check in scope["checks"]:
-                retained = result["checks"][check["id"]].get("retained_branch")
+                expected = result["checks"][check["id"]]
+                retained = expected.get("retained_branch")
                 if retained:
                     keep(retained["basis"])
-                if check["kind"] in {"evidence", "improvement"}:
-                    ref = {"path": check["target"]["path"], "sha256": result["checks"][check["id"]]["sha256"]}
+                # A reviewed stopped close never claims goal evidence, so it may leave unproduced evidence empty.
+                if check["kind"] in {"evidence", "improvement"} and not (stopped and expected == {}):
+                    ref = {"path": check["target"]["path"], "sha256": expected["sha256"]}
                     keep(ref)
                     if check["kind"] == "improvement":
                         for case in read_control(ref)["cases"]:

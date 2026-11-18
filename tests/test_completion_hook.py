@@ -1336,6 +1336,30 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.f.scope_path.exists()); self.assertTrue(self.f.result_path.exists())
         self.call("arm", "--task-id", "new-synthetic-task")
 
+    def test_stopped_release_does_not_require_unproduced_goal_evidence(self):
+        report = self.f.root / "unproduced-quality.json"
+        self.f.seed["checks"].append({"id": "quality", "category": "quality", "kind": "evidence",
+            "target": {"path": str(report), "assertions": [{"path": ["passed"], "equals": True}]}})
+        self.f.reset_categories()
+        self.arm_bind(finalize=False)
+        self.f.result["checks"]["quality"] = {}
+        self.f.write(self.f.result_path, self.f.result); self.f.final_review()
+        before = self.state.read_bytes()
+        self.call("finalize", *self.completion_args(), ok=False)  # a completion review still needs the evidence bytes
+        self.assertEqual(self.state.read_bytes(), before)
+        self.call("outcome", "--status", "cancelled", *self.basis())
+        reviewed = json.loads(self.f.final_review_path.read_bytes()); reviewed["disposition"] = "stopped"
+        self.f.write(self.f.final_review_path, reviewed)
+        self.call("finalize", *self.completion_args())
+        self.call("outcome", "--status", "working", *self.basis())
+        self.assertIn("final review", self.call("complete", *self.completion_args(), ok=False)["error"])
+        self.call("outcome", "--status", "waiting", *self.basis())
+        self.call("finalize", *self.completion_args())  # waiting-only owner rechecks reach the same capture
+        self.call("outcome", "--status", "cancelled", *self.basis())
+        answer = self.call("release")
+        self.assertFalse(answer["complete"]); self.assertTrue(answer["stopped"])
+        self.assertTrue(answer["observed"]["quality"]["unfulfilled"]); self.assertFalse(self.state.exists())
+
     def stopped_record_fixture(self):
         self.record_fixture(nested=True)
         self.arm_bind()
