@@ -40,7 +40,8 @@ KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote
 STATE_FIELDS = ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome")
 STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup",
                   "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history",
-                  "reservation_resolutions")
+                  "reservation_resolutions", "github_observer_recovery")
+GITHUB_OBSERVER_ENV = "CODEX_COMPLETION_GH"
 _CONTROL = ContextVar("completion_control", default=None)
 
 
@@ -286,7 +287,7 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
             keep(read_control(resolution["evidence"])["source"])
         keep(state.get("status_basis"))
         keep(state.get("handoff", {}).get("basis"))
-        for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
+        for name in ("owner_recovery", "source_preservation", "filesystem_recovery", "github_observer_recovery"):
             binding = state.get(name)
             seen = set()
             while binding:
@@ -394,11 +395,25 @@ def control_refs(values):
 
 
 def observer_env():
-    # Git config/SSH/proxy injection is not inherited. No input-selected executable.
+    # Git config/SSH/proxy injection and the caller's PATH are not inherited.
     return {"PATH": "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin", "HOME": os.environ.get("HOME", ""),
             "LANG": "C", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1",
             "GH_PAGER": "cat"}
+
+
+def github_observer():
+    configured = os.environ.get(GITHUB_OBSERVER_ENV)
+    if configured is None:
+        return shutil.which("gh", path=observer_env()["PATH"])
+    candidate = path(configured).resolve(strict=True)
+    if candidate.name != "gh" or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise CompletionError(f"{GITHUB_OBSERVER_ENV} must resolve to an executable gh file")
+    return str(candidate)
+
+
+def github_observation_required(checks):
+    return any(check["target"].get("remote_binding", {}).get("kind") == "github" for check in checks)
 
 
 def run(argv, cwd=None, timeout=TIMEOUT):
@@ -497,7 +512,7 @@ def remote_ref(repo, remote, ref, binding):
         values = git(binding["url"], "for-each-ref", "--format=%(refname) %(objectname)", ref).decode().splitlines()
         return next((line.split()[1] for line in values if line.split()[0] == ref), None)
     # gh api is a fixed authenticated read, not an input-selected command or URL.
-    executable = shutil.which("gh", path=observer_env()["PATH"])
+    executable = github_observer()
     if not executable:
         raise CompletionError("GitHub observer unavailable")
     endpoint = "repos/" + binding["repository"] + "/git/matching-refs/heads/" + ref[len("refs/heads/"):]
@@ -507,14 +522,62 @@ def remote_ref(repo, remote, ref, binding):
     return next((item["object"]["sha"] for item in values if item.get("ref") == ref), None)
 
 
-def environment(workspace):
-    binaries = {name: shutil.which(name, path=observer_env()["PATH"]) for name in ("git", "gh", "ps")}
+def environment(workspace, *, github=True):
+    binaries = {name: shutil.which(name, path=observer_env()["PATH"]) for name in ("git", "ps")}
+    binaries["gh"] = github_observer() if github else shutil.which("gh", path=observer_env()["PATH"])
     ca = ssl.get_default_verify_paths().openssl_cafile
     return {"https_ca": {"path": ca, "sha256": working_source_sha(ca)} if ca and Path(ca).is_file() else None,
             "workspace": str(path(workspace)), "python": str(Path(sys.executable).resolve()),
             "python_version": sys.version, "binaries": binaries,
             "binary_sha256": {k: working_source_sha(v) if v else None for k,v in binaries.items()},
             "settings_sha256": sha(canonical(observer_env()))}
+
+
+def scope_environment(scope, resources=()):
+    frozen = scope["environment"]
+    if github_observation_required([*scope["checks"], *resources]):
+        if not frozen["binaries"]["gh"]:
+            raise CompletionError("GitHub observer unavailable")
+    elif frozen["binaries"]["gh"] == shutil.which("gh", path=observer_env()["PATH"]):
+        return environment(frozen["workspace"], github=False)
+    return environment(frozen["workspace"])
+
+
+def github_observer_environment(frozen):
+    """Allow a reviewed gh-only change to an existing observer environment."""
+    if GITHUB_OBSERVER_ENV not in os.environ:
+        raise CompletionError(f"set {GITHUB_OBSERVER_ENV} to the reviewed gh executable")
+    current = environment(frozen["workspace"])
+    expected = {**frozen,
+                "binaries": {**frozen["binaries"], "gh": current["binaries"]["gh"]},
+                "binary_sha256": {**frozen["binary_sha256"], "gh": current["binary_sha256"]["gh"]}}
+    if current != expected or current == frozen:
+        raise CompletionError("only an actual gh executable change can be recovered here")
+    return current
+
+
+def github_observer_scope(scope_ref, scope, state):
+    if "github_observer_recovery" not in state:
+        return scope
+    binding = state["github_observer_recovery"]
+    fields(binding, ("evidence", "review"))
+    evidence = read_control(binding["evidence"])
+    fields(evidence, ("scope_sha256", "task_id", "request_digest", "previous_state_sha256", "authorization", "observer"))
+    if (state.get("scope") != scope_ref or
+            (evidence["scope_sha256"], evidence["task_id"], evidence["request_digest"]) !=
+            (scope_ref["sha256"], scope["task_id"], scope["request_digest"]) or
+            not github_observation_required([*scope["checks"], *state["resources"]])):
+        raise CompletionError("GitHub observer recovery belongs to another scope or goal")
+    digest(evidence["previous_state_sha256"])
+    control_reference(evidence["authorization"])
+    current = github_observer_environment(scope["environment"])
+    if evidence["observer"] != {"path": current["binaries"]["gh"], "sha256": current["binary_sha256"]["gh"]}:
+        raise CompletionError("GitHub observer no longer matches the reviewed executable")
+    if read_control(binding["review"]) != {"scope_sha256": scope_ref["sha256"],
+                                          "github_observer_recovery_sha256": binding["evidence"]["sha256"],
+                                          "status": "No Findings"}:
+        raise CompletionError("GitHub observer recovery needs exact independent review")
+    return {**scope, "environment": current}
 
 
 def inventory(repo):
@@ -930,6 +993,7 @@ def filesystem_scope(scope_ref, scope, state):
 
 def filesystem_view(scope_ref, scope, state):
     """Project reviewed device-only changes; never rewrite the frozen scope."""
+    scope = github_observer_scope(scope_ref, scope, state)
     resources = decode(canonical(state.get("resources", [])))
     if "filesystem_recovery" not in state:
         return scope, resources
@@ -1248,7 +1312,7 @@ def validate_source_targets(checks):
             validate_git_source_target(check["target"])
 
 
-def validate_scope(scope, recovery=None):
+def validate_scope(scope, recovery=None, *, resources=()):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
     text(scope["task_id"]); text(scope["session_id"])
@@ -1312,7 +1376,7 @@ def validate_scope(scope, recovery=None):
         for value in scope[key]:
             path(value)
     path(scope["state_path"])
-    if not isinstance(scope["environment"], dict) or scope["environment"] != environment(scope["environment"].get("workspace")):
+    if not isinstance(scope["environment"], dict) or scope["environment"] != scope_environment(scope, resources):
         raise CompletionError("observer environment changed")
     fields(scope["baseline"], ("repositories", "artifact_roots"))
     if set(scope["baseline"]["repositories"]) != set(scope["repositories"]) or set(scope["baseline"]["artifact_roots"]) != set(scope["artifact_roots"]):
@@ -1392,7 +1456,10 @@ def prepare(seed):
         if check["kind"] in {"git_source", "remote_ref_absent"}:
             target = check["target"]
             target["remote_binding"] = remote_identity(target["repository"], target["remote"])
+    needs_github = github_observation_required(seed["checks"])
     execution = environment(seed.pop("workspace"))
+    if needs_github and not execution["binaries"]["gh"]:
+        raise CompletionError(f"GitHub observer unavailable; set {GITHUB_OBSERVER_ENV} before freezing scope")
     scope = {**seed, "baseline": {
         "repositories": {repo: inventory(repo) for repo in seed["repositories"]},
         "artifact_roots": {root: tree(root) for root in seed["artifact_roots"]}}, "environment": execution}
@@ -1450,7 +1517,7 @@ def _draft_result(scope_ref, expectations=None):
     scope = filesystem_scope(scope_ref, scope, state)
     if "owner_recovery" in state:
         recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state)
-    checks = validate_scope(scope, recovery)
+    checks = validate_scope(scope, recovery, resources=state.get("resources", ()))
     if "source_preservation" in state:
         source_preservation(scope_ref, scope, state["source_preservation"])
     planned = {(ref["original"]["repository"], ref["original"]["file"])
@@ -1749,7 +1816,7 @@ def final_review_fields(scope_ref, scope, state, result_sha, review_path, *, fre
     if "reservation_resolutions" in state:
         reservation_resolutions(scope, state)
         expected["reservation_resolutions_sha256"] = sha(canonical(state["reservation_resolutions"]))
-    for name in ("owner_recovery", "source_preservation", "filesystem_recovery"):
+    for name in ("owner_recovery", "source_preservation", "filesystem_recovery", "github_observer_recovery"):
         if name in state:
             expected[name + "_sha256"] = state[name]["evidence"]["sha256"]
     if "record_root" in scope:
@@ -1782,7 +1849,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     resolved = reservation_resolutions(scope, state)
     protect_bound_records(scope, state, location, resources, observing=True)
     recovery = owner_recovery(scope_ref, scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
-    checks = validate_scope(scope, recovery)
+    checks = validate_scope(scope, recovery, resources=resources)
     preserved = source_preservation(scope_ref, scope, state["source_preservation"]) if "source_preservation" in state else {}
     if workspace is not None and scope["environment"]["workspace"] != str(path(workspace)):
         raise CompletionError("observer workspace differs from host")
@@ -1908,7 +1975,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     if "record_root" in scope and expected_review["record_inventory_sha256"] != checked_record_inventory(scope, state, selected_final["path"]):
         raise CompletionError("task records changed during inspection")
     exception_view(result)
-    if scope["environment"] != environment(scope["environment"]["workspace"]):
+    if scope["environment"] != scope_environment(scope, resources):
         raise CompletionError("observer environment changed during inspection")
     if control_bytes(result_path) != result_raw or raw_file(location) != state_raw:
         raise CompletionError("completion input or accumulated resources changed during inspection")
