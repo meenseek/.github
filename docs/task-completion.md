@@ -633,6 +633,17 @@ python3 scripts/completion_hook.py adopt --session NEW_SESSION --from-session OL
 최신 SHA로 같은 인수를 재시도한다. 이동 뒤에는 새 session만 상태를 바꿀 수 있다.
 등록된 queue 실행은 해당 실행 소유자의 claim·복구 경계를 따르며 직접 adopt로 우회하지 않는다.
 
+GitHub 관측기 부재로 대기 중인 작업은 `CODEX_COMPLETION_GH`가 가리키는 관측기가 준비되면
+Stop에서 같은 업무에 연결된 턴을 한 번 이어갈 수 있다. 턴 연결을 확인할 수 없으면 재개 방법을 안내한다.
+현재 pointer SHA와 승인 근거를 사용해
+`completion_hook.py recover-github-observer --session SESSION --expected-sha256 POINTER_SHA`
+에 `--evidence/--evidence-sha256`와 `--review/--review-sha256`를 함께 전달한다.
+근거에는 `scope_sha256`, `task_id`, `request_digest`, `previous_state_sha256`, 승인 파일 참조
+`authorization`, 실행 파일의 path/SHA인 `observer`가 필요하다. 독립 리뷰는
+`{scope_sha256, github_observer_recovery_sha256, status: "No Findings"}`를 결속한다.
+이 전이는 이전 scope와 대기 근거를 보존하며 검토된 실행 파일 변경만 적용한다.
+재개한 작업의 최종 리뷰에도 `github_observer_recovery_sha256`를 포함한다.
+
 임시 기록 폴더가 없어도 저장된 과거 입력은 검증할 수 있다. 남은 폴더가 있으면 기존
 경로·device/inode와 검토된 manifest를 대조한다. 최종 입력 게시 뒤 사라진 파일은 없어도 되지만,
 새 파일·변조·교체된 폴더는 삭제하지 않는다. 저장된 기대값과 실제 남은 파일을 나눠 검사하고
@@ -646,6 +657,11 @@ binding은 원래 파일이 필요하며, 없는 바이트를 발명하거나 �
 기존 파일 SHA를 재대조하여 원자적으로 설치한다. 호스트가 지원하는 `/hooks` 검토·신뢰
 절차를 거쳐 실제 `hooks/list`에서 enabled/trusted·명령·currentHash를 확인한다.
 파일 존재만으로 실행을 완료했다고 보고하지 않는다. 기존 observatory handler를 덮어쓰지 않는다.
+
+GitHub 관측이 있는 scope를 고정하기 전에 호스트에서 `CODEX_COMPLETION_GH`를 실제 `gh`
+실행 파일의 절대 경로로 지정할 수 있다. 미지정 시 제한된 관측 PATH에서 찾는다.
+`configure`에도 같은 변수를 주면 검토할 hook 명령에 경로가 포함된다. scope는 정규화한 실행
+경로와 파일 SHA를 고정하고, GitHub 확인이 필요한데 실행 파일을 찾지 못하면 고정을 중단한다.
 
 추가 LLM·모델 API 호출, Jev 의존성, 상주 polling은 없다. 원격 상태 확인은 필요한
 GitHub API 읽기와 HTTP GET을 수행한다. 검사 지연은 실제 대상·환경·원격 호출에

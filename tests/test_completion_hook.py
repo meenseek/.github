@@ -2,6 +2,7 @@ import importlib.util
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -1322,6 +1323,67 @@ class HookTests(unittest.TestCase):
                   "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=False)
         self.call("outcome", "--status", "working", *self.basis())
         self.assertTrue(self.call("inspect")["complete"])
+
+    def test_gh_override_leaves_local_scope_intact_and_only_offers_one_continuation(self):
+        self.arm_bind(finalize=False)
+        scope = h.c.read_control(self.f.scope_ref)
+        repo = scope["repositories"][0]
+        h.c.git(repo, "remote", "add", "github", "https://github.com/fixture/testing.git")
+        self.call("reserve", "--id", "remote-branch", *self.basis())
+        resource = self.f.root / "remote-branch.json"
+        self.f.write(resource, {"kind": "remote_ref_absent", "target": {
+            "repository": repo, "remote": "github", "ref": "refs/heads/temporary"}})
+        self.call("attach", "--id", "remote-branch", "--resource", str(resource), *self.basis())
+        basis = self.f.root / "observer-blocker.json"
+        self.f.write(basis, {"reason": {"complete": False, "error": "GitHub observer unavailable"},
+                             "task_id": scope["task_id"], "request_digest": scope["request_digest"],
+                             "scope_sha256": self.f.scope_ref["sha256"]})
+        self.call("outcome", "--status", "waiting", "--basis", str(basis),
+                  "--basis-sha256", self.f.ref(basis)["sha256"])
+        before = self.state.read_bytes()
+        gh = self.f.root / "gh"
+        gh.write_text("#!/bin/sh\nexit 1\n")
+        gh.chmod(0o700)
+        with mock.patch.dict(os.environ, {h.c.GITHUB_OBSERVER_ENV: str(gh)}):
+            self.assertEqual(h.c.scope_environment(scope), scope["environment"])
+            answer = h._hook(self.payload, self.root)
+            self.assertIn("recover-github-observer", answer["systemMessage"])
+            self.assertNotIn("decision", answer)
+            with mock.patch.object(h, "same_work_turn", return_value=True):
+                self.assertEqual(h._hook(self.payload, self.root)["decision"], "block")
+                self.assertNotIn("decision", h._hook({**self.payload, "stop_hook_active": True}, self.root))
+            evidence = self.f.root / "gh-recovery.json"
+            review = self.f.root / "gh-review.json"
+            self.f.write(evidence, {"scope_sha256": self.f.scope_ref["sha256"], "task_id": scope["task_id"],
+                                    "request_digest": scope["request_digest"], "previous_state_sha256": h.c.sha(before),
+                                    "authorization": self.f.ref(basis), "observer": self.f.ref(gh)})
+            self.f.write(review, {"scope_sha256": self.f.scope_ref["sha256"],
+                                  "github_observer_recovery_sha256": self.f.ref(evidence)["sha256"],
+                                  "status": "No Findings"})
+            args = ("--evidence", str(evidence), "--evidence-sha256", self.f.ref(evidence)["sha256"],
+                    "--review", str(review), "--review-sha256", self.f.ref(review)["sha256"])
+            self.assertEqual(self.state.read_bytes(), before)
+            gh.write_text("#!/bin/sh\nexit 2\n")
+            self.call("recover-github-observer", *args, ok=False)
+            self.assertEqual(self.state.read_bytes(), before)
+            gh.write_text("#!/bin/sh\nexit 1\n")
+            self.call("recover-github-observer", *args)
+            state, _ = h.load_state(self.state)
+            self.assertEqual(state["outcome"], "waiting")
+            self.assertEqual(h.c.filesystem_scope(self.f.scope_ref, scope, state)["environment"]["binaries"]["gh"], str(gh))
+            self.assertEqual(h.c.read_control(self.f.scope_ref), scope)
+
+    def test_configuration_rotates_owned_observer_path(self):
+        paths = [self.f.root / prefix / "gh" for prefix in ("old folder", "new folder")]
+        for gh in paths:
+            gh.parent.mkdir()
+            gh.touch(mode=0o700)
+        with mock.patch.dict(os.environ, {h.c.GITHUB_OBSERVER_ENV: str(paths[0])}):
+            original = h.configuration({})
+        with mock.patch.dict(os.environ, {h.c.GITHUB_OBSERVER_ENV: str(paths[1])}):
+            updated = h.configuration(original)
+            self.assertEqual(h.configuration(updated), updated)
+        self.assertIn(str(paths[1]), updated["hooks"]["Stop"][0]["hooks"][0]["command"])
 
     def test_terminal_release_preserves_unfinished_goal_and_allows_session_reuse(self):
         self.arm_bind()

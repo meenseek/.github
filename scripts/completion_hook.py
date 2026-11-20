@@ -300,6 +300,47 @@ def hook(payload, root=ROOT, measurement_root=None):
     return _hook(payload, root, measurement_root)
 
 
+def waiting_observer_recovery(state):
+    """Offer one continuation for the classified, now actionable blocker."""
+    if (c.GITHUB_OBSERVER_ENV not in os.environ or state["outcome"] != "waiting" or
+            not state.get("scope") or "github_observer_recovery" in state):
+        return False
+    try:
+        basis = c.read_control(state["status_basis"])
+        scope = c.read_control(state["scope"])
+        if not isinstance(basis, dict) or (basis.get("task_id"), basis.get("request_digest")) != (
+                state["task_id"], scope["request_digest"]):
+            return False
+        history = c.scope_history(state["scope"], state)
+        if basis.get("scope_sha256") not in {state["scope"]["sha256"], *(step["scope"]["sha256"] for step in history)}:
+            return False
+        failure = basis.get("reason", basis.get("completion_tool_response"))
+        if failure != {"complete": False, "error": "GitHub observer unavailable"}:
+            return False
+        if not c.github_observation_required([*scope["checks"], *state.get("resources", [])]):
+            return False
+        c.github_observer_environment(scope["environment"])
+    except (c.CompletionError, OSError, ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+def same_work_turn(payload, task, measurement_root):
+    turn = payload.get("turn_id")
+    if not turn:
+        return False
+    try:
+        measured = measurement_store(measurement_root)
+        if measured:
+            _, store = measured
+            with store.connection() as db:
+                row = db.execute("SELECT work_id FROM turns WHERE session=? AND id=?", (payload["session_id"], turn)).fetchone()
+            return row is not None and row["work_id"] == task
+    except (OSError, ValueError, TypeError, KeyError, ImportError, sqlite3.Error):
+        pass
+    return False
+
+
 def _hook(payload, root=ROOT, measurement_root=None):
     measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
     event = payload.get("hook_event_name")
@@ -334,6 +375,11 @@ def _hook(payload, root=ROOT, measurement_root=None):
             raise c.CompletionError("검사 통과 후 임시 기록 삭제가 미완료입니다. 현재 task/request와 pointer SHA로 " + command + "를 재실행하세요")
         if state["outcome"] in {"waiting", "blocked", "cancelled"}:
             c.control_reference(state.get("status_basis"))
+            if not payload.get("stop_hook_active") and waiting_observer_recovery(state):
+                reason = "검토할 GitHub 관측기가 준비됐습니다. 같은 작업에 recover-github-observer를 적용하고 남은 정리를 확인하세요."
+                if same_work_turn(payload, state["task_id"], measurement_root):
+                    return {"decision": "block", "reason": reason}
+                return {"systemMessage": reason}
             return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 작업 종료 조건이 남은 상태입니다. 파일 손상 여부를 이 상태만으로 판단하지 마세요. 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
         if state["outcome"] != "working" or state["scope"] is None:
             raise c.CompletionError("armed task has no frozen reviewed scope")
@@ -357,13 +403,26 @@ def configuration(original):
     result = c.decode(c.canonical(original))
     events = result.setdefault("hooks", {})
     command = shlex.quote(str(Path(sys.executable).resolve())) + " -I " + shlex.quote(str(Path(__file__).resolve())) + " hook"
+    observer = c.github_observer() if c.GITHUB_OBSERVER_ENV in os.environ else None
     for event in ("SessionStart", "UserPromptSubmit", "Stop"):
-        group = {"hooks": [{"type": "command", "command": command, "timeout": 35}]}
+        legacy = {"hooks": [{"type": "command", "command": command, "timeout": 35}]}
+        group = ({"hooks": [{"type": "command", "command": f"{c.GITHUB_OBSERVER_ENV}={shlex.quote(observer)} {command}",
+                             "timeout": 35}]} if observer else legacy)
         groups = events.setdefault(event, [])
         if not isinstance(groups, list): raise c.CompletionError("invalid hook groups")
         existing = [g for g in groups if any("completion_hook.py" in h.get("command", "") for h in g.get("hooks", []))]
-        if existing and existing != [group]: raise c.CompletionError("changed completion hook requires explicit review")
-        if not existing: groups.append(group)
+        if not existing:
+            groups.append(group)
+        elif existing != [group]:
+            entry = existing[0]
+            old_command = entry["hooks"][0].get("command", "")
+            parts = shlex.split(old_command)
+            owned_prefix = (parts and parts[0].startswith(c.GITHUB_OBSERVER_ENV + "=/") and
+                            parts[1:] == shlex.split(command) and
+                            entry == {"hooks": [{"type": "command", "command": old_command, "timeout": 35}]})
+            if len(existing) != 1 or (entry != legacy and not owned_prefix):
+                raise c.CompletionError("changed completion hook requires explicit review")
+            groups[groups.index(entry)] = group
     return result
 
 
@@ -405,7 +464,7 @@ def adopt_session(filename, state, before, args):
 def extend_scope(state, before, filename, args):
     if state["scope"] is None or state["outcome"] != "waiting":
         raise c.CompletionError("scope extension requires the existing waiting binding")
-    if any(name in state for name in ("source_preservation", "filesystem_recovery")):
+    if any(name in state for name in ("source_preservation", "filesystem_recovery", "github_observer_recovery")):
         raise c.CompletionError("resolve the existing recovery boundary before extending scope")
     if "cleanup" in state or "record_manifest" in state:
         raise c.CompletionError("reviewed record cleanup must finish before extending scope")
@@ -418,7 +477,7 @@ def extend_scope(state, before, filename, args):
     recovery = (c.owner_recovery(state["scope"], old_scope, state["owner_recovery"], state=state)
                 if "owner_recovery" in state else None)
     c.validate_source_targets(new_scope["checks"])
-    c.validate_scope(new_scope, recovery)
+    c.validate_scope(new_scope, recovery, resources=state["resources"])
     normal = c.control_reference({"path": args.review, "sha256": args.review_sha256})
     if c.read_control(normal) != c.scope_review_value(new_ref, state.get("owner_recovery")):
         raise c.CompletionError("scope review does not cover the extended scope")
@@ -618,7 +677,7 @@ def main(argv=None):
     subs.add_parser("hook")
     config = subs.add_parser("configure")
     config.add_argument("--existing", required=True); config.add_argument("--output", required=True)
-    for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "repair-process-record", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "adopt"):
+    for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "repair-process-record", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "recover-github-observer", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
         if name == "arm": item.add_argument("--task-id", required=True)
@@ -644,7 +703,7 @@ def main(argv=None):
             item.add_argument("--result"); item.add_argument("--review"); item.add_argument("--review-sha256")
             item.add_argument("--inputs", choices=("-",), help="read {result,review} JSON from stdin without staging files")
         if name == "repair-process-record": item.add_argument("--id", required=True)
-        if name in {"recover-owner", "preserve-source", "recover-filesystem", "resolve-reservation", "repair-process-record"}:
+        if name in {"recover-owner", "preserve-source", "recover-filesystem", "recover-github-observer", "resolve-reservation", "repair-process-record"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
             item.add_argument("--review", required=True); item.add_argument("--review-sha256", required=True)
         if name == "recover-filesystem":
@@ -732,6 +791,22 @@ def main(argv=None):
                                     target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                                 protect_records(state, filename, [resource])
                                 found[0].update(resource, basis=basis)
+                        elif args.command == "recover-github-observer":
+                            if (state["outcome"] != "waiting" or state["scope"] is None or
+                                    "github_observer_recovery" in state or "record_manifest" in state):
+                                raise c.CompletionError("GitHub observer recovery requires a waiting task without prior recovery or cleanup")
+                            if not waiting_observer_recovery(state):
+                                raise c.CompletionError("waiting task has no actionable GitHub observer recovery")
+                            binding = {"evidence": {"path": args.evidence, "sha256": args.evidence_sha256},
+                                       "review": {"path": args.review, "sha256": args.review_sha256}}
+                            if c.read_control(binding["evidence"])["previous_state_sha256"] != before:
+                                raise c.CompletionError("GitHub observer recovery is not for the exact previous pointer")
+                            proposed = {**state, "github_observer_recovery": binding}
+                            scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), proposed)
+                            c.validate_state_identity(scope, state, filename)
+                            recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=proposed) if "owner_recovery" in state else None
+                            c.validate_scope(scope, recovery, resources=state["resources"])
+                            state["github_observer_recovery"] = binding
                         elif args.command == "recover-filesystem":
                             if state["outcome"] != "waiting" or state["scope"] is None or "filesystem_recovery" in state:
                                 raise c.CompletionError("filesystem recovery requires a waiting task without prior filesystem recovery")
@@ -752,7 +827,7 @@ def main(argv=None):
                                 proposed["owner_recovery"] = companion
                             scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), proposed)
                             recovery = c.owner_recovery(state["scope"], scope, proposed["owner_recovery"], state=proposed) if "owner_recovery" in proposed else None
-                            c.validate_scope(scope, recovery)
+                            c.validate_scope(scope, recovery, resources=state["resources"])
                             state["filesystem_recovery"] = binding
                             if args.owner_recovery:
                                 state["owner_recovery"] = companion
@@ -769,7 +844,7 @@ def main(argv=None):
                             scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), proposed)
                             c.validate_state_identity(scope, state, filename)
                             recovery = c.owner_recovery(state["scope"], scope, binding, state=proposed)
-                            c.validate_scope(scope, recovery)
+                            c.validate_scope(scope, recovery, resources=state["resources"])
                             state["owner_recovery"] = binding
                         elif args.command == "preserve-source":
                             if state["outcome"] != "waiting" or state["scope"] is None or "source_preservation" in state:
@@ -782,7 +857,7 @@ def main(argv=None):
                             if c.read_control(binding["evidence"])["previous_state_sha256"] != before:
                                 raise c.CompletionError("source preservation is not for the exact previous pointer")
                             recovery = c.owner_recovery(state["scope"], scope, state["owner_recovery"], state=state) if "owner_recovery" in state else None
-                            c.validate_scope(scope, recovery)
+                            c.validate_scope(scope, recovery, resources=state["resources"])
                             c.source_preservation(state["scope"], scope, binding)
                             state["source_preservation"] = binding
                         elif args.command in {"finalize", "complete"}:
