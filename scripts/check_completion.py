@@ -11,7 +11,7 @@ import base64
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from types import SimpleNamespace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -24,6 +24,7 @@ import stat
 import ssl
 import subprocess
 import sys
+from threading import Lock
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -503,7 +504,33 @@ def remote_identity(repo, remote):
     raise CompletionError("unsupported remote: only canonical local Git or GitHub HTTPS/SSH identity is observed")
 
 
-def remote_ref(repo, remote, ref, binding):
+def github_ref_read(executable, endpoint):
+    return decode(run([executable, "api", "--hostname", "github.com", "--method", "GET", endpoint]))
+
+
+def github_read_batch():
+    """Reuse one exact GitHub request, including its failure, within a single phase."""
+    pending = {}
+    lock = Lock()
+
+    def read(executable, endpoint):
+        key = (executable, endpoint)
+        with lock:
+            result = pending.get(key)
+            first = result is None
+            if first:
+                result = pending[key] = Future()
+        if first:
+            try:
+                result.set_result(github_ref_read(executable, endpoint))
+            except BaseException as error:
+                result.set_exception(error)
+        return result.result()
+
+    return read
+
+
+def remote_ref(repo, remote, ref, binding, *, github_reader=github_ref_read):
     if remote_identity(repo, remote) != binding:
         raise CompletionError("approved repository or remote identity changed")
     if not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*", text(ref)) or ".." in ref:
@@ -516,7 +543,7 @@ def remote_ref(repo, remote, ref, binding):
     if not executable:
         raise CompletionError("GitHub observer unavailable")
     endpoint = "repos/" + binding["repository"] + "/git/matching-refs/heads/" + ref[len("refs/heads/"):]
-    values = decode(run([executable, "api", "--hostname", "github.com", "--method", "GET", endpoint]))
+    values = github_reader(executable, endpoint)
     if not isinstance(values, list):
         raise CompletionError("GitHub ref observation malformed")
     return next((item["object"]["sha"] for item in values if item.get("ref") == ref), None)
@@ -1528,6 +1555,8 @@ def _draft_result(scope_ref, expectations=None):
     for expected in expectations.values():
         http_expectation(expected)
 
+    github_reader = github_read_batch()
+
     def collect(item):
         key, check = item
         kind, target = check["kind"], check["target"]
@@ -1549,7 +1578,8 @@ def _draft_result(scope_ref, expectations=None):
             validate_source_targets([check])
             repo = target["repository"]
             local = git(repo, "rev-parse", "refs/heads/" + text(target["main"])).decode().strip()
-            remote = remote_ref(repo, target["remote"], "refs/heads/" + target["main"], target["remote_binding"])
+            remote = remote_ref(repo, target["remote"], "refs/heads/" + target["main"], target["remote_binding"],
+                                github_reader=github_reader)
             if remote is None:
                 raise CompletionError("remote main could not be observed")
             files = {}
@@ -1581,7 +1611,7 @@ def _draft_result(scope_ref, expectations=None):
     return result
 
 
-def observe(check, expected, *, preserved=None, owners=(), recovery=None):
+def observe(check, expected, *, preserved=None, owners=(), recovery=None, github_reader=github_ref_read):
     kind, target = check["kind"], check["target"]
     if kind == "improvement":
         fields(target, ("path", "plan")); fields(expected, ("sha256",))
@@ -1692,7 +1722,7 @@ def observe(check, expected, *, preserved=None, owners=(), recovery=None):
                     raise CompletionError("retained foreign checkout must name the current non-main branch at reviewed main")
 
         checkout()
-        remote_oid = remote_ref(repo, remote, "refs/heads/" + main, target["remote_binding"])
+        remote_oid = remote_ref(repo, remote, "refs/heads/" + main, target["remote_binding"], github_reader=github_reader)
         if remote_oid is None:
             raise CompletionError("remote main could not be observed")
         if (local, remote_oid) != (expected["local_revision"], expected["remote_revision"]):
@@ -1892,6 +1922,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     if reviewed_final != expected_review:
         raise CompletionError("final review does not cover these exact expectations and exceptions")
     failures, observed = [], {}
+    github_reader = github_read_batch()
 
     def inspect(item):
         key, definition, wanted = item
@@ -1899,6 +1930,8 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
             return key, {"unfulfilled": True, "reason": "terminal stop; original goal is not claimed complete"}, None
         try:
             options = {"owners": scope["owners"], "recovery": recovery} if definition["kind"] == "improvement" else {}
+            if definition["kind"] == "git_source" and definition["target"]["remote_binding"]["kind"] == "github":
+                options["github_reader"] = github_reader
             if key in preserved:
                 options["preserved"] = preserved[key]
             return key, observe(definition, wanted, **options), None
@@ -1954,6 +1987,7 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
                 unclassified.append("path:" + item)
     # Re-observe source after all other checks: main/remote changes seen inside
     # this inspection are never hidden by the expected main inventory exception.
+    github_reader = github_read_batch()
     for key, definition in checks.items():
         if (definition["kind"] in {"git_source", "improvement"}
                 or definition["kind"] == "evidence" and "assertions" in definition["target"]) and not stopped:

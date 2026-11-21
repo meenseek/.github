@@ -1494,6 +1494,41 @@ class CompletionTests(unittest.TestCase):
             c.inventory(str(self.repo))
         self.assertFalse(marker.exists())
 
+    def test_draft_and_completion_share_github_reads_only_within_each_phase(self):
+        self.git("remote", "set-url", "origin", "https://github.com/fixture/completion.git")
+        self.seed["checks"].append({**copy.deepcopy(self.seed["checks"][0]), "id": "additional-source"})
+        self.reset_categories()
+        revision = self.git("rev-parse", "main")
+        original_run = c.run
+        requests = []
+        drift = False
+
+        def run(argv, *args, **kwargs):
+            if argv[:2] != [sys.executable, "api"]:
+                return original_run(argv, *args, **kwargs)
+            requests.append(argv[-1])
+            remote = "f" * 40 if drift and len(requests) == 2 else revision
+            return c.canonical([{"ref": "refs/heads/main", "object": {"sha": remote}}])
+
+        endpoint = "repos/fixture/completion/git/matching-refs/heads/main"
+        with mock.patch.object(c, "github_observer", return_value=sys.executable), mock.patch.object(c, "run", side_effect=run):
+            self.freeze()
+            self.result = c.draft_result(self.scope_ref)
+            self.assertEqual(requests, [endpoint])
+            self.write(self.result_path, self.result)
+            self.final_review()
+            requests.clear()
+            self.assertTrue(self.inspect()["complete"])
+            self.assertEqual(requests, [endpoint, endpoint])
+
+            requests.clear()
+            drift = True
+            answer = self.inspect()
+            self.assertEqual(requests, [endpoint, endpoint])
+            self.assertFalse(answer["complete"])
+            self.assertEqual({failure["id"] for failure in answer["failures"]}, {"source", "additional-source"})
+            self.assertTrue(all("final source observation" in failure["reason"] for failure in answer["failures"]))
+
     def test_final_source_observation_rejects_drift(self):
         original = c.observe
         changed = False
