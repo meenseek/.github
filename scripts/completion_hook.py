@@ -35,11 +35,13 @@ def pointer(root, session):
     return c.path(str(root)) / (session + ".json")
 
 
-def protect_records(state, filename, resources, *, observing=False):
+def protect_records(state, filename, resources, *, observing=False, admitting_resources=False):
     scope = None
     if state.get("scope"):
         scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), state)
     c.protect_bound_records(scope, state, filename, resources, observing=observing)
+    if scope is not None and admitting_resources:
+        c.protect_retained_files(scope["checks"], resources)
 
 
 def measurement_store(explicit_root=None):
@@ -478,6 +480,9 @@ def extend_scope(state, before, filename, args):
                 if "owner_recovery" in state else None)
     c.validate_source_targets(new_scope["checks"])
     c.validate_scope(new_scope, recovery, resources=state["resources"])
+    added_checks = new_scope["checks"][len(old_scope["checks"]):]
+    c.protect_retained_files(new_scope["checks"], added_checks)
+    c.protect_retained_files(added_checks, [*old_scope["checks"], *state["resources"]])
     normal = c.control_reference({"path": args.review, "sha256": args.review_sha256})
     if c.read_control(normal) != c.scope_review_value(new_ref, state.get("owner_recovery")):
         raise c.CompletionError("scope review does not cover the extended scope")
@@ -607,7 +612,7 @@ def publication_admissions(state, accepted, *, final):
             raise c.CompletionError("initial scope and review must be paired")
         if state["scope"] is not None:
             c.fields(state["scope"], ("path", "sha256")); c.fields(state["review"], ("path", "sha256"))
-            c.validate_source_targets(c.read_control(state["scope"])["checks"])
+            c.validate_admission_targets(c.read_control(state["scope"])["checks"])
         return state["resources"]
     # Resource updates and reviewed final inputs are the only generic transitions.
     # bind/outcome/adopt/recover and cleanup retain their dedicated owner boundaries.
@@ -660,13 +665,13 @@ def publish(filename, state, before, *, final=False):
         raise c.CompletionError("pointer disappeared")
     admitted = publication_admissions(state, accepted, final=final)
     with c.stored_controls(state, filename):
-        protect_records(state, filename, admitted, observing=final)
+        protect_records(state, filename, admitted, observing=final, admitting_resources=not final)
     c.capture_controls(state, final=final, location=filename, observing=final)
     previous_rows = accepted.get("control_records", []) if accepted else []
     if c.canonical(state.get("control_records", [])[:len(previous_rows)]) != c.canonical(previous_rows):
         raise c.CompletionError("capture changed the accepted control prefix")
     with c.stored_controls(state, filename):
-        protect_records(state, filename, admitted, observing=final)
+        protect_records(state, filename, admitted, observing=final, admitting_resources=not final)
     return replace(filename, state, before)
 
 
@@ -755,7 +760,7 @@ def main(argv=None):
                             scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
                             review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
                             scope = c.read_control(scope_ref)
-                            c.validate_source_targets(scope["checks"])
+                            c.validate_admission_targets(scope["checks"], state["resources"])
                             c.validate_scope(scope)
                             c.validate_state_identity(scope, state, filename)
                             if c.read_control(review_ref) != {"scope_sha256": args.scope_sha256, "status": "No Findings"}:
@@ -789,7 +794,7 @@ def main(argv=None):
                                 if resource["kind"] == "remote_ref_absent":
                                     target = resource["target"]
                                     target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
-                                protect_records(state, filename, [resource])
+                                protect_records(state, filename, [resource], admitting_resources=True)
                                 found[0].update(resource, basis=basis)
                         elif args.command == "recover-github-observer":
                             if (state["outcome"] != "waiting" or state["scope"] is None or
