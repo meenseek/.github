@@ -1451,6 +1451,36 @@ class HookTests(unittest.TestCase):
         self.call("outcome", "--status", "working", *self.basis())
         self.assertTrue(self.call("inspect")["complete"])
 
+    def test_ready_waiting_scope_gets_one_same_task_continuation_without_closing(self):
+        self.record_fixture()
+        self.arm_bind()
+        self.call("outcome", "--status", "waiting", *self.basis())
+        before = self.state.read_bytes()
+        self.assertNotIn("decision", h.hook(self.payload, self.root))
+        with mock.patch.object(h, "same_work_turn", return_value=True):
+            answer = h.hook(self.payload, self.root)
+            self.assertEqual(answer["decision"], "block")
+            self.assertIn("outcome working", answer["reason"])
+            self.assertIn("complete", answer["reason"])
+            self.assertNotIn("decision", h.hook({**self.payload, "stop_hook_active": True}, self.root))
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue(self.records.exists())
+        self.call("inspect", ok=False)
+        self.call("outcome", "--status", "working", *self.basis())
+        self.assertTrue(self.call("complete")["binding_released"])
+        self.assertFalse(self.records.exists())
+
+    def test_waiting_scope_with_unresolved_resource_does_not_continue(self):
+        self.arm_bind()
+        self.call("reserve", "--id", "still-owned", *self.basis())
+        self.call("outcome", "--status", "waiting", *self.basis())
+        before = self.state.read_bytes()
+        with mock.patch.object(h, "same_work_turn", return_value=True):
+            answer = h.hook(self.payload, self.root)
+        self.assertIn("waiting", answer["systemMessage"])
+        self.assertNotIn("decision", answer)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_gh_override_leaves_local_scope_intact_and_only_offers_one_continuation(self):
         self.arm_bind(finalize=False)
         scope = h.c.read_control(self.f.scope_ref)

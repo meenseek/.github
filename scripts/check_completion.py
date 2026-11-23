@@ -1882,7 +1882,8 @@ def check_scope(scope_ref, result_path, *, state_path=None, **options):
     return _check_scope(scope_ref, result_path, **options)
 
 
-def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None, workspace=None, stopped=False, report=False):
+def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, review_ref=None, final_review_ref=None,
+                 workspace=None, stopped=False, report=False, waiting_probe=False):
     started = time.monotonic()
     scope = read_control(scope_ref)
     location = state_location(scope)
@@ -1922,7 +1923,10 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
                    for filename, wanted in expected["files"].items()):
                 raise CompletionError("source deletion was not declared as a planned owner edit")
     current_owners(scope["owners"], result.get("owner_updates", {}), recovery)
-    if stopped:
+    if waiting_probe:
+        if stopped or state["outcome"] != "waiting":
+            raise CompletionError("read-only readiness probe requires a waiting task")
+    elif stopped:
         if state["outcome"] not in {"blocked", "cancelled"}:
             raise CompletionError("terminal release requires blocked/cancelled, not waiting/completed")
         reference(state.get("status_basis"))
@@ -2032,7 +2036,8 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
     if control_bytes(result_path) != result_raw or raw_file(location) != state_raw:
         raise CompletionError("completion input or accumulated resources changed during inspection")
     if stopped: reference(state["status_basis"])
-    answer = {"complete": not failures and not stopped, "stopped": stopped and not failures, "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
+    answer = {"complete": not failures and not stopped and not waiting_probe, "stopped": stopped and not failures,
+            "task_id": scope["task_id"], "scope_sha256": scope_ref["sha256"],
             "checked_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
             "observed": observed, "failures": failures, "exceptions": result["exceptions"],
             "resource_state": {"path": location, "sha256": sha(state_raw)},
