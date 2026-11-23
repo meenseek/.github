@@ -1151,7 +1151,7 @@ def checked_record_inventory(scope, state, final_review):
     return reviewed_record_inventory(record, final_review, inventory=reviewed)
 
 
-def protect_completion_records(check, protected):
+def protect_completion_records(check, protected, *, label="active completion records"):
     """Absence checks must not require removal of their own verification inputs."""
     if check["kind"] not in {"absent", "worktree_absent"}:
         return
@@ -1164,7 +1164,20 @@ def protect_completion_records(check, protected):
             raise CompletionError("cleanup target has invalid symlink resolution") from exc
         for candidate, protected_path in ((target, record), resolved):
             if candidate.is_relative_to(protected_path) or protected_path.is_relative_to(candidate):
-                raise CompletionError("cleanup target overlaps active completion records")
+                raise CompletionError(f"cleanup target overlaps {label}")
+
+
+def protect_retained_files(checks, cleanup_checks):
+    """Keep new cleanup obligations from covering a declared retained file."""
+    retained = []
+    for check in checks:
+        if check["kind"] == "file":
+            target = check["target"]
+            fields(target, ("path",), ("source",))
+            retained.append(str(path(target["path"])))
+    if retained:
+        for check in cleanup_checks:
+            protect_completion_records(check, retained, label="a retained file")
 
 
 def protect_control_records(scope, state, location, resources):
@@ -1339,6 +1352,11 @@ def validate_source_targets(checks):
             validate_git_source_target(check["target"])
 
 
+def validate_admission_targets(checks, resources=()):
+    validate_source_targets(checks)
+    protect_retained_files(checks, [*checks, *resources])
+
+
 def validate_scope(scope, recovery=None, *, resources=()):
     fields(scope, ("task_id", "session_id", "request", "request_digest", "owners", "categories", "checks",
                    "repositories", "artifact_roots", "state_path", "baseline", "environment"), ("record_root",))
@@ -1491,7 +1509,7 @@ def prepare(seed):
         "repositories": {repo: inventory(repo) for repo in seed["repositories"]},
         "artifact_roots": {root: tree(root) for root in seed["artifact_roots"]}}, "environment": execution}
     validate_scope(scope)
-    validate_source_targets(scope["checks"])
+    validate_admission_targets(scope["checks"])
     return scope
 
 

@@ -1034,6 +1034,133 @@ class HookTests(unittest.TestCase):
             self.assertIn("overlaps active completion records", result["error"])
             self.assertEqual(self.state.read_bytes(), before)
 
+    def declare_retained_file(self):
+        retained = self.f.artifacts / "delivery.mp4"
+        retained.write_bytes(b"synthetic retained delivery")
+        self.f.seed["checks"].append({
+            "id": "retained-delivery", "category": "artifacts", "kind": "file",
+            "target": {"path": str(retained)},
+        })
+        self.f.reset_categories()
+        return retained
+
+    def test_prepare_and_initial_publish_reject_cleanup_covering_retained_file(self):
+        retained = self.declare_retained_file()
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        absence = {"id": "remove-delivery", "category": "temporary_resources", "kind": "absent",
+                   "target": {"path": str(retained.parent)}}
+        category = {"checks": [absence["id"]], "not_applicable": None}
+        seed = {**self.f.seed, "checks": [*self.f.seed["checks"], absence],
+                "categories": {**self.f.seed["categories"], "temporary_resources": category}}
+        with self.assertRaisesRegex(h.c.CompletionError, "overlaps a retained file"):
+            h.c.prepare(seed)
+
+        scope = json.loads(self.f.scope_path.read_bytes())
+        scope["checks"].append(absence)
+        scope["categories"]["temporary_resources"] = category
+        self.f.write(self.f.scope_path, scope)
+        scope_ref = self.f.ref(self.f.scope_path)
+        self.f.write(self.f.review_path, {"scope_sha256": scope_ref["sha256"], "status": "No Findings"})
+        proposed = {**self.f.state, "scope": scope_ref, "review": self.f.ref(self.f.review_path),
+                    "result_path": None, "final_review": None}
+        with self.assertRaisesRegex(h.c.CompletionError, "overlaps a retained file"):
+            h.publish(self.state, proposed, None)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(retained.read_bytes(), b"synthetic retained delivery")
+
+    def test_bind_rejects_retained_file_conflicting_with_early_cleanup_resource(self):
+        retained = self.declare_retained_file()
+        self.call("arm", "--task-id", self.f.seed["task_id"])
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        self.call("reserve", "--id", "early", *self.basis())
+        resource = self.f.root / "early-resource.json"
+        self.f.write(resource, {"kind": "absent", "target": {"path": str(retained.parent)}})
+        self.call("attach", "--id", "early", "--resource", str(resource), *self.basis())
+        before = self.state.read_bytes()
+        answer = self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
+                           "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"],
+                           ok=False)
+        self.assertIn("overlaps a retained file", answer["error"])
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue(retained.is_file())
+
+    def test_admission_rejects_a_malformed_retained_file_with_a_structured_error(self):
+        self.declare_retained_file()
+        self.f.seed["checks"][-1]["target"] = {}
+        with self.assertRaises(h.c.CompletionError):
+            h.c.prepare(self.f.seed)
+
+    def test_extend_rejects_both_directions_of_a_retained_file_conflict(self):
+        retained = self.declare_retained_file()
+        self.arm_bind(finalize=False)
+        scratch = self.f.root / "scratch"
+        self.call("reserve", "--id", "old-scratch", *self.basis())
+        resource = self.f.root / "scratch-resource.json"
+        self.f.write(resource, {"kind": "absent", "target": {"path": str(scratch)}})
+        self.call("attach", "--id", "old-scratch", "--resource", str(resource), *self.basis())
+        self.call("outcome", "--status", "waiting", *self.basis())
+        before = self.state.read_bytes()
+        for kind, category, target in (
+            ("absent", "temporary_resources", retained.parent),
+            ("file", "artifacts", scratch / "retained.mp4"),
+        ):
+            scope = json.loads(self.f.scope_path.read_bytes())
+            scope["checks"].append({"id": "followup", "category": category, "kind": kind,
+                                    "target": {"path": str(target)}})
+            scope["categories"][category]["checks"].append("followup")
+            scope["categories"][category]["not_applicable"] = None
+            extended = self.f.root / "extended-scope.json"
+            self.f.write(extended, scope)
+            args = type("Args", (), {"scope": str(extended), "scope_sha256": self.f.ref(extended)["sha256"]})()
+            with self.subTest(kind=kind), self.assertRaisesRegex(h.c.CompletionError, "overlaps a retained file"):
+                h.extend_scope(json.loads(before), h.c.sha(before), self.state, args)
+            self.assertEqual(self.state.read_bytes(), before)
+
+    def test_resource_admission_rejects_retained_ancestor_alias_and_accepts_scratch(self):
+        retained = self.declare_retained_file()
+        alias = self.f.root / "archive-alias"
+        alias.symlink_to(retained.parent, target_is_directory=True)
+        self.arm_bind(finalize=False)
+        self.call("reserve", "--id", "cleanup", *self.basis())
+        before = self.state.read_bytes()
+        resource = self.f.root / "resource.json"
+        unsafe = {"kind": "worktree_absent", "target": {"repository": str(self.f.repo), "path": str(alias)}}
+        self.f.write(resource, unsafe)
+        answer = self.call("attach", "--id", "cleanup", "--resource", str(resource), *self.basis(), ok=False)
+        self.assertIn("overlaps a retained file", answer["error"])
+        self.assertEqual(self.state.read_bytes(), before)
+
+        proposed, digest = h.load_state(self.state)
+        proposed["resources"][0].update(unsafe)
+        with self.assertRaisesRegex(h.c.CompletionError, "overlaps a retained file"):
+            h.publish(self.state, proposed, digest)
+        self.assertEqual(self.state.read_bytes(), before)
+
+        scratch = {"kind": "absent", "target": {"path": str(self.f.root / "scratch")}}
+        self.f.write(resource, scratch)
+        self.call("attach", "--id", "cleanup", "--resource", str(resource), *self.basis())
+        self.assertEqual(json.loads(self.state.read_bytes())["resources"][0]["target"], scratch["target"])
+        self.assertEqual(retained.read_bytes(), b"synthetic retained delivery")
+
+    def test_existing_retention_conflict_still_uses_the_original_absence_observation(self):
+        retained = self.declare_retained_file()
+        self.arm_bind(finalize=False)
+        self.f.result["checks"]["retained-delivery"] = {"sha256": self.f.ref(retained)["sha256"]}
+        self.f.write(self.f.result_path, self.f.result)
+        self.f.write(self.f.final_review_path, {
+            "scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings",
+            "result_sha256": self.f.ref(self.f.result_path)["sha256"],
+        })
+        self.call("finalize", *self.completion_args())
+        legacy = self.legacy_resource(retained.parent)
+        before = self.state.read_bytes()
+        answer = self.call("inspect", ok=False)
+        self.assertIn({"id": "resource:" + legacy["id"], "reason": "owned temporary path remains"}, answer["failures"])
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue(retained.is_file())
+
     def test_worktree_absence_cannot_hide_record_cleanup(self):
         self.record_fixture()
         self.arm_bind(finalize=False)
