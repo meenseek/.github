@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shlex
 import sqlite3
+from subprocess import TimeoutExpired
 import sys
 import tempfile
 
@@ -343,6 +344,15 @@ def same_work_turn(payload, task, measurement_root):
     return False
 
 
+def waiting_ready_to_close(state, filename, cwd):
+    try:
+        answer = c.check_scope(state["scope"], state["result_path"], state_path=str(filename),
+                               task_id=state["task_id"], workspace=str(cwd), waiting_probe=True)
+    except (c.CompletionError, OSError, ValueError, TypeError, KeyError, TimeoutExpired):
+        return False
+    return not answer["failures"]
+
+
 def _hook(payload, root=ROOT, measurement_root=None):
     measured = measurement_event(payload, measurement_root) if measurement_root is not None or root == ROOT else {}
     event = payload.get("hook_event_name")
@@ -382,6 +392,13 @@ def _hook(payload, root=ROOT, measurement_root=None):
                 if same_work_turn(payload, state["task_id"], measurement_root):
                     return {"decision": "block", "reason": reason}
                 return {"systemMessage": reason}
+            if (state["outcome"] == "waiting" and not payload.get("stop_hook_active")
+                    and state.get("scope") and state.get("result_path") and state.get("final_review")
+                    and same_work_turn(payload, state["task_id"], measurement_root)
+                    and waiting_ready_to_close(state, filename, cwd)):
+                return {"decision": "block", "reason": (
+                    "대기 중이던 정리의 기존 검토 결과와 현재 조건이 일치합니다. "
+                    "같은 작업을 outcome working으로 재개하고 work-turn을 포함해 complete로 정리하세요.")}
             return {"systemMessage": "정리 미완료: " + state["outcome"] + ". 작업 종료 조건이 남은 상태입니다. 파일 손상 여부를 이 상태만으로 판단하지 마세요. 남은 범위·이유는 상태 근거에 보존되어 있습니다. 완료로 보고하지 마세요."}
         if state["outcome"] != "working" or state["scope"] is None:
             raise c.CompletionError("armed task has no frozen reviewed scope")
