@@ -581,6 +581,12 @@ owner 근거로 포함한다. HTTP GET은 redirect, 누락 revision/health, 오�
 보장하지 않는다. 큐는 검사 중 DB lock을 놓고 이후 token·attempt·revision·cancel·route·
 시간 및 resource state를 다시 확인한 뒤 완료를 CAS한다.
 
+LLM 작업 관측을 설치한 호스트에서 이번 작업이 설치에 포함된 공통 완료 스크립트를 바꾸면,
+정리 완료와 대기 상태의 재개 확인에서 실제 사용 checkout의 소스와 검토된 설치를 대조한다.
+오래된 설치에는 [operations의 검토·갱신 절차](../../operations/docs/work-observation.md#설치와-확인)를
+적용하고 같은 완료 검사를 다시 실행한다. 설치 대상과 무관한 작업과 취소·중단 해제는
+이 검사 때문에 대기하지 않는다. 검사 자체는 설치, 워커 활성화 또는 실험 실행을 하지 않는다.
+
 `file` 산출물과 산출물·임시 기록 inventory의 SHA는 파일을 나눠 읽어 계산하며 용량
 상한을 두지 않는다. 제어 JSON의 입력 한도를 PDF 등 산출물의 제출 조건으로 적용하지
 않는다. 일반 파일·symlink·hardlink·정확한 bytes/identity 검사는 유지한다. `installed_file`은
