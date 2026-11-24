@@ -55,6 +55,81 @@ class CompletionTests(unittest.TestCase):
         self.result = c.draft_result(self.scope_ref)
         self.write(self.result_path, self.result); self.final_review()
 
+    def test_published_installation_source_needs_current_review_before_completion(self):
+        operations = self.root / "operations"
+        marker = operations / ".state/llm-work/enabled.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("stale")
+        observer = operations / "llm_work.py"
+        observer.write_text(
+            "from pathlib import Path\n"
+            "DEFAULT_ROOT = Path(__file__).parent / '.state/llm-work'\n"
+            "class WorkStore:\n"
+            "    def __init__(self, root, *, read_only):\n"
+            "        assert read_only\n"
+            "def verify_execution_installation(store):\n"
+            "    if (DEFAULT_ROOT / 'enabled.json').read_text() != 'current':\n"
+            "        raise ValueError('Review and install the current sources')\n"
+        )
+        filename = "scripts/completion_hook.py"
+        source = self.repo / filename
+        source.parent.mkdir()
+        source.write_text("# initial installed hook\n")
+        self.git("add", filename)
+        self.git("commit", "-m", "test: add installed hook")
+        self.git("push", "origin", "main")
+        self.seed["checks"][0]["target"]["files"].append("./" + filename)
+        self.freeze()
+        source.write_text("# reviewed hook update\n")
+        self.git("commit", "-am", "test: publish hook update")
+        self.git("push", "origin", "main")
+        self.result = c.draft_result(self.scope_ref)
+        self.write(self.result_path, self.result)
+        self.final_review()
+        with mock.patch.object(c, "__file__", str(self.repo / "scripts/check_completion.py")):
+            stale = self.inspect()
+            self.assertFalse(stale["complete"])
+            self.assertEqual(stale["failures"], [{"id": "installation:llm-work",
+                                                  "reason": "Review and install the current sources"}])
+
+            marker.write_text("current")
+            current = self.inspect()
+            self.assertTrue(current["complete"], current)
+            self.assertEqual(current["observed"]["installation:llm-work"]["affected_sources"],
+                             [str(source)])
+
+            marker.write_text("stale")
+            observer.write_text("raise AssertionError('Unrelated work loaded the observation installer')\n")
+            self.freeze()
+            self.advance_scoped_main()
+            unaffected = self.inspect()
+            self.assertTrue(unaffected["complete"], unaffected)
+            self.assertNotIn("installation:llm-work", unaffected["observed"])
+
+    def test_worktree_publication_cannot_leave_older_canonical_installation_sources(self):
+        marker = self.root / "operations/.state/llm-work/enabled.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("installation marker")
+        filename = "scripts/check_improvement.py"
+        source = self.repo / filename
+        source.parent.mkdir()
+        source.write_text("# canonical source remains at its original revision\n")
+        self.git("add", filename)
+        self.git("commit", "-m", "test: register canonical source")
+        before = self.git("rev-parse", "HEAD")
+        checkout = self.root / "linked"
+        self.git("worktree", "add", "-b", "reviewed", str(checkout))
+        (checkout / filename).write_text("# reviewed source in linked checkout\n")
+        self.git("-C", str(checkout), "commit", "-am", "test: update from linked checkout")
+        after = self.git("rev-parse", "reviewed")
+        checks = {"source":{"kind":"git_source","target":{
+            "repository":str(checkout),"main":"reviewed","files":[filename]}}}
+        expectations = {"source":{"local_revision":after,"files":{filename:self.ref(checkout / filename)["sha256"]}}}
+        baseline = {str(checkout):{"identity":c.repo_identity(str(checkout)),"refs":{"refs/heads/reviewed":before}}}
+        with mock.patch.object(c, "__file__", str(self.repo / "scripts/check_completion.py")):
+            with self.assertRaisesRegex(c.CompletionError, "Integrate the reviewed completion sources"):
+                c.observe_installation_update(checks, expectations, baseline, {})
+
     def test_existing_canonical_symbolic_head_follows_reviewed_main_without_exception(self):
         self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
         self.freeze()

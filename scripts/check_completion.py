@@ -58,6 +58,69 @@ def improvement_observer():
     return module
 
 
+def observe_installation_update(checks, expectations, repositories, preserved):
+    """Recheck observation installation when this task changed its completion scripts."""
+    completion = Path(__file__).resolve().parents[1]
+    operations = completion.parent / "operations"
+    if not (operations / ".state/llm-work/enabled.json").is_file():
+        return None
+
+    sources = {"scripts/check_completion.py", "scripts/completion_hook.py", "scripts/check_improvement.py"}
+    affected = {}
+    for key, check in checks.items():
+        if check["kind"] != "git_source":
+            continue
+        target = check["target"]
+        scoped_paths = {str(Path(filename)): filename for filename in target["files"]}
+        files = sources.intersection(scoped_paths)
+        if not files:
+            continue
+        repo = target["repository"]
+        baseline = repositories.get(repo, {})
+        checkout = path(repo).resolve()
+        common = baseline.get("identity", {}).get("common_dir")
+        if checkout != completion and common != repo_identity(str(completion))["common_dir"]:
+            continue
+        before = baseline.get("refs", {}).get("refs/heads/" + target["main"])
+        expected = expectations[key]
+        after = expected["local_revision"]
+        if before == after:
+            continue
+        if not isinstance(before, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before):
+            raise CompletionError("LLM work installation check needs the captured source baseline")
+        raw = git(repo, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv",
+                  "--no-renames", "--name-only", "-z", before, after, "--", *sorted(files))
+        for name in filter(None, raw.split(b"\0")):
+            filename = os.fsdecode(name)
+            source = str(completion / filename)
+            scoped_name = scoped_paths[filename]
+            wanted = expected["files"][scoped_name]
+            proof = preserved.get(key, {}).get(scoped_name)
+            if proof:
+                published = git(repo, "show", "--no-ext-diff", "--no-textconv", after + ":" + filename)
+                wanted = sha(preserved_source_bytes(published, proof["working"]))
+            if wanted is None or working_source_sha(source) != wanted:
+                raise CompletionError("Integrate the reviewed completion sources into the observation checkout before refreshing the installation")
+            affected[source] = wanted
+    if not affected:
+        return None
+
+    spec = importlib.util.spec_from_file_location("completion_observation_owner", operations / "llm_work.py")
+    module = importlib.util.module_from_spec(spec)
+    saved_path = sys.path[:]
+    try:
+        sys.path.insert(0, str(operations))
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = saved_path
+    store = module.WorkStore(module.DEFAULT_ROOT, read_only=True)
+    module.verify_execution_installation(store)
+    for source, expected in affected.items():
+        if working_source_sha(source) != expected:
+            raise CompletionError("Completion sources changed while checking the observation installation")
+    return {"affected_sources": sorted(affected), "installation_current": True}
+
+
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), allow_nan=False).encode()
@@ -2017,6 +2080,13 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
             if failure:
                 label = "source" if definition["kind"] == "git_source" else definition["kind"]
                 failures.append({"id": key, "reason": "final " + label + " observation: " + failure})
+    if not stopped and not failures:
+        try:
+            installation = observe_installation_update(checks, result["checks"], scope["baseline"]["repositories"], preserved)
+            if installation is not None:
+                observed["installation:llm-work"] = installation
+        except (CompletionError, OSError, ValueError, ImportError) as exc:
+            failures.append({"id": "installation:llm-work", "reason": str(exc)})
     for item in unclassified:
         if item not in exceptions:
             failures.append({"id": item, "reason": "new remaining resource has no current owner classification"})
