@@ -1,5 +1,6 @@
 import importlib.util
 from contextlib import redirect_stdout
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -316,7 +317,7 @@ class GitHubBoundaryTests(unittest.TestCase):
             self.assertEqual(module.ci_observation(repo, (None, None), [], github, "meenseek")["status"], "absent")
             self.assertEqual(module.ci_observation(repo, (None, "denied"), [], github, "meenseek")["status"], "unknown")
 
-    def test_creation_cli_requires_ci_and_budget_while_default_exit_remains_structural(self):
+    def test_hosted_ci_mode_requires_ci_and_budget_while_default_exit_remains_structural(self):
         repo = repository()
         ci = ".github/workflows/test.yml"
         files = {("product", "a" * 40, "README.md"): (blob("## 연결과 검증\nCI: [CI](" + ci + ")"), None),
@@ -338,6 +339,52 @@ class GitHubBoundaryTests(unittest.TestCase):
             with patch.object(github, "actions_budget", return_value={"status": "failed", "reason": "disabled"}):
                 self.assertEqual(cli(True), 1)
                 self.assertEqual(cli(False), 0)
+
+    def test_local_verification_is_bound_to_repository_commit_and_review(self):
+        sha = "a" * 40
+        files = {("product", sha, "README.md"):
+                 (blob("## 연결과 검증\n[Owner checks](README.md)"), None)}
+        github = MemoryGitHub([repository()], files)
+        result = {"repository_id": 1, "repository": "meenseek/product", "branch": "main", "commit": sha,
+                  "environment": "Linux, Python 3.12",
+                  "checks": [{"id": "tests", "command": "python -m unittest", "exit_code": 0, "skipped": []}],
+                  "exclusions": [{"id": "macos", "reason": "Outside the repository's Linux check"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            review_path = Path(directory) / "review.json"
+
+            def cli(record, review_sha=None):
+                output = io.StringIO()
+                result_path.write_text(record if isinstance(record, str) else json.dumps(record), encoding="utf-8")
+                review_path.write_text(json.dumps({
+                    "result_sha256": review_sha or hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                    "reviewer": "fixture-reviewer", "status": "No Findings"}), encoding="utf-8")
+                argv = ["check", "--repo", "product", "--local-verification", str(result_path),
+                        "--local-verification-review", str(review_path)]
+                with patch.object(module, "GitHub", return_value=github), \
+                     patch.object(module.sys, "argv", argv), redirect_stdout(output):
+                    code = module.main()
+                return code, json.loads(output.getvalue())["repositories"][0]
+
+            with patch.object(github, "actions_budget", return_value={"status": "unknown", "reason": "denied"}):
+                code, row = cli(result)
+                self.assertEqual(code, 0)
+                self.assertEqual(row["ci"]["status"], "absent")
+                self.assertEqual(row["local_verification"]["status"], "confirmed")
+
+            for changes in ({"commit": "b" * 40}, {"repository_id": True}, {"branch": "feature"},
+                            {"checks": []}, {"checks": [{**result["checks"][0], "skipped": ["required"]}]},
+                            {"checks": [{**result["checks"][0], "exit_code": False}]},
+                            {"exclusions": [{"id": "tests", "reason": "Already required"}]}):
+                with self.subTest(changes=changes):
+                    code, row = cli({**result, **changes})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(row["local_verification"]["status"], "failed")
+            self.assertEqual(cli(result, review_sha="0" * 64)[0], 1)
+            duplicate_exit = json.dumps(result).replace('"exit_code": 0', '"exit_code": 1, "exit_code": 0')
+            code, row = cli(duplicate_exit)
+            self.assertEqual(code, 1)
+            self.assertIn("duplicate JSON member", row["local_verification"]["reason"])
 
     def test_release_link_does_not_become_ci_or_block_successful_owner_verification(self):
         ci, release = ".github/workflows/ci.yml", ".github/workflows/release.yml"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only repository discovery and contract-reference checks; never run documents."""
+"""Read-only repository, contract-reference, and reviewed verification checks."""
 
 import argparse
 import hashlib
@@ -412,6 +412,70 @@ def ci_observation(repo, listing, references, github, org):
     return result
 
 
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReadError("verification input contains a duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def read_verification(path):
+    if not path.is_file():
+        raise ReadError("verification input must be a regular file")
+    with path.open("rb") as handle:
+        raw = handle.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ReadError("verification input is too large")
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    if not isinstance(value, dict):
+        raise ReadError("verification input must be a JSON object")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def local_verification(row, result_path, review_path):
+    """Check the attestation binding. The reviewer verifies commands and coverage."""
+    try:
+        result, result_sha = read_verification(result_path)
+        review, _ = read_verification(review_path)
+    except ReadError as exc:
+        return {"status": "failed", "reason": str(exc)}
+    except (OSError, ValueError):
+        return {"status": "failed", "reason": "could not read local verification and review JSON"}
+
+    if (set(result) != {"repository_id", "repository", "branch", "commit", "environment", "checks", "exclusions"}
+            or type(result["repository_id"]) is not int
+            or not row["commit"] or result["repository_id"] != row["id"]
+            or result["repository"] != row["name"] or result["branch"] != row["default_branch"]
+            or result["commit"] != row["commit"]):
+        return {"status": "failed", "reason": "local result does not identify the observed repository and default commit"}
+    if (set(review) != {"result_sha256", "reviewer", "status"} or review["result_sha256"] != result_sha
+            or review["status"] != "No Findings" or not nonblank(review["reviewer"])):
+        return {"status": "failed", "reason": "an independent review of the exact local result is required"}
+    if not nonblank(result["environment"]) or not isinstance(result["checks"], list) or not result["checks"]:
+        return {"status": "failed", "reason": "the environment and at least one required check are needed"}
+    if not all(isinstance(check, dict) and set(check) == {"id", "command", "exit_code", "skipped"}
+               and nonblank(check["id"]) and nonblank(check["command"])
+               and type(check["exit_code"]) is int and check["exit_code"] == 0 and check["skipped"] == []
+               for check in result["checks"]):
+        return {"status": "failed", "reason": "every required check must have passed without skips"}
+    exclusions = result["exclusions"]
+    if not isinstance(exclusions, list) or not all(
+            isinstance(item, dict) and set(item) == {"id", "reason"}
+            and nonblank(item["id"]) and nonblank(item["reason"]) for item in exclusions):
+        return {"status": "failed", "reason": "each excluded check needs an identifier and an owner-backed reason"}
+    identifiers = [item["id"].strip() for item in result["checks"] + exclusions]
+    if len(set(identifiers)) != len(identifiers):
+        return {"status": "failed", "reason": "a check cannot be repeated or both required and excluded"}
+    return {"status": "confirmed", "reason": "reviewed local verification for the observed default commit",
+            "result_sha256": result_sha, "passed_checks": len(result["checks"]), "exclusions": len(exclusions)}
+
+
+def nonblank(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
 def check(org, github, selected=None, local_root=None):
     report = {"org": org, "checked_at": datetime.now(timezone.utc).isoformat(),
               "environment": "GitHub committed sources; local runtime checks are separate",
@@ -444,6 +508,7 @@ def check(org, github, selected=None, local_root=None):
         row = {"id": repo["databaseId"], "name": repo["nameWithOwner"],
                "private": repo["isPrivate"], "archived": repo["isArchived"],
                "empty": repo["isEmpty"], "commit": branch["target"]["oid"] if branch else None,
+               "default_branch": branch["name"] if branch else None,
                "entrypoints": {}, "contract": None, "references": [],
                "structure": {"status": "unknown", "reason": "connection contract needs owner assessment"},
                "connections": {"status": "unknown", "reason": "owner contract meaning and target environment verification required"}}
@@ -537,6 +602,9 @@ def markdown(report):
         lines.append(f"| {row['name']} | {row['structure']['status']} | {row['ci']['status']} | {row['connections']['status']} |")
     for row in report["repositories"]:
         lines.extend(["", f"## {row['name']}", row["structure"]["reason"]])
+        if "local_verification" in row:
+            local = row["local_verification"]
+            lines.append(f"Local verification: {local['status']} — {local['reason']}")
         lines.extend(["CI: " + row["ci"]["reason"], "Workflow files: " + (", ".join(row["ci"]["workflow_files"]) or "none")])
         for workflow in row["ci"]["workflows"]:
             lines.append(f"- CI {workflow['path']}: {workflow['status']} — {workflow['reason']}")
@@ -554,8 +622,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="meenseek")
     parser.add_argument("--repo", help="one repository name; inventory still spans the organization")
-    parser.add_argument("--require-ci", action="store_true",
-                        help="Creation gate: require one selected repo's declared exact-commit CI and zero-dollar Actions stop")
+    validation = parser.add_mutually_exclusive_group()
+    validation.add_argument("--require-ci", action="store_true",
+                            help="Require hosted CI and the Actions budget stop for the selected repository")
+    validation.add_argument("--local-verification", type=Path,
+                            help="Check the reviewed local result for the selected repository's current default commit")
+    parser.add_argument("--local-verification-review", type=Path,
+                        help="Independent review bound to the exact local result bytes")
     parser.add_argument("--format", choices=["json", "markdown"], default="json")
     parser.add_argument("--local-root", type=Path,
                         help="Optionally export verified local Git/entrypoint identity; no runtime checks")
@@ -566,10 +639,18 @@ def main():
         parser.error("--repo takes a repository name, without an owner")
     if args.require_ci and not args.repo:
         parser.error("--require-ci needs --repo; applicability exclusions require owner assessment")
+    if bool(args.local_verification) != bool(args.local_verification_review):
+        parser.error("--local-verification and --local-verification-review are required together")
+    if args.local_verification and not args.repo:
+        parser.error("--local-verification needs --repo")
     report = check(args.org, GitHub(), args.repo, args.local_root)
+    if args.local_verification:
+        for row in report["repositories"]:
+            row["local_verification"] = local_verification(row, args.local_verification, args.local_verification_review)
     print(json.dumps(report, ensure_ascii=False, indent=2) if args.format == "json" else markdown(report), end="\n")
-    # Exit success concerns structural checks only; connections are deliberately unassessed.
     statuses = {r["structure"]["status"] for r in report["repositories"]}
+    if args.local_verification:
+        statuses.update(r["local_verification"]["status"] for r in report["repositories"])
     if args.require_ci:
         statuses.update("unknown" if r["ci"]["status"] == "absent" else r["ci"]["status"] for r in report["repositories"])
         statuses.add(report["actions_budget"]["status"])

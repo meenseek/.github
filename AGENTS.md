@@ -5,7 +5,8 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 
 조직 저장소 생성·소유권·연결 점검에서는 [저장소 운영 규칙](docs/repository-rules.md)의
 생성 완료와 재점검 절차를 먼저 읽습니다. 검사 명령과 결과 해석은 이 문서의 [연결과 검증](#연결과-검증)을 따릅니다.
-새 저장소의 검증 자동화 설치·비용 통제·첫 성공 확인은 같은 문서의 [경량 CI](docs/repository-rules.md#경량-ci)를 따릅니다.
+새 저장소의 첫 검증과 운영 중 변경 검증은 같은 문서의
+[로컬 검증](docs/repository-rules.md#로컬-검증)을 따릅니다.
 
 새 저장소 생성이나 이름 변경에서는 [명명](docs/repository-rules.md#명명)을 먼저 읽습니다.
 제품이 소유한 이름의 판단 근거와 원문 연결을 확인하고, 가칭을 확정된 제품명으로
@@ -230,7 +231,7 @@ Canonical GitHub remote owner가 `meenseek`인 저장소에 적용합니다. 대
 조직 기준은 [저장소 운영 규칙](docs/repository-rules.md)이 소유합니다.
 [검사기](scripts/check_repositories.py)는 GitHub 실제 목록과 선언된 참조의 접근을 확인하고,
 각 저장소의 실제 연결은 그 소유 계약과 현재 실행 환경에서 별도로 검증합니다.
-CI: [이 저장소의 검증 workflow](.github/workflows/ci.yml)
+[수동 원격 검증 workflow](.github/workflows/ci.yml)도 필요할 때 실행할 수 있습니다.
 operations 등록이나 개인 ontology 사용은 모든 저장소의 필수 조건이 아닙니다.
 
 Python 3.11+와 의도한 계정으로 로그인한 `gh`가 필요합니다. 저장소 루트에서 실행합니다.
@@ -238,9 +239,9 @@ Python 3.11+와 의도한 계정으로 로그인한 `gh`가 필요합니다. 저
 ```sh
 python3 scripts/check_repositories.py --org meenseek --format json
 python3 scripts/check_repositories.py --org meenseek --repo .github --format markdown
-python3 scripts/check_repositories.py --org meenseek --repo .github --require-ci --format markdown
+python3 scripts/check_repositories.py --org meenseek --repo .github --local-verification /absolute/local-result.json --local-verification-review /absolute/local-review.json
 python3 scripts/check_repositories.py --org meenseek --local-root /absolute/checkouts --format json
-python3 -m unittest discover -s tests -v
+python3.12 -B -m unittest discover -s tests -v
 ```
 
 명령은 저장소·설정·서비스를 변경하거나 문서의 명령을 실행하지 않습니다.
@@ -261,8 +262,10 @@ JSON에는 확인 시각, 적용한 기준의 SHA-256, 저장소 ID·이름·상
 미확인만으로 준비 실패를 선언하거나 모든 저장소의 README를 일괄 변경하지 않습니다.
 
 기본 종료 코드 0은 구조 검사 범위만 확인됨, 1은 선언된 참조의 실패, 2는 미확인입니다.
-`--require-ci`는 `--repo`가 필요한 생성 게이트이며 CI와 과금 차단도 종료 판정에 포함합니다.
-CI 적용 여부와 제외 판단은 [생성 기준](docs/repository-rules.md#경량-ci)을 따릅니다.
+`--local-verification`은 `--repo`의 현재 기본 브랜치 커밋과 독립 검토를
+[로컬 검증 규칙](docs/repository-rules.md#로컬-검증)에 따라 대조합니다.
+`--require-ci`는 [별도로 요청된 원격 보조 검증](docs/repository-rules.md#경량-ci)과
+과금 차단을 확인할 때 사용합니다.
 선택적 `--local-root`는 확인된 조직 이름과 일치하는 `origin`을 가진 직접 하위 checkout의
 Git commit·branch·변경 여부와 README/AGENTS 파일의 SHA·크기만 추가합니다. 다른 저장소,
 미설치·큰 파일·심볼릭 링크·확인 중 바뀐 원문은 확인된 자료로 내보내지 않습니다.

@@ -1,24 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/**'
-      - 'tests/**'
-      - 'docs/**'
-      - 'AGENTS.md'
-      - 'README.md'
-      - '.github/workflows/ci.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'scripts/**'
-      - 'tests/**'
-      - 'docs/**'
-      - 'AGENTS.md'
-      - 'README.md'
-      - '.github/workflows/ci.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
