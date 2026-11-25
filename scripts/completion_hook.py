@@ -43,12 +43,11 @@ def temporary_record_parents():
 
 
 def new_record_directory():
-    default = Path.home() / ".local/state/meenseek/completion-records"
-    parent = c.path(os.environ.get(RECORD_PARENT_ENV, str(default)))
+    parent = c.path(os.environ.get(RECORD_PARENT_ENV, str(c.DIRECT_RECORD_PARENT)))
     if parent.resolve() != parent or any(parent.is_relative_to(p.resolve()) for p in temporary_record_parents()):
         raise c.CompletionError(f"{RECORD_PARENT_ENV} must name a real, non-temporary state directory")
-    if parent.is_relative_to(Path(__file__).resolve().parents[2]):
-        raise c.CompletionError(f"{RECORD_PARENT_ENV} must be outside the Desktop workspace")
+    if c.inside_git_checkout(parent):
+        raise c.CompletionError(f"{RECORD_PARENT_ENV} must be outside Git checkouts")
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = parent.stat()
     if parent.resolve() != parent or not parent.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -160,6 +159,59 @@ def load_state(filename):
             c.scope_history(value["scope"], value)
             c.reservation_resolutions(c.read_control(value["scope"]) if value["scope"] else None, value)
     return value, c.sha(raw)
+
+
+def record_path_absent(directory):
+    try:
+        directory.lstat()
+    except FileNotFoundError:
+        return not any(parent.is_symlink() for parent in directory.parents)
+    return False
+
+
+def require_absent_record(record):
+    old = c.path(record["path"])
+    if not record_path_absent(old) or old.parent.stat().st_dev != record["device"]:
+        raise c.CompletionError("original record must be absent on its available filesystem")
+
+
+def arm(filename, args):
+    task = c.text(args.task_id)
+    before = None
+    original = None
+    if args.expected_sha256 is None:
+        if os.path.lexists(filename):
+            raise c.CompletionError("session already armed; reuse its current pointer")
+        state = {"task_id": task, "session_id": args.session, "intent": "closure", "scope": None,
+                 "review": None, "final_review": None, "result_path": None, "resources": [],
+                 "outcome": "working", "execution_owner": "direct"}
+    else:
+        state, before = load_state(filename)
+        if (before, state["task_id"], state["session_id"]) != (c.digest(args.expected_sha256), task, args.session):
+            raise c.CompletionError("stale pointer or wrong task/session")
+        original = state.get("armed_record")
+        if state["scope"] is not None or not original or state.get("execution_owner") != "direct":
+            raise c.CompletionError("record reallocation requires a direct task before scope binding")
+        require_absent_record(original)
+        with c.stored_controls(state, filename):
+            for resource in state["resources"]:
+                c.control_reference(resource["basis"])
+
+    if before is None and filename.parent != ROOT and RECORD_PARENT_ENV not in os.environ:
+        return replace(filename, state, None)
+    record = state["armed_record"] = new_record_directory()
+    try:
+        with c.stored_controls(state, filename):
+            protect_records(state, filename, state["resources"])
+        if original:
+            require_absent_record(original)
+        answer = replace(filename, state, before)
+    except (OSError, c.CompletionError):
+        current = c.sha(c.raw_file(str(filename))) if os.path.lexists(filename) else None
+        if current == before:
+            Path(record["path"]).rmdir()
+        raise
+    return {**answer, "record_root": record["path"]}
 
 
 def task_context(state, filename, session):
@@ -715,19 +767,23 @@ def publish(filename, state, before, *, final=False):
     return replace(filename, state, before)
 
 
-def recover_final_records(state, scope, payload, review_path):
+def recover_final_records(state, scope, payload, review_path, *, allow_stopped=False):
     """Accept only reviewed control bytes for exact paths in an absent record root."""
     root = scope["record_root"]
     directory = c.path(root["path"])
-    if os.path.lexists(directory) or any(part.is_symlink() for part in directory.parents):
+    if not record_path_absent(directory):
         raise c.CompletionError("record recovery requires the original record directory to be absent")
     result = payload["result"]
     c.fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates", "exception_groups"))
     checks = result["checks"]
     if result["scope_sha256"] != state["scope"]["sha256"] or not isinstance(checks, dict) or set(checks) != {check["id"] for check in scope["checks"]}:
         raise c.CompletionError("record recovery must cover the original frozen scope")
-    expected_review = c.final_review_fields(state["scope"], scope, state, c.sha(c.canonical(result)), review_path)
-    if payload["review"] != expected_review:
+    review = payload["review"]
+    stopped = (allow_stopped and state["outcome"] in {"blocked", "cancelled"}
+               and isinstance(review, dict) and review.get("disposition") == "stopped")
+    expected_review = c.final_review_fields(state["scope"], scope, state, c.sha(c.canonical(result)),
+                                            review_path, stopped=stopped)
+    if review != expected_review:
         raise c.CompletionError("record recovery requires independent review of the exact final result")
     rows = payload["records"]
     if not isinstance(rows, list) or not rows:
@@ -749,11 +805,15 @@ def recover_final_records(state, scope, payload, review_path):
         if check["kind"] not in {"evidence", "improvement"}:
             continue
         target = check["target"]
-        ref = (target["path"], c.digest(checks[check["id"]]["sha256"]))
-        allowed.add(ref)
         if check["kind"] == "improvement":
             basis = c.read_control(target["plan"])["basis"]
             allowed.add((basis["path"], basis["sha256"]))
+        expected = checks[check["id"]]
+        if stopped and expected == {}:
+            continue
+        ref = (target["path"], c.digest(expected["sha256"]))
+        allowed.add(ref)
+        if check["kind"] == "improvement":
             raw = restored.get(ref)
             record = c.decode(c.control_bytes(*ref) if raw is None else raw)
             for case in record["cases"]:
@@ -777,9 +837,10 @@ def main(argv=None):
         item.add_argument("--session", required=True)
         if name == "arm":
             item.description = ("For direct work, use the returned record_root in the scope seed. "
-                                f"{RECORD_PARENT_ENV} can select a private persistent parent outside the workspace. "
-                                "The default is ~/.local/state/meenseek/completion-records.")
+                                f"{RECORD_PARENT_ENV} selects a private persistent parent outside Git checkouts. "
+                                "The default is .completion-records beside the .github checkout.")
             item.add_argument("--task-id", required=True)
+            item.add_argument("--expected-sha256", help="Reallocate a missing record root before bind using the current pointer SHA")
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
         if name in {"complete", "unbind", "release", "adopt", "repair-process-record"}:
             if name != "repair-process-record":
@@ -823,21 +884,7 @@ def main(argv=None):
             filename = pointer(Path(args.bindings), args.from_session if args.command == "adopt" else args.session)
             with locked(filename.parent):
                 if args.command == "arm":
-                    if os.path.lexists(filename): raise c.CompletionError("session already armed; reuse its current pointer")
-                    state = {"task_id": c.text(args.task_id), "session_id": args.session, "intent": "closure",
-                             "scope": None, "review": None, "final_review": None, "result_path": None,
-                             "resources": [], "outcome": "working", "execution_owner": "direct"}
-                    record = None
-                    if filename.parent == ROOT or RECORD_PARENT_ENV in os.environ:
-                        record = state["armed_record"] = new_record_directory()
-                    try:
-                        answer = replace(filename, state, None)
-                    except (OSError, c.CompletionError):
-                        if record and not os.path.lexists(filename):
-                            Path(record["path"]).rmdir()
-                        raise
-                    if record:
-                        answer["record_root"] = record["path"]
+                    answer = arm(filename, args)
                 else:
                     state, before = load_state(filename)
                     if before != c.digest(args.expected_sha256) or (args.command != "adopt" and state["session_id"] != args.session):
@@ -866,8 +913,10 @@ def main(argv=None):
                             scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
                             review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
                             scope = c.read_control(scope_ref)
-                            if "armed_record" in state and scope.get("record_root") != state["armed_record"]:
-                                raise c.CompletionError("use the exact record_root returned by arm")
+                            if armed_record := state.get("armed_record"):
+                                if (scope.get("record_root") != armed_record
+                                        or c.record_directory(armed_record["path"]) != armed_record):
+                                    raise c.CompletionError("use the exact record_root returned by arm")
                             c.validate_admission_targets(scope["checks"], state["resources"])
                             c.validate_scope(scope)
                             c.validate_state_identity(scope, state, filename)
@@ -904,6 +953,8 @@ def main(argv=None):
                                     target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                                 protect_records(state, filename, [resource], admitting_resources=True)
                                 found[0].update(resource, basis=basis)
+                            if state["scope"] is None and "armed_record" in state:
+                                c.remember_control(state, basis)
                         elif args.command == "recover-github-observer":
                             if (state["outcome"] != "waiting" or state["scope"] is None or
                                     "github_observer_recovery" in state or "record_manifest" in state):
@@ -986,7 +1037,8 @@ def main(argv=None):
                                 if os.path.lexists(result_origin) or os.path.lexists(review_origin):
                                     raise c.CompletionError("stdin control origins must not shadow staging files")
                                 if "records" in payload:
-                                    recover_final_records(state, scope, payload, str(review_origin))
+                                    recover_final_records(state, scope, payload, str(review_origin),
+                                                          allow_stopped=args.command == "finalize")
                                 state.update(result_path=str(result_origin), final_review={
                                     "path": str(review_origin), "sha256": c.sha(review_raw)})
                                 protect_records(state, filename, state["resources"], observing=True)

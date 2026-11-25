@@ -43,6 +43,7 @@ STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "file
                   "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history",
                   "reservation_resolutions", "github_observer_recovery", "armed_record")
 GITHUB_OBSERVER_ENV = "CODEX_COMPLETION_GH"
+DIRECT_RECORD_PARENT = Path(__file__).resolve().parents[2] / ".completion-records"
 _CONTROL = ContextVar("completion_control", default=None)
 
 
@@ -1182,6 +1183,40 @@ def record_directory(value):
     return {"path": str(root), "device": info.st_dev, "inode": info.st_ino}
 
 
+def inside_git_checkout(location):
+    for directory in (location, *location.parents):
+        git_marker = directory / ".git"
+        if git_marker.is_file() or (git_marker / "HEAD").is_file():
+            return True
+    return False
+
+
+def matches_armed_record(scope):
+    location = scope["state_path"]
+    current = _CONTROL.get()
+    origin = {"session_id": scope["session_id"], "state_path": location}
+    try:
+        if current and current[1] and (current[1] == location or current[0].get("origin") == origin):
+            state, location = current
+        else:
+            state = decode(raw_file(location))
+    except FileNotFoundError:
+        return False
+    if not isinstance(state, dict) or state.get("execution_owner") != "direct" or not state.get("armed_record"):
+        return False
+    validate_state_identity(scope, state, location)
+    armed = state["armed_record"]
+    if armed == scope["record_root"]:
+        return True
+    if not state.get("scope"):
+        return False
+    frozen = read_control(state["scope"])
+    record = scope["record_root"]
+    # Filesystem recovery may project a reviewed device change; allocation still owns the same path and inode.
+    return (frozen.get("record_root") == armed
+            and (armed["path"], armed["inode"]) == (record["path"], record["inode"]))
+
+
 def record_inventory(record):
     """Inventory task-only records without accepting filesystem links."""
     if not os.path.lexists(record["path"]):
@@ -1311,8 +1346,14 @@ def validate_record_root(scope):
         if record_directory(record["path"]) != record:
             raise CompletionError("record root identity changed")
     root = path(record["path"])
+    workspace = path(scope["environment"]["workspace"]).resolve()
     protected = [*scope["repositories"], *scope["artifact_roots"], scope["state_path"],
-                 scope["environment"]["workspace"], *(owner["path"] for owner in scope["owners"])]
+                 *(owner["path"] for owner in scope["owners"])]
+    shared_workspace = (workspace == DIRECT_RECORD_PARENT.parent and root != workspace
+                        and root.is_relative_to(workspace) and not inside_git_checkout(root)
+                        and matches_armed_record(scope))
+    if not shared_workspace:
+        protected.append(str(workspace))
     for check in scope["checks"]:
         if check["kind"] == "git_source":
             protected.append(check["target"]["repository"])

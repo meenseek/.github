@@ -176,7 +176,120 @@ class HookTests(unittest.TestCase):
         self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
         self.assertFalse(record.exists())
 
+    def test_default_record_root_is_usable_from_the_shared_workspace(self):
+        parent = self.f.root / ".completion-records"
+        out = io.StringIO()
+        with (mock.patch.object(h, "ROOT", self.root), mock.patch.object(h.c, "DIRECT_RECORD_PARENT", parent),
+              mock.patch.object(h, "temporary_record_parents", return_value=()),
+              mock.patch.dict(os.environ), redirect_stdout(out)):
+            os.environ.pop(h.RECORD_PARENT_ENV, None)
+            args = ["arm", "--session", self.f.seed["session_id"], "--task-id", self.f.seed["task_id"]]
+            self.assertEqual(h.main(args), 0, out.getvalue())
+            record = Path(json.loads(out.getvalue())["record_root"])
+            self.assertEqual(record.parent, parent)
+            self.record_fixture(root=record)
+            self.f.seed.update(state_path=str(self.state), workspace=str(self.f.root))
+            scope = h.c.prepare(self.f.seed)
+            self.assertEqual(scope["record_root"]["path"], str(record))
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(record.stat().st_mode & 0o777, 0o700)
+
+    def test_shared_workspace_only_admits_the_exact_armed_override(self):
+        default = self.f.root / ".completion-records"
+        override = self.f.root / "persistent-private"
+        args = ["--bindings", str(self.root), "arm", "--session", self.f.seed["session_id"],
+                "--task-id", self.f.seed["task_id"]]
+        out = io.StringIO()
+        with (mock.patch.object(h.c, "DIRECT_RECORD_PARENT", default),
+              mock.patch.object(h, "temporary_record_parents", return_value=()), redirect_stdout(out)):
+            with mock.patch.dict(os.environ, {h.RECORD_PARENT_ENV: str(self.f.repo / "records")}):
+                self.assertEqual(h.main(args), 2)
+            self.assertIn("outside Git checkouts", out.getvalue())
+            out.seek(0); out.truncate(0)
+            with mock.patch.dict(os.environ, {h.RECORD_PARENT_ENV: str(override)}):
+                self.assertEqual(h.main(args), 0, out.getvalue())
+            record = Path(json.loads(out.getvalue())["record_root"])
+            self.assertEqual(record.parent, override)
+            self.f.seed.update(state_path=str(self.state), workspace=str(self.f.root))
+            self.record_fixture()
+            with self.assertRaisesRegex(h.c.CompletionError, "overlaps"):
+                h.c.prepare(self.f.seed)
+            self.record_fixture(root=record)
+            scope = h.c.prepare(self.f.seed)
+            self.assertEqual(scope["record_root"]["path"], str(record))
+            state = json.loads(self.state.read_bytes())
+            original = {**scope["record_root"], "device": scope["record_root"]["device"] + 1}
+            frozen = self.f.root / "frozen-scope.json"
+            self.f.write(frozen, {**scope, "record_root": original})
+            adopted = {**state, "scope": self.f.ref(frozen), "armed_record": original,
+                       "session_id": "new-session",
+                       "origin": {"session_id": state["session_id"], "state_path": str(self.state)}}
+            self.state.unlink()
+            with h.c.stored_controls(adopted, self.root / "new-session.json"):
+                h.c.validate_record_root(scope)
+
+    def test_reallocate_missing_unbound_records_preserves_resources_and_allows_completion(self):
+        parent = self.f.root / "state-records"
+        args = ["--bindings", str(self.root), "arm", "--session", self.f.seed["session_id"],
+                "--task-id", self.f.seed["task_id"]]
+
+        def arm(extra, code):
+            out = io.StringIO()
+            with (mock.patch.dict(os.environ, {h.RECORD_PARENT_ENV: str(parent)}),
+                  mock.patch.object(h, "temporary_record_parents", return_value=()), redirect_stdout(out)):
+                self.assertEqual(h.main([*args, *extra]), code, out.getvalue())
+            return json.loads(out.getvalue())
+
+        started = arm([], 0)
+        old = Path(started["record_root"])
+        basis = old / "reservation.txt"
+        basis.write_text("Retain the owned resource identity")
+        basis_args = ["--basis", str(basis), "--basis-sha256", self.f.ref(basis)["sha256"]]
+        self.call("reserve", "--id", "scratch", *basis_args)
+        resource = self.f.root / "scratch-resource.json"
+        self.f.write(resource, {"kind": "absent", "target": {"path": str(self.f.root / "scratch")}})
+        self.call("attach", "--id", "scratch", "--resource", str(resource), *basis_args)
+        before = self.state.read_bytes()
+        recover = ["--expected-sha256", h.c.sha(before)]
+        self.assertIn("original record must be absent", arm(recover, 2)["error"])
+        shutil.rmtree(old)
+        self.assertIn("stale pointer", arm(["--expected-sha256", started["sha256"]], 2)["error"])
+        self.assertEqual(self.state.read_bytes(), before)
+
+        allocate = h.new_record_directory
+        def reappears_during_allocation():
+            old.mkdir()
+            return allocate()
+
+        with mock.patch.object(h, "new_record_directory", side_effect=reappears_during_allocation):
+            self.assertIn("original record must be absent", arm(recover, 2)["error"])
+        self.assertEqual(list(parent.iterdir()), [old])
+        self.assertEqual(self.state.read_bytes(), before)
+        old.rmdir()
+
+        record = Path(arm(recover, 0)["record_root"])
+        current = json.loads(self.state.read_bytes())
+        self.assertNotEqual(record, old)
+        self.assertEqual({**current, "armed_record": json.loads(before)["armed_record"]}, json.loads(before))
+
+        self.record_fixture(root=record)
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
+                  "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"])
+        bound = self.state.read_bytes()
+        self.assertIn("before scope binding", arm(["--expected-sha256", h.c.sha(bound)], 2)["error"])
+        self.assertEqual(self.state.read_bytes(), bound)
+        self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
+        self.assertFalse(record.exists())
+
     def test_improvement_record_loss_can_resume_using_only_exact_reviewed_controls(self):
+        self.check_improvement_record_loss(stopped=False)
+
+    def test_stopped_improvement_record_loss_recovers_only_the_frozen_basis(self):
+        self.check_improvement_record_loss(stopped=True)
+
+    def check_improvement_record_loss(self, *, stopped):
         self.record_fixture()
         improvement = improvement_fixture.ImprovementTests()
         improvement.setUp()
@@ -199,6 +312,8 @@ class HookTests(unittest.TestCase):
                                       "target": {"path": record["path"], "plan": plan}})
         self.f.reset_categories()
         self.arm_bind(finalize=False)
+        if stopped:
+            self.call("outcome", "--status", "cancelled", *self.basis())
         state = json.loads(self.state.read_bytes())
         basis = improvement.plan["basis"]
         self.assertIn(basis["path"], {item["path"] for item in state["control_records"]})
@@ -218,12 +333,19 @@ class HookTests(unittest.TestCase):
         state["record_manifest"] = h.c.record_inventory(h.c.record_directory(str(self.records)))
         self.f.write(self.state, state)
         result = self.f.result
-        result["checks"]["prevention"] = {"sha256": record["sha256"]}
-        args = self.direct_complete(); args = args[:args.index("--result")] + ["--inputs", "-"]
+        result["checks"]["prevention"] = {} if stopped else {"sha256": record["sha256"]}
+        if stopped:
+            args = ["--bindings", str(self.root), "finalize", "--session", self.f.seed["session_id"],
+                    "--expected-sha256", h.c.sha(self.state.read_bytes()), "--inputs", "-"]
+        else:
+            args = self.direct_complete()
+            args = args[:args.index("--result")] + ["--inputs", "-"]
         shutil.rmtree(self.records)
         review = {"scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings",
                   "result_sha256": h.c.sha(h.c.canonical(result)),
                   "record_inventory_sha256": h.c.sha(h.c.canonical(state["record_manifest"]))}
+        if stopped:
+            review["disposition"] = "stopped"
         unchanged_state = self.state.read_bytes()
 
         def complete(rows, code):
@@ -234,12 +356,26 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(h.main(args), code, out.getvalue())
             return json.loads(out.getvalue())
 
-        unreviewed = {**recovered[0], "path": str(self.records / "unreviewed.md")}
-        self.assertIn("exceed", complete([*recovered, unreviewed], 2)["error"])
-        mismatched = [{**recovered[0], "data": base64.b64encode(b"different basis").decode()}, *recovered[1:]]
+        valid = recovered[:1] if stopped else recovered
+        unreviewed = recovered[1] if stopped else {**recovered[0], "path": str(self.records / "unreviewed.md")}
+        self.assertIn("exceed", complete([*valid, unreviewed], 2)["error"])
+        mismatched = [{**valid[0], "data": base64.b64encode(b"different basis").decode()}, *valid[1:]]
         self.assertIn("SHA differs", complete(mismatched, 2)["error"])
+        lstat = Path.lstat
+
+        def inaccessible(path):
+            if path == self.records:
+                raise PermissionError("synthetic permission denied for old records")
+            return lstat(path)
+
+        with mock.patch.object(Path, "lstat", new=inaccessible):
+            self.assertIn("permission denied", complete(valid, 2)["error"])
         self.assertEqual(self.state.read_bytes(), unchanged_state)
-        self.assertTrue(complete(recovered, 0)["binding_released"])
+        answer = complete(valid, 0)
+        if stopped:
+            answer = self.call("release")
+            self.assertTrue(answer["stopped"])
+        self.assertTrue(answer["binding_released"])
         self.assertFalse(self.state.exists())
         self.assertFalse(self.records.exists())
 
