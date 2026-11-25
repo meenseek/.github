@@ -38,7 +38,7 @@ def observation(ref, case, implementation):
     return matches(value["result"], case["assertions"])
 
 
-def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None):
+def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None, record_root=None):
     plan = c.read_control(plan_ref)
     c.fields(plan, ("task_id", "problem", "criterion", "basis", "baseline_sha256", "cases"))
     for key in ("task_id", "problem", "criterion"):
@@ -46,7 +46,7 @@ def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None):
     if task_id is not None and plan["task_id"] != task_id:
         raise c.CompletionError("improvement plan belongs to another task")
     # A declared owner edit preserves its original criterion in Git/a snapshot.
-    # Match both frozen path and bytes; all other bases remain live references.
+    # Match both frozen path and bytes. Only task-owned temporary copies may use stored controls.
     if not isinstance(owners, (list, tuple)):
         raise c.CompletionError("expected owner references")
     c.fields(plan["basis"], ("path", "sha256"))
@@ -63,6 +63,8 @@ def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None):
                   and owner.get("sha256") == plan["basis"]["sha256"] for owner in owners)
           and recovery.verify_original(plan["basis"])):
         c.owner_refs(list(owners), recovery)
+    elif c.is_task_record(plan["basis"], record_root):
+        c.control_reference(plan["basis"])
     else:
         c.reference(plan["basis"])
     c.digest(plan["baseline_sha256"])
@@ -91,8 +93,8 @@ def validate_plan(plan_ref, task_id=None, *, owners=(), recovery=None):
     return plan, baseline_passes
 
 
-def inspect(plan_ref, record_ref, task_id=None, *, owners=(), recovery=None, check_application=True):
-    plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners, recovery=recovery)
+def inspect(plan_ref, record_ref, task_id=None, *, owners=(), recovery=None, record_root=None, check_application=True):
+    plan, baseline_passes = validate_plan(plan_ref, task_id, owners=owners, recovery=recovery, record_root=record_root)
     record = c.read_control(record_ref)
     c.fields(record, ("plan_sha256", "candidate", "cases", "application"))
     if record["plan_sha256"] != plan_ref["sha256"]:
@@ -128,7 +130,7 @@ def inspect(plan_ref, record_ref, task_id=None, *, owners=(), recovery=None, che
         if check_application and c.working_source_sha(location) != source["sha256"]:
             raise c.CompletionError("actual usage differs from the verified candidate")
     # Repeat every binding after reading the final observation and installed bytes.
-    validate_plan(plan_ref, task_id, owners=owners, recovery=recovery)
+    validate_plan(plan_ref, task_id, owners=owners, recovery=recovery, record_root=record_root)
     c.control_reference(record_ref)
     c.refs(candidates)
     for ref in after_refs:

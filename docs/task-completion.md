@@ -108,7 +108,14 @@ python3 scripts/check_completion.py prepare --seed /absolute/seed.json --output 
   직접 채팅에서는 원래 요청 바이트의 SHA를 사용한다.
 
 직접 작업의 요청·seed·scope·관측·result·리뷰는 저장소 밖의 전용 임시 폴더에 모으고
-seed의 `record_root`에 그 절대경로를 지정한다. `prepare`는 폴더의 device/inode를 고정한다.
+seed의 `record_root`에는 `arm`이 반환한 절대경로를 지정한다. 기본 상위 경로는 `.github`
+체크아웃과 같은 디렉터리의 비공개 `.completion-records`다. 호스트에서
+`CODEX_COMPLETION_RECORD_PARENT`를 지정하면 Git 체크아웃 밖의 다른 비공개 지속 경로를
+쓸 수 있다. 해당 경로는 `arm`부터 `complete`까지 실제 실행 경계에서 쓰기 가능해야 한다.
+`prepare`는 할당된 폴더의 device/inode를 고정한다.
+`bind` 전에 폴더가 실제로 없어졌고 원래 파일시스템을 확인할 수 있으면, 같은 session과 task에
+`arm --expected-sha256`으로 현재 pointer SHA를 지정해 새 폴더를 할당할 수 있다. 이미 접수한
+예약과 근거는 유지하며, 원래 기록의 현재 부재와 정확한 pointer를 다시 확인한다.
 이 폴더는 제품 산출물이나 영구 기록이 아니며 Git ignore 여부로 보존하지 않는다.
 `bind`는 선택한 요청·범위·리뷰와 재발 방지 계획·사례의 정확한 바이트를 기존 private
 작업 상태에 함께 저장한다. 참조의 path/SHA는 출처와 원문 식별이며, 게시된 통제 입력을
@@ -621,6 +628,11 @@ LLM 작업 관측을 설치한 호스트에서 이번 작업이 설치에 포함
 `finalize`·`complete --inputs -`는 stdin의 `{result: {...}, review: {...}}`를 받아 별도 파일 없이
 게시한다. 리뷰는 canonical JSON의 result SHA와 실제 남은 기록 inventory를 결속한다.
 stdin 리뷰는 실제 파일이 아니므로 전체 inventory를 결속하며 제외할 자기 파일이 없다.
+원래 기록 폴더가 없고 과거 binding에서 검증 입력을 보관하지 못했다면, 별도로 보존한 정확한
+원문을 `records` 배열의 `{path, sha256, data}`로 함께 전달할 수 있다. `data`는 Base64다.
+기존 계획에 고정된 근거와 최종 리뷰가 결속한 증거의 원래 경로·SHA만 수락한다.
+중단 작업은 `disposition: stopped` 리뷰로 `finalize`한 뒤 `release`하며, 미생성 증거의
+기대값이 비어 있으면 고정 계획의 원래 근거만 복원한다.
 이미 `finalize`한 상태의 `complete`는 result/review 파일 인자를 생략해 저장된 입력으로 재검사한다.
 `attach --resource -`도 stdin의 `{kind, target}`를 받는다.
 
@@ -654,7 +666,7 @@ Stop에서 같은 업무에 연결된 턴을 한 번 이어갈 수 있다. 턴 �
 경로·device/inode와 검토된 manifest를 대조한다. 최종 입력 게시 뒤 사라진 파일은 없어도 되지만,
 새 파일·변조·교체된 폴더는 삭제하지 않는다. 저장된 기대값과 실제 남은 파일을 나눠 검사하고
 완료·중단 시 기존 삭제 재개 절차로 관리 상태까지 제거한다. 이미 원문을 보관하지 못한 과거
-binding은 원래 파일이 필요하며, 없는 바이트를 발명하거나 자동 완료하지 않는다.
+binding에는 원래 파일이나 위에서 설명한 정확한 원문 사본이 필요하다.
 
 ## Codex 설치와 실제 연결 확인
 

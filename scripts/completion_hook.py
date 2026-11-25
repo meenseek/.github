@@ -1,5 +1,6 @@
 """Advisory Codex adapter; explicit completion can remove reviewed task-only records."""
 import argparse
+import base64
 from contextlib import contextmanager
 import fcntl
 import importlib.util
@@ -19,6 +20,7 @@ SPEC = importlib.util.spec_from_file_location("completion", Path(__file__).with_
 c = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(c)
 ROOT = Path(__file__).resolve().parents[1] / ".completion"
+RECORD_PARENT_ENV = "CODEX_COMPLETION_RECORD_PARENT"
 GUIDANCE = ("Desktop 저장소 변경 작업은 별도 정리 요청이 없어도 첫 변경·작업 branch/worktree 생성 전에 "
             "completion_hook.py arm으로 이 session_id를 연결하고 "
             "docs/task-completion.md의 범위 고정·검증·리뷰·실제 적용·자원 정리를 끝까지 수행하세요. "
@@ -26,7 +28,7 @@ GUIDANCE = ("Desktop 저장소 변경 작업은 별도 정리 요청이 없어�
             "임시 파일/프로세스/탭/자식 작업, 중단 작업 재개가 포함됩니다. 명시적인 정리 요청도 같은 계약을 따릅니다. "
             "상태 보고는 실제 남은 조치를 쓰고 파일 손상·유실은 확인된 경우에만 보고하세요. "
             "읽기 전용 조사·리뷰와 단순 질문만 하는 작업은 새 변경 작업으로 추정하지 마세요. "
-            "직접 작업의 임시 완료 기록은 저장소 밖 전용 record_root에 모으고 scope에 고정하세요. "
+            "직접 작업의 완료 기록은 arm이 반환한 record_root에 모으고 scope에 고정하세요. "
             "complete/unbind/release 성공 시 검토된 임시 기록 폴더까지 제거하며 완료 receipt 파일을 다시 만들지 마세요. 완료는 현재 관측으로 확인하세요.")
 
 
@@ -36,10 +38,30 @@ def pointer(root, session):
     return c.path(str(root)) / (session + ".json")
 
 
+def temporary_record_parents():
+    return (Path("/tmp"), Path("/var/tmp"), Path("/run"), Path("/dev/shm"), Path(tempfile.gettempdir()))
+
+
+def new_record_directory():
+    parent = c.path(os.environ.get(RECORD_PARENT_ENV, str(c.DIRECT_RECORD_PARENT)))
+    if parent.resolve() != parent or any(parent.is_relative_to(p.resolve()) for p in temporary_record_parents()):
+        raise c.CompletionError(f"{RECORD_PARENT_ENV} must name a real, non-temporary state directory")
+    if c.inside_git_checkout(parent):
+        raise c.CompletionError(f"{RECORD_PARENT_ENV} must be outside Git checkouts")
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = parent.stat()
+    if parent.resolve() != parent or not parent.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise c.CompletionError(f"{RECORD_PARENT_ENV} must be a private directory owned by the current user")
+    return c.record_directory(tempfile.mkdtemp(prefix="task-", dir=parent))
+
+
 def protect_records(state, filename, resources, *, observing=False, admitting_resources=False):
     scope = None
     if state.get("scope"):
         scope = c.filesystem_scope(state["scope"], c.read_control(state["scope"]), state)
+    elif "armed_record" in state:
+        for resource in resources:
+            c.protect_completion_records(resource, [state["armed_record"]["path"]])
     c.protect_bound_records(scope, state, filename, resources, observing=observing)
     if scope is not None and admitting_resources:
         c.protect_retained_files(scope["checks"], resources)
@@ -137,6 +159,59 @@ def load_state(filename):
             c.scope_history(value["scope"], value)
             c.reservation_resolutions(c.read_control(value["scope"]) if value["scope"] else None, value)
     return value, c.sha(raw)
+
+
+def record_path_absent(directory):
+    try:
+        directory.lstat()
+    except FileNotFoundError:
+        return not any(parent.is_symlink() for parent in directory.parents)
+    return False
+
+
+def require_absent_record(record):
+    old = c.path(record["path"])
+    if not record_path_absent(old) or old.parent.stat().st_dev != record["device"]:
+        raise c.CompletionError("original record must be absent on its available filesystem")
+
+
+def arm(filename, args):
+    task = c.text(args.task_id)
+    before = None
+    original = None
+    if args.expected_sha256 is None:
+        if os.path.lexists(filename):
+            raise c.CompletionError("session already armed; reuse its current pointer")
+        state = {"task_id": task, "session_id": args.session, "intent": "closure", "scope": None,
+                 "review": None, "final_review": None, "result_path": None, "resources": [],
+                 "outcome": "working", "execution_owner": "direct"}
+    else:
+        state, before = load_state(filename)
+        if (before, state["task_id"], state["session_id"]) != (c.digest(args.expected_sha256), task, args.session):
+            raise c.CompletionError("stale pointer or wrong task/session")
+        original = state.get("armed_record")
+        if state["scope"] is not None or not original or state.get("execution_owner") != "direct":
+            raise c.CompletionError("record reallocation requires a direct task before scope binding")
+        require_absent_record(original)
+        with c.stored_controls(state, filename):
+            for resource in state["resources"]:
+                c.control_reference(resource["basis"])
+
+    if before is None and filename.parent != ROOT and RECORD_PARENT_ENV not in os.environ:
+        return replace(filename, state, None)
+    record = state["armed_record"] = new_record_directory()
+    try:
+        with c.stored_controls(state, filename):
+            protect_records(state, filename, state["resources"])
+        if original:
+            require_absent_record(original)
+        answer = replace(filename, state, before)
+    except (OSError, c.CompletionError):
+        current = c.sha(c.raw_file(str(filename))) if os.path.lexists(filename) else None
+        if current == before:
+            Path(record["path"]).rmdir()
+        raise
+    return {**answer, "record_root": record["path"]}
 
 
 def task_context(state, filename, session):
@@ -692,6 +767,64 @@ def publish(filename, state, before, *, final=False):
     return replace(filename, state, before)
 
 
+def recover_final_records(state, scope, payload, review_path, *, allow_stopped=False):
+    """Accept only reviewed control bytes for exact paths in an absent record root."""
+    root = scope["record_root"]
+    directory = c.path(root["path"])
+    if not record_path_absent(directory):
+        raise c.CompletionError("record recovery requires the original record directory to be absent")
+    result = payload["result"]
+    c.fields(result, ("scope_sha256", "checks", "exceptions"), ("owner_updates", "exception_groups"))
+    checks = result["checks"]
+    if result["scope_sha256"] != state["scope"]["sha256"] or not isinstance(checks, dict) or set(checks) != {check["id"] for check in scope["checks"]}:
+        raise c.CompletionError("record recovery must cover the original frozen scope")
+    review = payload["review"]
+    stopped = (allow_stopped and state["outcome"] in {"blocked", "cancelled"}
+               and isinstance(review, dict) and review.get("disposition") == "stopped")
+    expected_review = c.final_review_fields(state["scope"], scope, state, c.sha(c.canonical(result)),
+                                            review_path, stopped=stopped)
+    if review != expected_review:
+        raise c.CompletionError("record recovery requires independent review of the exact final result")
+    rows = payload["records"]
+    if not isinstance(rows, list) or not rows:
+        raise c.CompletionError("record recovery needs exact record bytes")
+    restored = {}
+    locations = set()
+    for row in rows:
+        c.fields(row, ("path", "sha256", "data"))
+        ref = (row["path"], c.digest(row["sha256"]))
+        if not c.is_task_record(row, root) or ref[0] in locations or not isinstance(row["data"], str):
+            raise c.CompletionError("invalid or duplicate recovered record")
+        raw = base64.b64decode(row["data"], validate=True)
+        if c.sha(raw) != ref[1]:
+            raise c.CompletionError("recovered record SHA differs")
+        restored[ref] = raw
+        locations.add(ref[0])
+    allowed = set()
+    for check in scope["checks"]:
+        if check["kind"] not in {"evidence", "improvement"}:
+            continue
+        target = check["target"]
+        if check["kind"] == "improvement":
+            basis = c.read_control(target["plan"])["basis"]
+            allowed.add((basis["path"], basis["sha256"]))
+        expected = checks[check["id"]]
+        if stopped and expected == {}:
+            continue
+        ref = (target["path"], c.digest(expected["sha256"]))
+        allowed.add(ref)
+        if check["kind"] == "improvement":
+            raw = restored.get(ref)
+            record = c.decode(c.control_bytes(*ref) if raw is None else raw)
+            for case in record["cases"]:
+                after = case["after"]
+                allowed.add((after["path"], after["sha256"]))
+    if restored.keys() - allowed:
+        raise c.CompletionError("recovered records exceed the reviewed evidence paths")
+    for (location, digest), raw in restored.items():
+        c.remember_control(state, {"path": location, "sha256": digest}, raw)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bindings", default=str(ROOT), help="private per-session pointer directory; host installation uses the default")
@@ -702,7 +835,12 @@ def main(argv=None):
     for name in ("arm", "bind", "extend", "reserve", "attach", "resolve-reservation", "repair-process-record", "finalize", "complete", "outcome", "inspect", "unbind", "release", "recover-owner", "preserve-source", "recover-filesystem", "recover-github-observer", "adopt"):
         item = subs.add_parser(name)
         item.add_argument("--session", required=True)
-        if name == "arm": item.add_argument("--task-id", required=True)
+        if name == "arm":
+            item.description = ("For direct work, use the returned record_root in the scope seed. "
+                                f"{RECORD_PARENT_ENV} selects a private persistent parent outside Git checkouts. "
+                                "The default is .completion-records beside the .github checkout.")
+            item.add_argument("--task-id", required=True)
+            item.add_argument("--expected-sha256", help="Reallocate a missing record root before bind using the current pointer SHA")
         else: item.add_argument("--expected-sha256", required=True, help="current pointer SHA; CAS under a local lock")
         if name in {"complete", "unbind", "release", "adopt", "repair-process-record"}:
             if name != "repair-process-record":
@@ -723,7 +861,9 @@ def main(argv=None):
         if name == "resolve-reservation": item.add_argument("--id", required=True)
         if name in {"finalize", "complete"}:
             item.add_argument("--result"); item.add_argument("--review"); item.add_argument("--review-sha256")
-            item.add_argument("--inputs", choices=("-",), help="read {result,review} JSON from stdin without staging files")
+            item.add_argument("--inputs", choices=("-",), help=(
+                "read {result,review} JSON from stdin. If the original record directory is absent, "
+                "optional records [{path,sha256,data}] supply reviewed task control bytes as Base64."))
         if name == "repair-process-record": item.add_argument("--id", required=True)
         if name in {"recover-owner", "preserve-source", "recover-filesystem", "recover-github-observer", "resolve-reservation", "repair-process-record"}:
             item.add_argument("--evidence", required=True); item.add_argument("--evidence-sha256", required=True)
@@ -744,11 +884,7 @@ def main(argv=None):
             filename = pointer(Path(args.bindings), args.from_session if args.command == "adopt" else args.session)
             with locked(filename.parent):
                 if args.command == "arm":
-                    if os.path.lexists(filename): raise c.CompletionError("session already armed; reuse its current pointer")
-                    state = {"task_id": c.text(args.task_id), "session_id": args.session, "intent": "closure",
-                             "scope": None, "review": None, "final_review": None, "result_path": None,
-                             "resources": [], "outcome": "working", "execution_owner": "direct"}
-                    answer = replace(filename, state, None)
+                    answer = arm(filename, args)
                 else:
                     state, before = load_state(filename)
                     if before != c.digest(args.expected_sha256) or (args.command != "adopt" and state["session_id"] != args.session):
@@ -777,6 +913,10 @@ def main(argv=None):
                             scope_ref = c.control_reference({"path": args.scope, "sha256": args.scope_sha256})
                             review_ref = c.control_reference({"path": args.review, "sha256": args.review_sha256})
                             scope = c.read_control(scope_ref)
+                            if armed_record := state.get("armed_record"):
+                                if (scope.get("record_root") != armed_record
+                                        or c.record_directory(armed_record["path"]) != armed_record):
+                                    raise c.CompletionError("use the exact record_root returned by arm")
                             c.validate_admission_targets(scope["checks"], state["resources"])
                             c.validate_scope(scope)
                             c.validate_state_identity(scope, state, filename)
@@ -813,6 +953,8 @@ def main(argv=None):
                                     target["remote_binding"] = c.remote_identity(target["repository"], target["remote"])
                                 protect_records(state, filename, [resource], admitting_resources=True)
                                 found[0].update(resource, basis=basis)
+                            if state["scope"] is None and "armed_record" in state:
+                                c.remember_control(state, basis)
                         elif args.command == "recover-github-observer":
                             if (state["outcome"] != "waiting" or state["scope"] is None or
                                     "github_observer_recovery" in state or "record_manifest" in state):
@@ -887,13 +1029,16 @@ def main(argv=None):
                                 if any((args.result, args.review, args.review_sha256)):
                                     raise c.CompletionError("use stdin inputs or file inputs, not both")
                                 payload = c.decode(sys.stdin.buffer.read())
-                                c.fields(payload, ("result", "review"))
+                                c.fields(payload, ("result", "review"), ("records",))
                                 scope = c.read_control(state["scope"])
                                 root = c.path(scope["record_root"]["path"])
                                 result_raw, review_raw = c.canonical(payload["result"]), c.canonical(payload["review"])
                                 result_origin, review_origin = root / ".state-result.json", root / ".state-final-review.json"
                                 if os.path.lexists(result_origin) or os.path.lexists(review_origin):
                                     raise c.CompletionError("stdin control origins must not shadow staging files")
+                                if "records" in payload:
+                                    recover_final_records(state, scope, payload, str(review_origin),
+                                                          allow_stopped=args.command == "finalize")
                                 state.update(result_path=str(result_origin), final_review={
                                     "path": str(review_origin), "sha256": c.sha(review_raw)})
                                 protect_records(state, filename, state["resources"], observing=True)
