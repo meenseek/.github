@@ -1,15 +1,18 @@
+import base64
 import importlib.util
 from contextlib import redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 import test_check_completion as fixture_module
+import test_improvement as improvement_fixture
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/completion_hook.py"
 HAS_COLLECTOR = (SCRIPT.parents[2] / "operations" / "llm_work.py").is_file()
@@ -121,9 +124,10 @@ class HookTests(unittest.TestCase):
     def goal_args(self):
         return ["--task-id", self.f.seed["task_id"], "--request-digest", self.f.seed["request_digest"]]
 
-    def record_fixture(self, nested=False):
-        self.records = self.f.root / "task-records"
-        self.records.mkdir()
+    def record_fixture(self, nested=False, root=None):
+        self.records = root or self.f.root / "task-records"
+        if root is None:
+            self.records.mkdir()
         if nested:
             (self.records / "nested").mkdir()
             (self.records / "nested" / "scratch.txt").write_text("task-only scratch")
@@ -143,6 +147,101 @@ class HookTests(unittest.TestCase):
             self.f.state["final_review"] = self.f.ref(self.f.final_review_path)
             self.f.write(self.f.state_path, self.f.state)
         self.f.final_review = final_review
+
+    def test_managed_arm_pins_exact_private_record_root_and_rejects_volatile_parent(self):
+        parent = self.f.root / "state-records"
+        argv = ["--bindings", str(self.root), "arm", "--session", self.f.seed["session_id"],
+                "--task-id", self.f.seed["task_id"]]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {h.RECORD_PARENT_ENV: str(parent)}), redirect_stdout(out):
+            self.assertEqual(h.main(argv), 2)
+            self.assertFalse(self.state.exists())
+            out.seek(0); out.truncate(0)
+            with mock.patch.object(h, "temporary_record_parents", return_value=()):
+                self.assertEqual(h.main(argv), 0)
+        record = Path(json.loads(out.getvalue())["record_root"])
+        self.assertEqual(record.parent, parent)
+        self.assertEqual(record.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(json.loads(self.state.read_bytes())["armed_record"], h.c.record_directory(str(record)))
+        self.record_fixture()
+        self.f.seed["state_path"] = str(self.state)
+        self.f.freeze()
+        def bind(ok):
+            return self.call("bind", "--scope", str(self.f.scope_path), "--scope-sha256", self.f.scope_ref["sha256"],
+                             "--review", str(self.f.review_path), "--review-sha256", self.f.ref(self.f.review_path)["sha256"], ok=ok)
+        self.assertIn("record_root returned by arm", bind(False)["error"])
+        self.record_fixture(root=record)
+        self.f.freeze()
+        bind(True)
+        self.assertTrue(self.call("complete", *self.completion_args())["binding_released"])
+        self.assertFalse(record.exists())
+
+    def test_improvement_record_loss_can_resume_using_only_exact_reviewed_controls(self):
+        self.record_fixture()
+        improvement = improvement_fixture.ImprovementTests()
+        improvement.setUp()
+        self.addCleanup(improvement.doCleanups)
+
+        def copy(ref):
+            source = Path(ref["path"])
+            target = self.records / source.name
+            shutil.copyfile(source, target)
+            return self.f.ref(target)
+
+        improvement.plan.update(task_id=self.f.seed["task_id"], basis=copy(improvement.plan["basis"]))
+        for case in improvement.plan["cases"]:
+            case.update(input=copy(case["input"]), baseline=copy(case["baseline"]))
+        for case in improvement.record["cases"]:
+            case["after"] = copy(case["after"])
+        improvement.freeze()
+        plan, record = copy(improvement.plan_ref), copy(improvement.record_ref)
+        self.f.seed["checks"].append({"id": "prevention", "category": "quality", "kind": "improvement",
+                                      "target": {"path": record["path"], "plan": plan}})
+        self.f.reset_categories()
+        self.arm_bind(finalize=False)
+        state = json.loads(self.state.read_bytes())
+        basis = improvement.plan["basis"]
+        self.assertIn(basis["path"], {item["path"] for item in state["control_records"]})
+        staged_elsewhere = self.records.with_name("original-records")
+        self.records.rename(staged_elsewhere)
+        try:
+            with h.c.bound_state(str(self.state)):
+                scope = h.c.read_control(state["scope"])
+                h.c.validate_scope(scope)
+        finally:
+            staged_elsewhere.rename(self.records)
+        reviewed_missing = [basis, record, *(case["after"] for case in improvement.record["cases"])]
+        recovered = [{**ref, "data": base64.b64encode(Path(ref["path"]).read_bytes()).decode()}
+                     for ref in reviewed_missing]
+        # Simulate a legacy bind that had saved the plan and baselines but missed the basis.
+        state["control_records"] = [item for item in state["control_records"] if item["path"] != basis["path"]]
+        state["record_manifest"] = h.c.record_inventory(h.c.record_directory(str(self.records)))
+        self.f.write(self.state, state)
+        result = self.f.result
+        result["checks"]["prevention"] = {"sha256": record["sha256"]}
+        args = self.direct_complete(); args = args[:args.index("--result")] + ["--inputs", "-"]
+        shutil.rmtree(self.records)
+        review = {"scope_sha256": self.f.scope_ref["sha256"], "status": "No Findings",
+                  "result_sha256": h.c.sha(h.c.canonical(result)),
+                  "record_inventory_sha256": h.c.sha(h.c.canonical(state["record_manifest"]))}
+        unchanged_state = self.state.read_bytes()
+
+        def complete(rows, code):
+            payload = {"result": result, "review": review, "records": rows}
+            stdin = io.TextIOWrapper(io.BytesIO(h.c.canonical(payload)))
+            out = io.StringIO()
+            with mock.patch.object(h.sys, "stdin", stdin), redirect_stdout(out):
+                self.assertEqual(h.main(args), code, out.getvalue())
+            return json.loads(out.getvalue())
+
+        unreviewed = {**recovered[0], "path": str(self.records / "unreviewed.md")}
+        self.assertIn("exceed", complete([*recovered, unreviewed], 2)["error"])
+        mismatched = [{**recovered[0], "data": base64.b64encode(b"different basis").decode()}, *recovered[1:]]
+        self.assertIn("SHA differs", complete(mismatched, 2)["error"])
+        self.assertEqual(self.state.read_bytes(), unchanged_state)
+        self.assertTrue(complete(recovered, 0)["binding_released"])
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.records.exists())
 
     def test_complete_actual_cli_removes_reviewed_task_records_and_binding(self):
         self.record_fixture()

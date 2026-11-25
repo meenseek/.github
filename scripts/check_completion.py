@@ -41,7 +41,7 @@ KINDS = {"git_source", "installed_file", "file", "absent", "ref_absent", "remote
 STATE_FIELDS = ("task_id", "session_id", "intent", "scope", "review", "final_review", "result_path", "resources", "outcome")
 STATE_OPTIONAL = ("status_basis", "owner_recovery", "source_preservation", "filesystem_recovery", "cleanup",
                   "control_records", "record_manifest", "origin", "handoff", "execution_owner", "scope_history",
-                  "reservation_resolutions", "github_observer_recovery")
+                  "reservation_resolutions", "github_observer_recovery", "armed_record")
 GITHUB_OBSERVER_ENV = "CODEX_COMPLETION_GH"
 _CONTROL = ContextVar("completion_control", default=None)
 
@@ -299,6 +299,14 @@ def control_reference(ref):
     return ref
 
 
+def is_task_record(ref, record_root):
+    if record_root is None:
+        return False
+    root = path(record_root["path"])
+    location = path(ref["path"])
+    return location != root and location.is_relative_to(root)
+
+
 def read_control(ref):
     fields(ref, ("path", "sha256"))
     raw = control_bytes(ref["path"], digest(ref["sha256"]))
@@ -373,7 +381,10 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
         for check in scope["checks"]:
             if check["kind"] == "improvement":
                 keep(check["target"]["plan"])
-                for case in read_control(check["target"]["plan"])["cases"]:
+                plan = read_control(check["target"]["plan"])
+                if is_task_record(plan["basis"], scope.get("record_root")):
+                    keep(plan["basis"])
+                for case in plan["cases"]:
                     keep(case["input"]); keep(case["baseline"])
         if state.get("final_review"):
             keep(state["final_review"])
@@ -403,7 +414,8 @@ def capture_controls(state, *, final=False, result_raw=None, location=None, obse
                     if check["kind"] == "improvement":
                         for case in read_control(ref)["cases"]:
                             keep(case["after"])
-            if final and "record_root" in scope:
+            if (final and "record_root" in scope and
+                    ("record_manifest" not in state or os.path.lexists(scope["record_root"]["path"]))):
                 state["record_manifest"] = record_inventory(scope["record_root"])
         guard()
 
@@ -1452,7 +1464,8 @@ def validate_scope(scope, recovery=None, *, resources=()):
             path(check["target"]["path"])
             if check["category"] != "quality":
                 raise CompletionError("improvement observations belong to quality")
-            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"], owners=owners, recovery=recovery)
+            improvement_observer().validate_plan(check["target"]["plan"], scope["task_id"], owners=owners,
+                                                 recovery=recovery, record_root=scope.get("record_root"))
         checks[key] = check
     for owner in owners:
         if "original" in owner and not any(
@@ -1692,11 +1705,12 @@ def _draft_result(scope_ref, expectations=None):
     return result
 
 
-def observe(check, expected, *, preserved=None, owners=(), recovery=None, github_reader=github_ref_read):
+def observe(check, expected, *, preserved=None, owners=(), recovery=None, record_root=None, github_reader=github_ref_read):
     kind, target = check["kind"], check["target"]
     if kind == "improvement":
         fields(target, ("path", "plan")); fields(expected, ("sha256",))
-        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])}, owners=owners, recovery=recovery)
+        return improvement_observer().inspect(target["plan"], {"path": target["path"], "sha256": digest(expected["sha256"])},
+                                              owners=owners, recovery=recovery, record_root=record_root)
     if kind in ("file", "evidence", "installed_file"):
         fields(target, ("path",), ("assertions",) if kind == "evidence" else ("source",))
         fields(expected, ("sha256",))
@@ -2014,7 +2028,8 @@ def _check_scope(scope_ref, result_path, *, task_id=None, request_digest=None, r
         if stopped and definition["kind"] not in CLEANUP_KINDS:
             return key, {"unfulfilled": True, "reason": "terminal stop; original goal is not claimed complete"}, None
         try:
-            options = {"owners": scope["owners"], "recovery": recovery} if definition["kind"] == "improvement" else {}
+            options = ({"owners": scope["owners"], "recovery": recovery, "record_root": scope.get("record_root")}
+                       if definition["kind"] == "improvement" else {})
             if definition["kind"] == "git_source" and definition["target"]["remote_binding"]["kind"] == "github":
                 options["github_reader"] = github_reader
             if key in preserved:
